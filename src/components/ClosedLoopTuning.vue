@@ -309,8 +309,9 @@ import { computed, reactive, ref, watch } from "vue";
 import { useMachineStore } from "@/stores/machine";
 import { LogLevel, useUiStore } from "@/stores/ui";
 
+import { HelpTip } from "dwc-plugin-runtime";
+
 import CaptureChart from "./CaptureChart.vue";
-import HelpTip from "./HelpTip.vue";
 import { CAPTURE_DIR, DOCS } from "../model/constants";
 import {
 	buildCalibrationCommand, buildCaptureCommand, buildModeCommand, buildPidCommand,
