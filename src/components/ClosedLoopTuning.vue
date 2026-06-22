@@ -13,123 +13,249 @@
 			No closed-loop drivers found. Connect a Duet 3 board with a 1HCL / M23CL configured for an axis or extruder.
 		</v-alert>
 
-		<v-row dense>
-			<!-- Driver + mode + calibration -->
-			<v-col cols="12" md="6" lg="4">
-				<v-card class="mb-2">
-					<v-card-title class="py-2 text-subtitle-1">Driver &amp; mode</v-card-title>
-					<v-card-text>
-						<v-select v-model="selectedDriver" :items="drivers" item-title="name" item-value="value"
-								  density="compact" variant="outlined" hide-details label="Closed-loop driver" class="mb-3" />
-						<div class="d-flex ga-2 mb-2">
-							<v-btn v-for="m in modeList" :key="m.value" size="small" variant="tonal"
-								   :disabled="!selectedDriver" @click="setMode(m.value)">{{ m.label }}</v-btn>
-						</div>
-						<div v-if="selectedDriver" class="text-caption text-medium-emphasis">Sends: <code>{{ modePreview }}</code></div>
-						<v-expansion-panels class="mt-2" variant="accordion">
-							<v-expansion-panel title="Advanced: mode D-values">
-								<v-expansion-panel-text>
-									<div class="text-caption mb-2">Confirm these against <code>M569</code> on your firmware if a mode misbehaves.</div>
+		<div class="d-flex align-center mb-2">
+			<v-icon class="mr-2">mdi-chart-bell-curve-cumulative</v-icon>
+			<span class="text-subtitle-1">Closed Loop Tuning</span>
+			<HelpTip class="ml-1" :href="DOCS.tuning"
+					 text="Follow the steps below in order: pick the driver, switch to closed/assisted mode, calibrate the encoder, tune the PID terms one at a time using the step response, then test and save. Click for the full Duet 1HCL tuning guide." />
+			<v-spacer />
+			<v-chip v-if="selectedDriver" size="small" variant="tonal" class="mr-2">Driver {{ selectedDriver }}</v-chip>
+			<v-chip v-if="currentMode" size="small" :color="currentMode === 'open' ? 'grey' : 'success'" variant="flat">{{ MODE_LABELS[currentMode] }}</v-chip>
+		</div>
+
+		<v-stepper v-model="step" :items="stepTitles" editable flat>
+			<!-- 1. Driver -->
+			<template #item.1>
+				<v-card flat>
+					<div class="text-body-2 mb-3">
+						Pick the closed-loop driver you want to tune. Tuning moves only this driver, so re-home the axis afterwards.
+						<HelpTip text="The list shows every axis/extruder driver on a board that reports closed-loop support (a 1HCL or M23CL). Only one driver can be tuned at a time." />
+					</div>
+					<v-select v-model="selectedDriver" :items="drivers" item-title="name" item-value="value"
+							  density="compact" variant="outlined" hide-details label="Closed-loop driver" style="max-width: 480px" />
+					<div v-if="selectedDriver" class="text-caption text-medium-emphasis mt-3">
+						Tip: read the current settings any time with the <strong>Reload</strong> button on the PID step.
+					</div>
+				</v-card>
+			</template>
+
+			<!-- 2. Loop mode -->
+			<template #item.2>
+				<v-card flat>
+					<div class="text-body-2 mb-3">
+						Choose how the driver runs. Tune in the mode you'll actually print in, and switch to
+						<strong>closed</strong> or <strong>assisted</strong> before calibrating.
+						<HelpTip :href="DOCS.m569" text="M569 D-parameter. Open = normal stepper, no feedback. Closed loop = full PID position control from the encoder. Assisted open loop = runs open-loop but uses the encoder to correct/avoid lost steps. D4=closed, D5=assisted, open returns to the normal stepper mode." />
+					</div>
+					<div class="d-flex flex-wrap ga-2 mb-3">
+						<v-tooltip v-for="m in modeList" :key="m.value" :text="modeHelp[m.value]" location="bottom" max-width="320">
+							<template #activator="{ props: tip }">
+								<v-btn v-bind="tip" :color="currentMode === m.value ? 'primary' : undefined"
+									   :variant="currentMode === m.value ? 'flat' : 'tonal'" size="small"
+									   :disabled="!selectedDriver" @click="setMode(m.value)">{{ m.label }}</v-btn>
+							</template>
+						</v-tooltip>
+					</div>
+					<div v-if="selectedDriver" class="text-caption text-medium-emphasis">
+						Will send: <code>{{ buildModeCommand(selectedDriver, 'closed', modeD) }}</code> (closed) ·
+						<code>{{ buildModeCommand(selectedDriver, 'assisted', modeD) }}</code> (assisted) ·
+						<code>{{ buildModeCommand(selectedDriver, 'open', modeD) }}</code> (open)
+					</div>
+					<v-expansion-panels class="mt-3" variant="accordion">
+						<v-expansion-panel>
+							<v-expansion-panel-title>
+								Advanced: mode D-values
+								<HelpTip class="ml-1" :href="DOCS.m569" text="The M569 D number for each mode. Defaults match RRF 3.6/3.7 (open=spreadCycle D2, closed=D4, assisted-open=D5). Only change these if your firmware differs." />
+							</v-expansion-panel-title>
+							<v-expansion-panel-text>
+								<v-row dense>
+									<v-col cols="4"><v-text-field v-model.number="modeD.open" type="number" label="Open (D)" density="compact" variant="outlined" hide-details /></v-col>
+									<v-col cols="4"><v-text-field v-model.number="modeD.closed" type="number" label="Closed (D)" density="compact" variant="outlined" hide-details /></v-col>
+									<v-col cols="4"><v-text-field v-model.number="modeD.assisted" type="number" label="Assisted (D)" density="compact" variant="outlined" hide-details /></v-col>
+								</v-row>
+							</v-expansion-panel-text>
+						</v-expansion-panel>
+					</v-expansion-panels>
+				</v-card>
+			</template>
+
+			<!-- 3. Calibrate -->
+			<template #item.3>
+				<v-card flat>
+					<div class="text-body-2 mb-3">
+						Calibration teaches the board the relationship between the encoder and the motor. It must be done
+						before closed-loop control will work. Pick your encoder type to see what's required.
+						<HelpTip :href="DOCS.m569_6" text="M569.6 runs a calibration/tuning manoeuvre. The driver must already be in closed or assisted mode. These moves rotate the motor a few steps to a few revolutions." />
+					</div>
+					<v-select v-model="encoderType" :items="encoderTypes" item-title="title" item-value="value"
+							  density="compact" variant="outlined" hide-details label="Encoder type (M569.1 T)" style="max-width: 360px" class="mb-2">
+						<template #append><HelpTip :href="DOCS.m569_1" text="Set in config.g with M569.1 T: T1=linear composite, T2=quadrature motor shaft, T3=Duet3D magnetic. This only filters the calibration moves shown here — it doesn't change your config." /></template>
+					</v-select>
+					<v-alert type="info" variant="tonal" density="compact" class="mb-2">{{ encoderGuidance }}</v-alert>
+					<v-list density="compact" class="py-0">
+						<v-list-item v-for="c in calibrationMoves" :key="c.id">
+							<template #title>
+								{{ c.name }}
+								<v-chip v-if="requiredMoveIds.includes(c.id)" size="x-small" color="primary" class="ml-1">required</v-chip>
+								<v-chip v-else size="x-small" variant="tonal" class="ml-1">optional</v-chip>
+							</template>
+							<template #subtitle>{{ c.description }}</template>
+							<template #append>
+								<v-tooltip :text="`Sends ${buildCalibrationCommand(selectedDriver || 'P#.#', c.id)} — the motor will move.`" location="left">
+									<template #activator="{ props: tip }">
+										<v-btn v-bind="tip" size="small" variant="tonal" :disabled="!selectedDriver || currentMode === 'open'" @click="runCalibration(c)">Run</v-btn>
+									</template>
+								</v-tooltip>
+							</template>
+						</v-list-item>
+					</v-list>
+					<div v-if="currentMode === 'open'" class="text-caption text-warning mt-2">Switch to closed or assisted mode (step 2) before calibrating.</div>
+				</v-card>
+			</template>
+
+			<!-- 4. Tune PID -->
+			<template #item.4>
+				<v-card flat>
+					<div class="text-body-2 mb-3">
+						Tune one term at a time using a step response. Work through them in order — each "Run step &amp; analyse"
+						applies a sudden 4-step target change, measures the response, and tells you whether to raise, lower or
+						keep the term. Set motor current to its final value before tuning.
+						<HelpTip :href="DOCS.tuning" text="Order: P (fastest rise without oscillation) → D (remove overshoot) → I (remove steady-state error) → optional A/V feed-forward for moving loads. Click for the full guide with example plots." />
+					</div>
+
+					<v-row dense>
+						<v-col cols="12" md="5">
+							<v-card variant="outlined">
+								<v-card-text>
+									<div class="d-flex align-center mb-2">
+										<v-btn size="small" variant="text" icon="mdi-chevron-left" :disabled="wizardIndex === 0" @click="wizardIndex--" />
+										<div class="flex-grow-1 text-center text-subtitle-2">{{ wizardStep.title }} ({{ wizardIndex + 1 }}/{{ steps.length }})</div>
+										<v-btn size="small" variant="text" icon="mdi-chevron-right" :disabled="wizardIndex === steps.length - 1" @click="wizardIndex++" />
+									</div>
+									<div class="text-caption mb-1"><strong>Goal:</strong> {{ wizardStep.goal }}</div>
+									<div class="text-caption text-medium-emphasis mb-2">{{ wizardStep.instructions }}</div>
+									<div class="d-flex ga-2 align-center mb-2">
+										<v-btn size="small" color="info" :disabled="!selectedDriver || recording" :loading="recording" @click="runWizardCapture">
+											<v-icon class="mr-1">mdi-record</v-icon> Run step &amp; analyse
+										</v-btn>
+										<v-btn v-if="wizardStep.term && wizardStep.defaultStart !== undefined" size="small" variant="text"
+											   :disabled="!selectedDriver" @click="seedDefault">Set start ({{ wizardStep.defaultStart }})</v-btn>
+										<HelpTip :href="DOCS.m569_5" text="Runs M569.5 with the step manoeuvre (V64): a 4 full-step jump so the controller's response can be measured. Recorded to a CSV and plotted below." />
+									</div>
+									<v-alert v-if="recommendation" :type="verdictType" variant="tonal" density="compact">
+										{{ recommendation.message }}
+										<template v-if="recommendation.suggested !== undefined" #append>
+											<v-btn size="x-small" variant="text" @click="applySuggestion">Set {{ wizardStep.term?.toUpperCase() }}={{ recommendation.suggested }}</v-btn>
+										</template>
+									</v-alert>
+								</v-card-text>
+							</v-card>
+						</v-col>
+
+						<v-col cols="12" md="7">
+							<v-card variant="outlined">
+								<v-card-title class="py-2 text-subtitle-2 d-flex align-center">
+									PID parameters
+									<HelpTip class="ml-1" :href="DOCS.m569_1" text="M569.1 R=P (proportional), I (integral), D (derivative), V (velocity feed-forward), A (acceleration feed-forward). The wizard's suggestions write into these; Apply sends them to the driver." />
+									<v-spacer />
+									<v-btn size="x-small" variant="text" :disabled="!selectedDriver" @click="loadPid">Reload</v-btn>
+								</v-card-title>
+								<v-card-text>
 									<v-row dense>
-										<v-col cols="4"><v-text-field v-model.number="modeD.open" type="number" label="Open (D)" density="compact" variant="outlined" hide-details /></v-col>
-										<v-col cols="4"><v-text-field v-model.number="modeD.closed" type="number" label="Closed (D)" density="compact" variant="outlined" hide-details /></v-col>
-										<v-col cols="4"><v-text-field v-model.number="modeD.assisted" type="number" label="Assisted (D)" density="compact" variant="outlined" hide-details /></v-col>
+										<v-col cols="4"><v-text-field v-model.number="pid.p" type="number" label="P (R)" density="compact" variant="outlined" hide-details :class="{ 'cl-active-term': wizardStep.term === 'p' }" /></v-col>
+										<v-col cols="4"><v-text-field v-model.number="pid.i" type="number" label="I" density="compact" variant="outlined" hide-details :class="{ 'cl-active-term': wizardStep.term === 'i' }" /></v-col>
+										<v-col cols="4"><v-text-field v-model.number="pid.d" type="number" label="D" density="compact" variant="outlined" hide-details :class="{ 'cl-active-term': wizardStep.term === 'd' }" /></v-col>
+										<v-col cols="6"><v-text-field v-model.number="pid.v" type="number" label="V (vel ff)" density="compact" variant="outlined" hide-details :class="{ 'cl-active-term': wizardStep.term === 'v' }" /></v-col>
+										<v-col cols="6"><v-text-field v-model.number="pid.a" type="number" label="A (accel ff)" density="compact" variant="outlined" hide-details :class="{ 'cl-active-term': wizardStep.term === 'a' }" /></v-col>
 									</v-row>
-								</v-expansion-panel-text>
-							</v-expansion-panel>
-						</v-expansion-panels>
-					</v-card-text>
-				</v-card>
+									<div class="d-flex ga-2 align-center mt-2">
+										<v-btn size="small" color="primary" :disabled="!selectedDriver" :loading="applyingPid" @click="applyPid">Apply (M569.1)</v-btn>
+										<span class="text-caption text-medium-emphasis text-truncate"><code>{{ pidPreview }}</code></span>
+									</div>
+								</v-card-text>
+							</v-card>
+						</v-col>
+					</v-row>
 
-				<v-card>
-					<v-card-title class="py-2 text-subtitle-1">Calibration</v-card-title>
-					<v-card-text>
-						<v-select v-model="encoderType" :items="encoderTypes" item-title="title" item-value="value"
-								  density="compact" variant="outlined" hide-details label="Encoder type" class="mb-2" />
-						<div class="text-caption text-medium-emphasis mb-2">Driver must be in closed/assisted mode first. These moves rotate the motor.</div>
-						<v-list density="compact" class="py-0">
-							<v-list-item v-for="c in calibrationMoves" :key="c.id" :title="c.name" :subtitle="c.description">
-								<template #append>
-									<v-btn size="small" variant="tonal" :disabled="!selectedDriver" @click="runCalibration(c)">Run</v-btn>
-								</template>
-							</v-list-item>
-						</v-list>
-					</v-card-text>
+					<v-expansion-panels class="mt-3" variant="accordion">
+						<v-expansion-panel>
+							<v-expansion-panel-title>
+								Advanced: manual capture
+								<HelpTip class="ml-1" :href="DOCS.m569_5" text="For power users: record any combination of variables, at a chosen rate, during the step manoeuvre or a custom move. Useful for tuning A/V on a steady-speed G1 move." />
+							</v-expansion-panel-title>
+							<v-expansion-panel-text>
+								<v-row dense>
+									<v-col cols="6" sm="3"><v-text-field v-model.number="samples" type="number" label="Samples" density="compact" variant="outlined" hide-details /></v-col>
+									<v-col cols="6" sm="3"><v-text-field v-model.number="sampleRate" type="number" label="Rate (/s, 0=max)" density="compact" variant="outlined" hide-details /></v-col>
+									<v-col cols="12" sm="6">
+										<v-radio-group v-model="moveMode" inline density="compact" hide-details>
+											<v-radio label="Step manoeuvre" value="step" />
+											<v-radio label="Custom move" value="custom" />
+										</v-radio-group>
+									</v-col>
+								</v-row>
+								<v-text-field v-if="moveMode === 'custom'" v-model="customMove" label="Move G-code" density="compact" variant="outlined" hide-details class="mb-2" placeholder="G91 G1 H2 X50 F6000 G90" />
+								<div class="d-flex flex-wrap mb-1">
+									<v-checkbox v-for="v in captureVariables" :key="v.key" v-model="recordKeys" :value="v.key" :label="v.header" density="compact" hide-details class="cl-var" />
+								</div>
+								<v-btn size="small" color="info" :disabled="!canRecord || recording" :loading="recording" @click="record()"><v-icon class="mr-1">mdi-record</v-icon> Record</v-btn>
+								<div v-if="selectedDriver" class="text-caption text-medium-emphasis mt-1"><code>{{ capturePreview }}</code></div>
+							</v-expansion-panel-text>
+						</v-expansion-panel>
+					</v-expansion-panels>
 				</v-card>
+			</template>
+
+			<!-- 5. Test & save -->
+			<template #item.5>
+				<v-card flat>
+					<div class="text-body-2 mb-3">
+						Verify the tuning with a real move, then copy the tuned line into <code>config.g</code> (after your
+						<code>M569</code>/<code>M906</code>/microstepping setup) and the mode + calibration lines into your homing file.
+						<HelpTip :href="DOCS.tuning" text="RRF programs these registers itself from M569/M906/microstepping, so the M569.1 line must come AFTER that setup. The mode switch and calibration belong in the homing file so they run every power-on." />
+					</div>
+					<v-row dense>
+						<v-col cols="12" md="6">
+							<v-card variant="outlined" class="mb-2">
+								<v-card-title class="py-2 text-subtitle-2">Test move</v-card-title>
+								<v-card-text>
+									<v-text-field v-model="customMove" label="Test move G-code" density="compact" variant="outlined" hide-details class="mb-2" placeholder="G91 G1 H2 X50 F6000 G90">
+										<template #append-inner><HelpTip text="A real G1 move (recorded while it runs). Watch Current Error in the plot — a well-tuned drive keeps it small and centred on zero." /></template>
+									</v-text-field>
+									<v-btn size="small" color="info" :disabled="!selectedDriver || recording" :loading="recording" @click="runTestMove"><v-icon class="mr-1">mdi-record</v-icon> Run test move</v-btn>
+								</v-card-text>
+							</v-card>
+						</v-col>
+						<v-col cols="12" md="6">
+							<v-card variant="outlined" class="mb-2">
+								<v-card-title class="py-2 text-subtitle-2 d-flex align-center">
+									config.g block
+									<v-spacer />
+									<v-btn size="x-small" variant="text" prepend-icon="mdi-content-copy" :disabled="!selectedDriver" @click="copyConfig">Copy</v-btn>
+								</v-card-title>
+								<v-card-text>
+									<pre class="cl-config">{{ configBlock }}</pre>
+								</v-card-text>
+							</v-card>
+						</v-col>
+					</v-row>
+				</v-card>
+			</template>
+		</v-stepper>
+
+		<!-- Persistent results: chart + analysis from the most recent capture -->
+		<v-row dense class="mt-1">
+			<v-col cols="12" md="9">
+				<CaptureChart :capture="capture" :overlay="overlayCapture" :selected-keys="viewKeys" :sample-rate="sampleRate" :raw-text="rawText" />
 			</v-col>
-
-			<!-- PID + wizard -->
-			<v-col cols="12" md="6" lg="4">
+			<v-col cols="12" md="3">
 				<v-card class="mb-2">
 					<v-card-title class="py-2 text-subtitle-1 d-flex align-center">
-						PID parameters <v-spacer />
-						<v-btn size="x-small" variant="text" :disabled="!selectedDriver" @click="loadPid">Reload</v-btn>
+						Analysis
+						<HelpTip class="ml-1" text="Computed automatically from the last step capture: rise time (10–90%), overshoot beyond target, settling time, and the residual steady-state error. The wizard uses these to make its recommendations." />
 					</v-card-title>
 					<v-card-text>
-						<v-row dense>
-							<v-col cols="4"><v-text-field v-model.number="pid.p" type="number" label="P (R)" density="compact" variant="outlined" hide-details /></v-col>
-							<v-col cols="4"><v-text-field v-model.number="pid.i" type="number" label="I" density="compact" variant="outlined" hide-details /></v-col>
-							<v-col cols="4"><v-text-field v-model.number="pid.d" type="number" label="D" density="compact" variant="outlined" hide-details /></v-col>
-							<v-col cols="6"><v-text-field v-model.number="pid.v" type="number" label="V (vel ff)" density="compact" variant="outlined" hide-details /></v-col>
-							<v-col cols="6"><v-text-field v-model.number="pid.a" type="number" label="A (accel ff)" density="compact" variant="outlined" hide-details /></v-col>
-						</v-row>
-						<v-btn class="mt-2" size="small" color="primary" :disabled="!selectedDriver" :loading="applyingPid" @click="applyPid">Apply (M569.1)</v-btn>
-						<div class="text-caption text-medium-emphasis mt-1">{{ pidPreview }}</div>
-					</v-card-text>
-				</v-card>
-
-				<v-card>
-					<v-card-title class="py-2 text-subtitle-1">Guided tuning</v-card-title>
-					<v-card-text>
-						<div class="d-flex align-center mb-2">
-							<v-btn size="small" variant="text" icon="mdi-chevron-left" :disabled="wizardIndex === 0" @click="wizardIndex--" />
-							<div class="flex-grow-1 text-center text-subtitle-2">{{ wizardStep.title }} ({{ wizardIndex + 1 }}/{{ steps.length }})</div>
-							<v-btn size="small" variant="text" icon="mdi-chevron-right" :disabled="wizardIndex === steps.length - 1" @click="wizardIndex++" />
-						</div>
-						<div class="text-caption mb-1"><strong>Goal:</strong> {{ wizardStep.goal }}</div>
-						<div class="text-caption text-medium-emphasis mb-2">{{ wizardStep.instructions }}</div>
-						<v-btn size="small" color="info" :disabled="!selectedDriver || recording" :loading="recording" @click="runWizardCapture">Run step &amp; analyse</v-btn>
-						<v-alert v-if="recommendation" :type="verdictType" variant="tonal" density="compact" class="mt-2">
-							{{ recommendation.message }}
-							<template v-if="recommendation.suggested !== undefined" #append>
-								<v-btn size="x-small" variant="text" @click="applySuggestion">Set {{ wizardStep.term?.toUpperCase() }}={{ recommendation.suggested }}</v-btn>
-							</template>
-						</v-alert>
-					</v-card-text>
-				</v-card>
-			</v-col>
-
-			<!-- Recorder + analysis -->
-			<v-col cols="12" lg="4">
-				<v-card class="mb-2">
-					<v-card-title class="py-2 text-subtitle-1">Record</v-card-title>
-					<v-card-text>
-						<v-row dense>
-							<v-col cols="6"><v-text-field v-model.number="samples" type="number" label="Samples" density="compact" variant="outlined" hide-details /></v-col>
-							<v-col cols="6"><v-text-field v-model.number="sampleRate" type="number" label="Rate (/s, 0=max)" density="compact" variant="outlined" hide-details /></v-col>
-						</v-row>
-						<v-radio-group v-model="moveMode" density="compact" hide-details class="mt-1">
-							<v-radio label="Step manoeuvre (4 full steps)" value="step" />
-							<v-radio label="Custom move (recorded while it runs)" value="custom" />
-						</v-radio-group>
-						<v-text-field v-if="moveMode === 'custom'" v-model="customMove" label="Move G-code" density="compact" variant="outlined" hide-details class="mb-2"
-									  placeholder="G91 G1 H2 X50 F6000 G90" />
-						<div class="text-caption mb-1">Record variables:</div>
-						<div class="d-flex flex-wrap">
-							<v-checkbox v-for="v in captureVariables" :key="v.key" v-model="recordKeys" :value="v.key" :label="v.header" density="compact" hide-details class="cl-var" />
-						</div>
-						<v-btn class="mt-2" size="small" color="info" :disabled="!canRecord || recording" :loading="recording" @click="record()">
-							<v-icon class="mr-1">mdi-record</v-icon> Record
-						</v-btn>
-						<div v-if="selectedDriver" class="text-caption text-medium-emphasis mt-1"><code>{{ capturePreview }}</code></div>
-						<v-progress-linear v-if="recording" indeterminate class="mt-2" />
-					</v-card-text>
-				</v-card>
-
-				<v-card>
-					<v-card-title class="py-2 text-subtitle-1">Analysis</v-card-title>
-					<v-card-text>
-						<div v-if="!metrics" class="text-medium-emphasis text-caption">Record a step to see rise time, overshoot and steady-state error.</div>
+						<div v-if="!metrics" class="text-medium-emphasis text-caption">Run a step to see rise time, overshoot and steady-state error.</div>
 						<v-table v-else density="compact">
 							<tbody>
 								<tr><td>Step size</td><td>{{ metrics.stepSize.toFixed(2) }} steps</td></tr>
@@ -137,26 +263,21 @@
 								<tr><td>Overshoot</td><td>{{ metrics.overshootPct.toFixed(0) }} %</td></tr>
 								<tr><td>Settling time</td><td>{{ metrics.settlingTime === null ? "—" : (metrics.settlingTime * 1000).toFixed(0) + " ms" }}</td></tr>
 								<tr><td>Steady-state error</td><td>{{ metrics.steadyStateError.toFixed(3) }} steps</td></tr>
-								<tr><td>Peak / RMS error</td><td>{{ metrics.peakError.toFixed(3) }} / {{ metrics.rmsError.toFixed(3) }} steps</td></tr>
+								<tr><td>Peak / RMS error</td><td>{{ metrics.peakError.toFixed(3) }} / {{ metrics.rmsError.toFixed(3) }}</td></tr>
 							</tbody>
 						</v-table>
 					</v-card-text>
 				</v-card>
-			</v-col>
-		</v-row>
-
-		<v-row dense class="mt-1">
-			<v-col cols="12" md="9">
-				<CaptureChart :capture="capture" :overlay="overlayCapture" :selected-keys="viewKeys" :sample-rate="sampleRate" :raw-text="rawText" />
-			</v-col>
-			<v-col cols="12" md="3">
-				<v-card class="fill-height">
+				<v-card>
 					<v-card-title class="py-2 text-subtitle-1 d-flex align-center">
-						Plot <v-spacer />
+						Plot
+						<HelpTip class="ml-1" text="Choose which recorded variables to draw. Use Overlay to freeze the current trace and compare it against your next capture." />
+						<v-spacer />
 						<v-btn size="x-small" variant="text" :disabled="!capture || !!overlayCapture" @click="pinOverlay">Overlay</v-btn>
 						<v-btn v-if="overlayCapture" size="x-small" variant="text" @click="overlayCapture = null">Clear</v-btn>
 					</v-card-title>
 					<v-card-text>
+						<div v-if="availableViewVars.length === 0" class="text-medium-emphasis text-caption">No capture loaded yet.</div>
 						<div class="d-flex flex-wrap">
 							<v-checkbox v-for="v in availableViewVars" :key="v.key" v-model="viewKeys" :value="v.key" :label="v.header" density="compact" hide-details class="cl-var" />
 						</div>
@@ -189,7 +310,8 @@ import { useMachineStore } from "@/stores/machine";
 import { LogLevel, useUiStore } from "@/stores/ui";
 
 import CaptureChart from "./CaptureChart.vue";
-import { CAPTURE_DIR } from "../model/constants";
+import HelpTip from "./HelpTip.vue";
+import { CAPTURE_DIR, DOCS } from "../model/constants";
 import {
 	buildCalibrationCommand, buildCaptureCommand, buildModeCommand, buildPidCommand,
 	CALIBRATION_MOVES, CAPTURE_VARIABLES, DEFAULT_MODE_D, ENCODER_TYPES, MODE_LABELS,
@@ -209,8 +331,16 @@ const captureVariables = CAPTURE_VARIABLES;
 const encoderTypes = ENCODER_TYPES;
 const steps = WIZARD_STEPS;
 const modeList = (Object.keys(MODE_LABELS) as Array<LoopMode>).map((value) => ({ value, label: MODE_LABELS[value] }));
+const modeHelp: Record<LoopMode, string> = {
+	open: "Normal stepper operation with no feedback. Use this for homing, then switch to closed/assisted.",
+	assisted: "Runs open-loop but uses the encoder to assist — correcting and preventing lost steps. Simpler to tune (P≈200, D/I usually 0).",
+	closed: "Full closed-loop PID position control from the encoder. Best accuracy; needs the PID terms tuned below.",
+};
+const stepTitles = ["1. Driver", "2. Loop mode", "3. Calibrate", "4. Tune PID", "5. Test & save"];
 
+const step = ref(1);
 const selectedDriver = ref<string | null>(null);
+const currentMode = ref<LoopMode | null>(null);
 const encoderType = ref<EncoderType>(2);
 const modeD = reactive({ ...DEFAULT_MODE_D });
 const pid = reactive<PidConfig>({ p: 100, i: 0, d: 0, v: 0, a: 0, warn: null, err: null });
@@ -219,7 +349,7 @@ const applyingPid = ref(false);
 const samples = ref(2000);
 const sampleRate = ref(2000);
 const moveMode = ref<"step" | "custom">("step");
-const customMove = ref("");
+const customMove = ref("G91 G1 H2 X50 F6000 G90");
 const recordKeys = ref<Array<string>>(["measuredMotorSteps", "targetMotorSteps", "currentError", "pidPTerm"]);
 const recording = ref(false);
 
@@ -272,15 +402,31 @@ const selectedBoard = computed<any>(() => {
 });
 
 // --- Mode ---
-const modePreview = computed(() => selectedDriver.value ? `${buildModeCommand(selectedDriver.value, "open", modeD)}  /  ${buildModeCommand(selectedDriver.value, "closed", modeD)}` : "");
 async function setMode(mode: LoopMode): Promise<void> {
 	if (!selectedDriver.value) { return; }
 	await send(buildModeCommand(selectedDriver.value, mode, modeD));
+	currentMode.value = mode;
 }
 
 // --- Calibration ---
+const requiredMoveIds = computed<Array<number>>(() => {
+	switch (encoderType.value) {
+		case 2: return [1];        // quadrature shaft: polarity/zero every power-on
+		case 3: return [2];        // magnetic: calibration once
+		case 1: return [2, 1];     // linear composite: magnetic cal then polarity/zero, once
+		default: return [];
+	}
+});
 const calibrationMoves = computed<Array<CalibrationMove>>(() =>
 	CALIBRATION_MOVES.filter((c) => c.encoders.length === 0 || c.encoders.includes(encoderType.value)));
+const encoderGuidance = computed(() => {
+	switch (encoderType.value) {
+		case 2: return "Quadrature shaft encoder: run Polarity detection & zeroing (V1) after every power-on — put it in your homing file.";
+		case 3: return "Duet3D magnetic encoder: run Magnetic encoder calibration (V2) once. It's stored in the 1HCL flash and survives power cycles.";
+		case 1: return "Linear composite encoder: run Magnetic encoder calibration (V2) then Polarity & zeroing (V1) once. Stored in flash.";
+		default: return "No encoder selected. Set the encoder type in config.g with M569.1 T (T1/T2/T3) and pick it here.";
+	}
+});
 function runCalibration(c: CalibrationMove): void {
 	if (!selectedDriver.value) { return; }
 	askConfirm(buildCalibrationCommand(selectedDriver.value, c.id), async () => { await send(buildCalibrationCommand(selectedDriver.value!, c.id)); });
@@ -292,8 +438,7 @@ async function loadPid(): Promise<void> {
 	if (!selectedDriver.value) { return; }
 	try {
 		const reply = await machineStore.sendCode(`M569.1 P${selectedDriver.value}`, false, false);
-		const parsed = parsePidReply(reply);
-		Object.assign(pid, parsed);
+		Object.assign(pid, parsePidReply(reply));
 	} catch (e) { console.warn("[ClosedLoopTuning] loadPid failed", e); }
 }
 async function applyPid(): Promise<void> {
@@ -307,9 +452,6 @@ async function applyPid(): Promise<void> {
 const canRecord = computed(() => !!selectedDriver.value && recordKeys.value.length > 0);
 const capturePreview = computed(() => selectedDriver.value ? buildCaptureCommand(captureOptions()) : "");
 
-function stepMoveGcode(): string | undefined {
-	return moveMode.value === "custom" ? (customMove.value || undefined) : undefined;
-}
 function captureOptions() {
 	return {
 		driver: selectedDriver.value ?? "",
@@ -318,7 +460,7 @@ function captureOptions() {
 		rate: sampleRate.value,
 		variables: recordKeys.value.map((k) => CAPTURE_VARIABLES.find((v) => v.key === k)?.id ?? 0),
 		manoeuvre: moveMode.value === "step" ? 64 : 0,
-		move: stepMoveGcode(),
+		move: moveMode.value === "custom" ? (customMove.value || undefined) : undefined,
 	};
 }
 
@@ -326,7 +468,7 @@ let runsAtStart = -1;
 async function record(): Promise<void> {
 	if (!canRecord.value) { return; }
 	if (moveMode.value === "custom" && !customMove.value) {
-		uiStore.makeNotification(LogLevel.warning, "Closed Loop Tuning", "Enter a custom move before recording.");
+		uiStore.makeNotification(LogLevel.warning, "Closed Loop Tuning", "Enter a move before recording.");
 		return;
 	}
 	runsAtStart = selectedBoard.value?.closedLoop?.runs ?? -1;
@@ -343,7 +485,6 @@ async function record(): Promise<void> {
 	}
 }
 
-// Detect capture completion via the object model's run counter, then load the newest CSV.
 watch(() => selectedBoard.value?.closedLoop?.runs, async (runs) => {
 	if (!recording.value || runs == null || runs === runsAtStart) { return; }
 	await loadLatestCapture();
@@ -372,19 +513,19 @@ const verdictType = computed(() => {
 	switch (recommendation.value?.verdict) {
 		case "accept": return "success";
 		case "decrease": return "warning";
-		case "increase": return "info";
 		default: return "info";
 	}
 });
 watch(wizardIndex, () => { recommendation.value = null; });
-
+function seedDefault(): void {
+	const t = wizardStep.value.term;
+	if (t && wizardStep.value.defaultStart !== undefined) { (pid as any)[t] = wizardStep.value.defaultStart; void applyPid(); }
+}
 async function runWizardCapture(): Promise<void> {
-	// Force a step-manoeuvre capture recording the keys this step needs.
 	moveMode.value = "step";
 	recordKeys.value = Array.from(new Set([...wizardStep.value.recordKeys]));
 	await record();
 }
-// After a wizard capture finishes, analysis runs; recompute the recommendation.
 watch(metrics, (m) => {
 	const term = wizardStep.value.term;
 	if (!term) { return; }
@@ -395,6 +536,38 @@ function applySuggestion(): void {
 	if (term && recommendation.value?.suggested !== undefined) {
 		(pid as any)[term] = recommendation.value.suggested;
 		void applyPid();
+	}
+}
+
+// --- Test & save ---
+async function runTestMove(): Promise<void> {
+	moveMode.value = "custom";
+	recordKeys.value = ["measuredMotorSteps", "targetMotorSteps", "currentError"];
+	viewKeys.value = ["currentError"];
+	await record();
+}
+const configBlock = computed(() => {
+	const id = selectedDriver.value ?? "#.#";
+	const lines = [
+		`; --- Closed-loop tuning for driver ${id} ---`,
+		`; Put this in config.g AFTER your M569 / M906 / microstepping setup:`,
+		buildPidCommand(id, pid),
+		"",
+		`; Put this in the homing file, after homing in open loop and moving to a safe spot:`,
+		`${buildModeCommand(id, currentMode.value === "assisted" ? "assisted" : "closed", modeD)}     ; ${currentMode.value === "assisted" ? "assisted open loop" : "closed loop"}`,
+	];
+	for (const mid of requiredMoveIds.value) {
+		const move = CALIBRATION_MOVES.find((c) => c.id === mid);
+		lines.push(`${buildCalibrationCommand(id, mid)}        ; ${move?.name ?? "calibration"}`);
+	}
+	return lines.join("\n");
+});
+async function copyConfig(): Promise<void> {
+	try {
+		await navigator.clipboard.writeText(configBlock.value);
+		uiStore.makeNotification(LogLevel.success, "Closed Loop Tuning", "config.g block copied to clipboard.");
+	} catch {
+		uiStore.makeNotification(LogLevel.warning, "Closed Loop Tuning", "Couldn't access the clipboard — select and copy the block manually.");
 	}
 }
 
@@ -428,5 +601,16 @@ watch(selectedDriver, (d) => { if (d) { void loadPid(); } });
 }
 :deep(.cl-var .v-label) {
 	font-size: 0.8rem;
+}
+.cl-config {
+	white-space: pre-wrap;
+	font-size: 0.78rem;
+	background: rgba(var(--v-theme-on-surface), 0.05);
+	padding: 8px;
+	border-radius: 4px;
+}
+:deep(.cl-active-term .v-field) {
+	outline: 2px solid rgb(var(--v-theme-primary));
+	border-radius: 4px;
 }
 </style>
