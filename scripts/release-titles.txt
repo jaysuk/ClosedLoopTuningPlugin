@@ -1,0 +1,22 @@
+# GitHub Release titles for ClosedLoopTuning, one per line (blank lines and # comments ignored).
+# Picked by version index (semver-sorted), wrapping if it runs out. Closed-loop / control puns.
+Closing the Loop
+In the Loop
+Feedback Loop
+Critically Damped
+Rise and Shine
+Overshoot Yourself
+Steady State of Mind
+Gain Control
+Proportional Response
+Derivative Works
+Integral to Success
+Phase Shift
+Loop Dreams
+Settling Time
+Tuned In
+Step Response
+Zero Error
+On Target
+Damped Spirits
+Full Steps Ahead
