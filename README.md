@@ -1,46 +1,42 @@
-# Closed Loop Tuning Plugin
+# Closed Loop Tuning Plugin (DWC 3.7 rework)
 
-*Visualise the performance of your [1HCL closed loop controller board](https://docs.duet3d.com/Duet3D_hardware/Duet_3_family/Duet_3_Expansion_1HCL) or [Motor23CL closed loop motor](https://docs.duet3d.com/en/Duet3D_hardware/Duet_3_family/Duet_3_Motor_23CL).*
+Tune and visualise a Duet closed-loop driver — the [Expansion 1HCL](https://docs.duet3d.com/Duet3D_hardware/Duet_3_family/Duet_3_Expansion_1HCL) or [Motor23CL](https://docs.duet3d.com/en/Duet3D_hardware/Duet_3_family/Duet_3_Motor_23CL) — from Duet Web Control.
 
+> This repository is a **fork** of [Duet3D/ClosedLoopTuningPlugin](https://github.com/Duet3D/ClosedLoopTuningPlugin),
+> ported to **DuetWebControl 3.7** (Vue 3 / Vuetify 4 / Pinia) and reworked to make tuning easier.
+> Original plugin by Louis Irwin & Juan Rosario. GPL-3.0-or-later, as upstream.
 
-![Image of the plugin UI](https://repository-images.githubusercontent.com/392753893/06488b0a-3573-45ae-a2c7-0017f91d7f48)
+## What this rework adds
 
-## Getting Started
+- **DWC 3.7 port** — the original was a Vue 2 / DWC 3.5-era plugin that won't load on 3.7. Every component
+  was rewritten to the Composition API + Vuetify 4, on the standard external-plugin Vite build via
+  [`dwc-plugin-test-kit`](https://github.com/jaysuk/dwc-plugin-test-kit), with self-update + diagnostics
+  through [`dwc-plugin-runtime`](https://github.com/jaysuk/dwc-plugin-runtime) (joins Flexible Layouts'
+  unified update popup).
+- **Mode + calibration control** — switch a driver between open / assisted-open / closed loop
+  (`M569 D2/D5/D4`, shown literally before sending and overridable), and run the `M569.6` calibration
+  manoeuvres (polarity/zero, magnetic cal, check, clear), filtered to your encoder type.
+- **Guided tuning wizard** — steps through the documented procedure (P → D → I, plus advanced A/V),
+  running a step capture and recommending whether to increase / decrease / accept each term.
+- **Automatic step-response analysis** — every capture is reduced to rise time, overshoot, settling
+  time, steady-state error and peak/RMS error, so you don't have to eyeball the graph.
+- **Improved chart** — multi-axis plot, overlay a previous run to compare tunings, and CSV export.
 
-To install the plugin into Duet Web Control (DWC):
+The mode `D`-values default to the RRF 3.6/3.7 mapping (open=`D2`, closed=`D4`, assisted-open=`D5`) and
+are shown before sending; an *Advanced* panel lets you override them per machine.
 
-1. Navigate to the [latest release](https://github.com/Duet3D/ClosedLoopTuningPlugin/releases) and download the `closed-loop-plugin.zip` asset
-2. Upload the zip folder to DWC by using the 'upload system files' button in the 'system' area
-3. Follow the on-screen instructions for installing the plugin
-4. Navigate to Setting > Machine Specific > Machine Specific Plugins and click the 'Start' button
-5. A 'closed loop' option should appear in the left sidebar - you're ready to start tuning!
+## Develop
 
-*Please note that DWC 3.3.0 is the minimum supported version of DWC. If you have difficulty following the above instructions, or if the plugin does not work as expected, please ensure you have [updated to the latest version of DWC](https://docs.duet3d.com/User_manual/RepRapFirmware/Updating_firmware).*
-
-## Contributing and Compiling from source
-
-If you don't fancy using the latest release, or you wish to contribute changes, you can compile this plugin yourself from source. To do this, you first need to clone the Duet Web Control (DWC) repo from https://github.com/Duet3D/DuetWebControl.
-
-Once you have DWC cloned, copy the `/src` folder from this repository into the `/src/plugins` folder in DWC. Then, rename the newly copied `/src/plugins/src` folder to `/src/plugins/ClosedLoopTuning`.
-
-Copy the following object into the `export default` array in DWC's `/src/plugins/index.js`
-
-```js
-new DwcPlugin({
-  id: 'ClosedLoopTuning',
-  name: 'Closed Loop Tuning',
-  author: 'Louis Irwin, Juan Rosario',
-  version,
-  loadDwcResources: () => import(
-    /* webpackChunkName: "ClosedLoopTuning" */
-    './ClosedLoopTuning/index.js'
-  )
-})
+```bash
+npm install
+npm test
+DWC_DIR=/path/to/DuetWebControl npm run typecheck
+DWC_DIR=/path/to/DuetWebControl npm run verify-build
 ```
 
-If you wish to develop on the plugin, run `npm run serve` in the DWC directory and open the resulting build in your browser. You can then navigate to Settings > General > Built-in Plugins and click 'start' to run the plugin. Any changes made in `/src/plugins/ClosedLoopTuning` will then be hot-reloaded and reflected live in the browser.
+The protocol builders, CSV parsing, step-response analysis and wizard logic are pure modules under
+`src/model/` and are unit-tested. Releases: `npm run release -- <version> --push`.
 
-## Building as an external plugin
+## License
 
-Once you have finished developing, or if you just wish to compile from source, run `npm run build-plugin ../ClosedLoopTuningPlugin` in the DWC directory where `../ClosedLoopTuningPlugin` points to this directory.
-This will generate a ZIP file in the `dist` directory within DWC that can be uploaded as a plugin.
+GPL-3.0-or-later.
