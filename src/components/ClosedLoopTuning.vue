@@ -673,10 +673,11 @@ async function runCapture(opts: Parameters<typeof buildCaptureCommand>[0]): Prom
 	const reply = await machineStore.sendCode(buildCaptureCommand(opts), false, false);
 	if (reply && reply.startsWith("Error:")) {
 		uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", reply);
+		log(`Firmware rejected the capture: ${reply}`);
 		return null;
 	}
 	const captureMs = opts.rate > 0 ? (opts.samples / opts.rate) * 1000 : 4000;
-	if (!(await waitForRuns(startRuns, captureMs + 8000))) { return null; }
+	if (!(await waitForRuns(startRuns, captureMs + 8000))) { log("Timed out waiting for the capture to finish — is the driver calibrated and in closed loop?"); return null; }
 	await delay(300); // let the CSV finish writing
 	return loadLatestCsv();
 }
@@ -766,6 +767,14 @@ async function runAutoTune(): Promise<void> {
 	autoLog.value = [];
 	viewKeys.value = ["measuredMotorSteps", "targetMotorSteps", "currentError"];
 	try {
+		// The step manoeuvre only moves in closed/assisted loop — the board may have reverted to open
+		// loop (e.g. after a reboot) even if the plugin remembers otherwise, so (re)assert the mode.
+		const mode: LoopMode = currentMode.value === "assisted" ? "assisted" : "closed";
+		log(`Ensuring ${MODE_LABELS[mode]} — sending ${buildModeCommand(selectedDriver.value ?? "", mode, modeD)}`);
+		await send(buildModeCommand(selectedDriver.value ?? "", mode, modeD));
+		currentMode.value = mode;
+		await delay(600);
+
 		// Phase 1 — P/D/I from the step response. Zero the other terms first so P is measured alone.
 		pid.i = 0; pid.d = 0; pid.v = 0; pid.a = 0;
 		await applyPid();
