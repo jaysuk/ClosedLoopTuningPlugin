@@ -125,11 +125,11 @@
 			<template #item.4>
 				<v-card flat>
 					<div class="text-body-2 mb-3">
-						First switch to closed/assisted loop and calibrate (Steps 2-3), set the motor current to its
-						final value, and uncouple the motor (see the note above). Then run <strong>Auto-tune</strong>:
-						it tunes P, D and I from step jumps, then A and V from a short move. Manual term-by-term tuning
-						is available below.
-						<HelpTip :href="DOCS.tuning" text="Auto-tune cycles P (rise time) → D (overshoot) → I (steady-state error) from step jumps, then A → V from a G1 move. It captures after every change, converges when the response stops improving, and backs off on oscillation. It does NOT change the loop mode or calibrate — do those in Steps 2-3 first." />
+						Calibrate the encoder (Step 3), set the motor current to its final value, and uncouple the
+						motor (see the note above). Then run <strong>Auto-tune</strong>: it switches to closed loop and
+						tunes P, D and I from step jumps (repeated for the chosen number of cycles), then A and V from a
+						short move. Manual term-by-term tuning is available below.
+						<HelpTip :href="DOCS.tuning" text="Auto-tune ensures closed loop, then cycles P (rise time) → D (overshoot) → I (steady-state error) from step jumps, then A → V from a G1 move. It captures after every change, converges when the response stops improving, and backs off on oscillation. It does NOT calibrate — do that in Step 3 first." />
 					</div>
 
 					<!-- Auto-tune -->
@@ -759,8 +759,8 @@ function startAutoTune(): void {
 	if (!selectedDriver.value) { return; }
 	const hasAxis = !!axisLetterForDriver();
 	const msg = hasAxis
-		? "Auto-tune will repeatedly move the driver: step jumps to tune P/D/I, then back-and-forth moves to tune A/V. Make sure the driver is already in closed loop and calibrated (Steps 2-3) and the motor is uncoupled."
-		: "Auto-tune will repeatedly move the driver with step jumps to tune P/D/I (A/V need an axis and will be skipped). Make sure the driver is already in closed loop and calibrated (Steps 2-3) and the motor is uncoupled.";
+		? "Auto-tune will switch to closed loop, then repeatedly move the driver: step jumps to tune P/D/I, then back-and-forth moves to tune A/V. Make sure you've calibrated (Step 3) and the motor is uncoupled."
+		: "Auto-tune will switch to closed loop, then repeatedly move the driver with step jumps to tune P/D/I (A/V need an axis and will be skipped). Make sure you've calibrated (Step 3) and the motor is uncoupled.";
 	askConfirm(msg, runAutoTune);
 }
 
@@ -771,8 +771,15 @@ async function runAutoTune(): Promise<void> {
 	viewKeys.value = ["measuredMotorSteps", "targetMotorSteps", "currentError"];
 	const totalCycles = Math.max(1, Math.round(cycles.value || 1));
 	try {
-		// The driver must already be in closed/assisted loop and calibrated (Steps 2-3) — auto-tune does
-		// NOT change the mode or calibrate.
+		// Ensure the driver is in a feedback mode — the step manoeuvre only moves in closed/assisted loop,
+		// and the board can come up in open loop after a reboot/reload. Uses the corrected mode command
+		// (D only — never S, which is direction). It does NOT calibrate; that's the user's job (Step 3).
+		const mode: LoopMode = currentMode.value === "assisted" ? "assisted" : "closed";
+		log(`Ensuring ${MODE_LABELS[mode]} — ${buildModeCommand(selectedDriver.value ?? "", mode, modeD)}`);
+		await send(buildModeCommand(selectedDriver.value ?? "", mode, modeD));
+		currentMode.value = mode;
+		await delay(600);
+
 		let ok = true;
 		for (let cycle = 1; cycle <= totalCycles && ok && !autoCancel.value; cycle++) {
 			log(`──── Cycle ${cycle} of ${totalCycles} ────`);
