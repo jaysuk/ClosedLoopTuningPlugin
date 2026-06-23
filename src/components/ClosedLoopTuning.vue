@@ -150,6 +150,7 @@
 										:variant="autoRunning && wizardStep.term === t.term ? 'flat' : 'tonal'">{{ t.term.toUpperCase() }} = {{ t.value }}</v-chip>
 							</div>
 							<div class="d-flex align-center flex-wrap ga-3 mt-2">
+								<v-text-field v-model.number="cycles" type="number" :min="1" :max="10" label="Cycles" density="compact" variant="outlined" hide-details style="max-width: 120px"><template #append-inner><HelpTip text="How many times to iterate the P→D→I tuning. Each pass re-tunes every term with the others in place, so they converge together. 3 is a good default. A/V are tuned once at the end." /></template></v-text-field>
 								<span class="text-caption text-medium-emphasis">A/V test move:</span>
 								<v-text-field v-model.number="avDistance" type="number" label="Distance (mm)" density="compact" variant="outlined" hide-details style="max-width: 150px"><template #append-inner><HelpTip text="Length of the back-and-forth move used to tune A and V — long enough to reach steady speed. Default 50 mm." /></template></v-text-field>
 								<v-text-field v-model.number="avFeed" type="number" label="Feed (mm/min)" density="compact" variant="outlined" hide-details style="max-width: 160px"><template #append-inner><HelpTip text="Speed of the A/V test move. Higher exercises the feed-forward terms more. Default 6000 mm/min (100 mm/s)." /></template></v-text-field>
@@ -400,7 +401,7 @@ interface SavedState {
 	step?: number; wizardIndex?: number; selectedDriver?: string | null; currentMode?: LoopMode | null;
 	encoderType?: EncoderType; modeD?: Partial<typeof DEFAULT_MODE_D>; pid?: Partial<PidConfig>;
 	samples?: number; sampleRate?: number; moveMode?: "step" | "custom"; customMove?: string;
-	recordKeys?: Array<string>; viewKeys?: Array<string>; avDistance?: number; avFeed?: number;
+	recordKeys?: Array<string>; viewKeys?: Array<string>; avDistance?: number; avFeed?: number; cycles?: number;
 }
 function loadState(): SavedState {
 	try { return JSON.parse(localStorage.getItem(LS_STATE) ?? "{}") as SavedState; } catch { return {}; }
@@ -442,7 +443,7 @@ function persistState(): void {
 				currentMode: currentMode.value, encoderType: encoderType.value, modeD: { ...modeD }, pid: { ...pid },
 				samples: samples.value, sampleRate: sampleRate.value, moveMode: moveMode.value,
 				customMove: customMove.value, recordKeys: recordKeys.value, viewKeys: viewKeys.value,
-				avDistance: avDistance.value, avFeed: avFeed.value,
+				avDistance: avDistance.value, avFeed: avFeed.value, cycles: cycles.value,
 			} satisfies SavedState));
 		} catch { /* storage unavailable */ }
 	}, 300);
@@ -457,7 +458,8 @@ const autoStatus = ref("");
 const autoLog = ref<Array<string>>([]);
 const avDistance = ref(saved.avDistance ?? 50);   // mm — A/V test move length
 const avFeed = ref(saved.avFeed ?? 6000);          // mm/min — A/V test move feedrate
-watch([avDistance, avFeed], persistState);
+const cycles = ref(saved.cycles ?? 3);             // how many times to iterate P→D→I
+watch([avDistance, avFeed, cycles], persistState);
 
 const confirmOpen = ref(false);
 const confirmCommand = ref("");
@@ -767,29 +769,34 @@ async function runAutoTune(): Promise<void> {
 	autoCancel.value = false;
 	autoLog.value = [];
 	viewKeys.value = ["measuredMotorSteps", "targetMotorSteps", "currentError"];
+	const totalCycles = Math.max(1, Math.round(cycles.value || 1));
 	try {
 		// The driver must already be in closed/assisted loop and calibrated (Steps 2-3) — auto-tune does
-		// NOT change the mode or calibrate. Phase 1: P/D/I from the step response; zero the other terms
-		// first so P is measured alone.
-		pid.i = 0; pid.d = 0; pid.v = 0; pid.a = 0;
-		await applyPid();
+		// NOT change the mode or calibrate.
 		let ok = true;
-		for (const strategy of AUTOTUNE_SEQUENCE) {
-			wizardIndex.value = WIZARD_STEPS.findIndex((s) => s.term === strategy.term);
-			if (autoCancel.value) { ok = false; break; }
-			if (!(await autoTuneTerm(strategy))) { ok = false; break; }
-		}
-		// Phase 2 — A/V feed-forward from a G1 move (best-effort; needs an axis).
-		if (ok && !autoCancel.value) {
-			if (axisLetterForDriver()) {
-				log("Tuning A/V on a moving axis…");
-				for (const strategy of AUTOTUNE_FF_SEQUENCE) {
-					wizardIndex.value = WIZARD_STEPS.findIndex((s) => s.term === strategy.term);
-					if (autoCancel.value) { break; }
-					await autoTuneMoveTerm(strategy); // don't fail the whole run if A/V can't converge
+		for (let cycle = 1; cycle <= totalCycles && ok && !autoCancel.value; cycle++) {
+			log(`──── Cycle ${cycle} of ${totalCycles} ────`);
+			// First cycle: zero the other terms so P is measured alone. Later cycles refine P/D/I with the
+			// previously-found values in place (each term re-converges given the others — coordinate descent).
+			if (cycle === 1) { pid.i = 0; pid.d = 0; pid.v = 0; pid.a = 0; await applyPid(); }
+			for (const strategy of AUTOTUNE_SEQUENCE) {
+				wizardIndex.value = WIZARD_STEPS.findIndex((s) => s.term === strategy.term);
+				if (autoCancel.value) { ok = false; break; }
+				if (!(await autoTuneTerm(strategy))) { ok = false; break; }
+			}
+			// A/V feed-forward (needs a G1 move + an axis) — only on the final cycle, after P/D/I have
+			// settled, since they're slower and far less coupled to the P/D/I iteration.
+			if (ok && !autoCancel.value && cycle === totalCycles) {
+				if (axisLetterForDriver()) {
+					log("Tuning A/V on a moving axis…");
+					for (const strategy of AUTOTUNE_FF_SEQUENCE) {
+						wizardIndex.value = WIZARD_STEPS.findIndex((s) => s.term === strategy.term);
+						if (autoCancel.value) { break; }
+						await autoTuneMoveTerm(strategy); // don't fail the whole run if A/V can't converge
+					}
+				} else {
+					log("A/V skipped — this driver has no axis (extruder?).");
 				}
-			} else {
-				log("A/V skipped — this driver has no axis (extruder?).");
 			}
 		}
 		autoStatus.value = autoCancel.value
