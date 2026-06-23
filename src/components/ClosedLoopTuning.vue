@@ -500,11 +500,14 @@ const selectedBoard = computed<any>(() => {
 	return (machineStore.model as any).boards?.find((b: any) => b && b.canAddress === addr) ?? null;
 });
 
+/** The axis object the selected driver belongs to (null for extruders / unknown). */
+function axisForDriver(): any {
+	if (!selectedDriver.value) { return null; }
+	return (machineStore.model as any).move?.axes?.find((a: any) => (a.drivers ?? []).some((d: any) => `${d.board}.${d.driver}` === selectedDriver.value)) ?? null;
+}
 /** Axis letter the selected driver belongs to (null for extruders / unknown — A/V can't be auto-tuned then). */
 function axisLetterForDriver(): string | null {
-	if (!selectedDriver.value) { return null; }
-	const ax = (machineStore.model as any).move?.axes?.find((a: any) => (a.drivers ?? []).some((d: any) => `${d.board}.${d.driver}` === selectedDriver.value));
-	return ax?.letter ?? null;
+	return axisForDriver()?.letter ?? null;
 }
 
 // --- Mode ---
@@ -636,9 +639,9 @@ function seedDefault(): void {
 	if (t && wizardStep.value.defaultStart !== undefined) { (pid as any)[t] = wizardStep.value.defaultStart; void applyPid(); }
 }
 async function runWizardCapture(): Promise<void> {
-	moveMode.value = "step";
-	recordKeys.value = Array.from(new Set([...wizardStep.value.recordKeys]));
-	await record();
+	// Use the same G1-move step capture as auto-tune (the V64 manoeuvre doesn't move on all setups).
+	recording.value = true;
+	try { await captureStep(); } finally { recording.value = false; }
 }
 watch(metrics, (m) => {
 	const term = wizardStep.value.term;
@@ -685,9 +688,26 @@ async function runCapture(opts: Parameters<typeof buildCaptureCommand>[0]): Prom
 	return loadLatestCsv();
 }
 
-/** Step-manoeuvre capture → step metrics (for P/D/I). */
+/**
+ * Step-response capture (for P/D/I). Uses a small, fast G1 move (~16 full steps) which behaves like a
+ * step jump — the firmware V64 manoeuvre doesn't reliably move on all setups, whereas a real
+ * closed-loop G1 move does (it's also what the official plugin/wiki tune from). The outward move is
+ * captured, then the axis is returned to its start. Falls back to V64 for drivers with no axis (extruders).
+ */
 async function captureStep(): Promise<StepMetrics | null> {
-	const c = await runCapture({ driver: selectedDriver.value ?? "", samples: samples.value, activate: 0, rate: sampleRate.value, variables: varIds(["measuredMotorSteps", "targetMotorSteps", "currentError", "pidPTerm"]), manoeuvre: 64 });
+	const ax = axisForDriver();
+	const stepVars = varIds(["measuredMotorSteps", "targetMotorSteps", "currentError", "pidPTerm"]);
+	let c: ParsedCapture | null;
+	if (ax?.letter) {
+		const stepsPerMm = Number(ax.stepsPerMm) || 80;
+		const micro = Number(ax.microstepping?.value) || 16;
+		const dist = Math.max(0.1, (micro / stepsPerMm) * 16);   // ~16 full steps ≈ a step jump
+		const move = `G91 G1 H2 ${ax.letter}${dist.toFixed(3)} F18000 G90`;
+		c = await runCapture({ driver: selectedDriver.value ?? "", samples: samples.value, activate: 1, rate: sampleRate.value, variables: stepVars, manoeuvre: 0, move });
+		try { await machineStore.sendCode(`G91 G1 H2 ${ax.letter}-${dist.toFixed(3)} F18000 G90`, false, false); } catch { /* return move */ }
+	} else {
+		c = await runCapture({ driver: selectedDriver.value ?? "", samples: samples.value, activate: 0, rate: sampleRate.value, variables: stepVars, manoeuvre: 64 });
+	}
 	if (!c) { return null; }
 	metrics.value = analyzeCapture(c, sampleRate.value);
 	return metrics.value;
