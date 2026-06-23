@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import { analyzeStep, type CaptureSeries } from "../model/analysis";
-import { parseCapture } from "../model/csv";
-import { analyzeCapture } from "../model/analysis";
+import { parseCapture, type ParsedCapture } from "../model/csv";
+import { analyzeCapture, analyzeMove } from "../model/analysis";
 
 /** Build a synthetic step response: target steps 0→4 at index 20, measured overshoots then settles. */
 function syntheticStep(overshoot: number, ssError: number): CaptureSeries {
@@ -66,5 +66,37 @@ describe("analyzeCapture (from CSV)", () => {
 	it("returns null when the required columns are missing", () => {
 		const csv = "Sample,Raw Encoder Reading\n0,1\n1,2\n";
 		expect(analyzeCapture(parseCapture(csv), 1000)).toBeNull();
+	});
+});
+
+describe("analyzeMove (A/V feed-forward)", () => {
+	it("finds the accel P-term peak and a near-zero cruise mean from a trapezoid move", () => {
+		// Trapezoid velocity: ramp up (0..9), cruise (10..24 at v=10), ramp down (25..39).
+		const n = 40;
+		const vel: Array<number> = [];
+		for (let i = 0; i < n; i++) { vel.push(i < 10 ? i : i < 25 ? 10 : Math.max(0, 10 - (i - 24))); }
+		const target: Array<number> = [0];
+		for (let i = 1; i < n; i++) { target.push(target[i - 1] + vel[i - 1]); }
+		// PID P term: large during accel/decel, ~0 during steady speed.
+		const pterm = vel.map((v) => (v >= 10 ? 1 : 80));
+		const capture: ParsedCapture = {
+			headers: ["Target Motor Steps", "PID P Term"],
+			columns: { "Target Motor Steps": target, "PID P Term": pterm },
+			rowCount: n,
+		};
+		const m = analyzeMove(capture, 1000);
+		expect(m).not.toBeNull();
+		expect(m!.hasMove).toBe(true);
+		expect(m!.pTermAccelPeak).toBeGreaterThanOrEqual(50);
+		expect(Math.abs(m!.pTermCruiseMean)).toBeLessThan(20);
+	});
+
+	it("reports no move for a static capture", () => {
+		const capture: ParsedCapture = {
+			headers: ["Target Motor Steps", "PID P Term"],
+			columns: { "Target Motor Steps": [0, 0, 0, 0, 0, 0, 0, 0], "PID P Term": [1, 1, 1, 1, 1, 1, 1, 1] },
+			rowCount: 8,
+		};
+		expect(analyzeMove(capture, 1000)!.hasMove).toBe(false);
 	});
 });

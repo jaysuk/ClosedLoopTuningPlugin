@@ -143,3 +143,58 @@ export function analyzeCapture(capture: ParsedCapture, sampleRateHz: number): St
 	const series = buildSeries(capture, sampleRateHz);
 	return series ? analyzeStep(series) : null;
 }
+
+// ---- Feed-forward (A / V) analysis from a G1 MOVE capture ----
+// A and V only act during motion, so they're judged on the PID P term during a real move: the A term
+// should flatten the P-term peaks in the accelerate/decelerate segments, and V should bring the mean
+// P-term in the steady-speed segment toward zero. Segments are derived from the target-step velocity.
+
+export interface MoveMetrics {
+	/** A clear move with a steady-speed (cruise) section was detected. */
+	hasMove: boolean;
+	/** Peak |PID P term| during the accelerate/decelerate segments (A reduces this). */
+	pTermAccelPeak: number;
+	/** Mean PID P term during the steady-speed segment (V brings this toward zero). */
+	pTermCruiseMean: number;
+	/** Number of samples classed as steady-speed (confidence). */
+	cruiseSamples: number;
+}
+
+export function analyzeMove(capture: ParsedCapture, sampleRateHz: number): MoveMetrics | null {
+	const target = column(capture, "Target Motor Steps");
+	const pterm = column(capture, "PID P Term");
+	if (!target || !pterm || target.length < 8) {
+		return null;
+	}
+	const time = timeAxisSeconds(capture, sampleRateHz);
+	const n = Math.min(target.length, pterm.length, time.length);
+	const dtOf = (i: number) => (time[i] - time[i - 1]) || (sampleRateHz > 0 ? 1 / sampleRateHz : 1);
+
+	// Velocity (steps/s) of the commanded target, and its acceleration.
+	const vel: Array<number> = [];
+	for (let i = 1; i < n; i++) { vel.push((target[i] - target[i - 1]) / dtOf(i)); }
+	const absVel = vel.map((v) => Math.abs(v));
+	const maxV = absVel.reduce((a, b) => Math.max(a, b), 0);
+	if (maxV <= 1e-6) {
+		return { hasMove: false, pTermAccelPeak: 0, pTermCruiseMean: 0, cruiseSamples: 0 };
+	}
+	const acc: Array<number> = [];
+	for (let i = 1; i < vel.length; i++) { acc.push((vel[i] - vel[i - 1]) / dtOf(i + 1)); }
+	const maxA = acc.reduce((a, b) => Math.max(a, Math.abs(b)), 1e-9);
+
+	let accelPeak = 0;
+	let cruiseSum = 0;
+	let cruiseCount = 0;
+	for (let i = 1; i < n; i++) {
+		const v = absVel[i - 1];
+		const a = i - 1 < acc.length ? Math.abs(acc[i - 1]) : 0;
+		const p = pterm[i];
+		if (!Number.isFinite(p)) { continue; }
+		if (v >= 0.7 * maxV && a < 0.2 * maxA) {
+			cruiseSum += p; cruiseCount++;                 // steady speed
+		} else if (a >= 0.3 * maxA && v > 0.1 * maxV) {
+			accelPeak = Math.max(accelPeak, Math.abs(p));  // accel / decel
+		}
+	}
+	return { hasMove: cruiseCount >= 3, pTermAccelPeak: accelPeak, pTermCruiseMean: cruiseCount ? cruiseSum / cruiseCount : 0, cruiseSamples: cruiseCount };
+}

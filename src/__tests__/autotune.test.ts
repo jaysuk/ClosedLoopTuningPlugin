@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { D_STRATEGY, I_STRATEGY, P_STRATEGY, describeMetrics, type Attempt } from "../model/autotune";
-import type { StepMetrics } from "../model/analysis";
+import { A_STRATEGY, D_STRATEGY, I_STRATEGY, P_STRATEGY, V_STRATEGY, describeMetrics, type Attempt, type MoveAttempt } from "../model/autotune";
+import type { MoveMetrics, StepMetrics } from "../model/analysis";
 
 function m(over: Partial<StepMetrics>): StepMetrics {
 	return { stepSize: 4, riseTime: 0.02, overshootPct: 0, settlingTime: 0.03, steadyStateError: 0, peakError: 0.1, rmsError: 0.05, oscillations: 0, hasStep: true, ...over };
@@ -64,5 +64,36 @@ describe("I strategy", () => {
 describe("describeMetrics", () => {
 	it("summarises a capture in one line", () => {
 		expect(describeMetrics(m({ riseTime: 0.02, overshootPct: 10, steadyStateError: 0.1, oscillations: 3 }))).toContain("rise 20ms");
+	});
+});
+
+function mm(over: Partial<MoveMetrics>): MoveMetrics {
+	return { hasMove: true, pTermAccelPeak: 0, pTermCruiseMean: 0, cruiseSamples: 10, ...over };
+}
+const mat = (value: number, metrics: MoveMetrics): MoveAttempt => ({ value, metrics });
+
+describe("A strategy (accel feed-forward)", () => {
+	it("fails when no steady move was detected", () => {
+		expect(A_STRATEGY.decide([mat(0, mm({ hasMove: false }))]).kind).toBe("fail");
+	});
+	it("raises A while the accel P-term peak keeps dropping", () => {
+		const d = A_STRATEGY.decide([mat(0, mm({ pTermAccelPeak: 200 }))]);
+		expect(d.kind).toBe("set");
+		if (d.kind === "set") expect(d.value).toBe(50000);
+	});
+	it("accepts when the accel peak plateaus", () => {
+		const d = A_STRATEGY.decide([mat(50000, mm({ pTermAccelPeak: 100 })), mat(100000, mm({ pTermAccelPeak: 96 }))]);
+		expect(d.kind).toBe("accept");
+	});
+});
+
+describe("V strategy (velocity feed-forward)", () => {
+	it("accepts when the steady-speed P-term is ~0", () => {
+		expect(V_STRATEGY.decide([mat(200, mm({ pTermCruiseMean: 2 }))]).kind).toBe("accept");
+	});
+	it("starts at 100 from zero when the cruise P-term is high", () => {
+		const d = V_STRATEGY.decide([mat(0, mm({ pTermCruiseMean: 50 }))]);
+		expect(d.kind).toBe("set");
+		if (d.kind === "set") expect(d.value).toBe(100);
 	});
 });

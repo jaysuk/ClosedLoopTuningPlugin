@@ -7,7 +7,7 @@
  * capture+analysis side effect; this module only decides the next move, so it's deterministic and
  * testable. Every term is bounded (value caps + max attempts) and backs off on oscillation for safety.
  */
-import type { StepMetrics } from "./analysis";
+import type { MoveMetrics, StepMetrics } from "./analysis";
 import type { PidTerm } from "./wizard";
 
 export interface Attempt {
@@ -137,11 +137,102 @@ export const I_STRATEGY: TermStrategy = {
 	},
 };
 
-/** The default auto-tune sequence: P, then D, then I. */
+/** The step-response auto-tune sequence: P, then D, then I. */
 export const AUTOTUNE_SEQUENCE: Array<TermStrategy> = [P_STRATEGY, D_STRATEGY, I_STRATEGY];
 
-/** One-line summary of a capture's metrics for the auto-tune log. */
+/** One-line summary of a step capture's metrics for the auto-tune log. */
 export function describeMetrics(m: StepMetrics): string {
 	const rise = m.riseTime == null ? "—" : `${(m.riseTime * 1000).toFixed(0)}ms`;
 	return `rise ${rise}, overshoot ${m.overshootPct.toFixed(0)}%, ss-err ${m.steadyStateError.toFixed(2)}, osc ${m.oscillations}`;
+}
+
+// ---- Feed-forward (A / V) auto-tune, driven by a G1 MOVE capture (MoveMetrics) ----
+
+export interface MoveAttempt {
+	value: number;
+	metrics: MoveMetrics;
+}
+
+export interface MoveTermStrategy {
+	term: PidTerm;
+	label: string;
+	start: number;
+	maxAttempts: number;
+	decide(attempts: Array<MoveAttempt>): AutoDecision;
+}
+
+export const A_MAX = 1_000_000;
+export const V_MAX = 5000;
+export const AV_PLATEAU = 0.1;        // <10% improvement → stop raising
+export const V_CRUISE_OK = 5;         // |mean P term| in cruise considered ~zero
+
+const noMove: AutoDecision = { kind: "fail", reason: "No steady-speed move detected — increase the A/V test move length or speed so the axis reaches cruise." };
+
+/** Attempt with the smallest metric (e.g. accel peak / |cruise mean|). */
+function bestMove(attempts: Array<MoveAttempt>, metric: (m: MoveMetrics) => number): MoveAttempt {
+	return attempts.reduce((best, a) => (metric(a.metrics) < metric(best.metrics) ? a : best), attempts[0]);
+}
+
+export const A_STRATEGY: MoveTermStrategy = {
+	term: "a",
+	label: "A (accel feed-forward)",
+	start: 0,
+	maxAttempts: 8,
+	decide(attempts) {
+		const last = attempts[attempts.length - 1];
+		if (!last.metrics.hasMove) { return noMove; }
+		if (attempts.length >= 2) {
+			const prev = attempts[attempts.length - 2];
+			const pp = prev.metrics.pTermAccelPeak;
+			const cp = last.metrics.pTermAccelPeak;
+			if (pp > 0 && (pp - cp) / pp < AV_PLATEAU) {
+				const best = pp <= cp ? prev : last;
+				return { kind: "accept", value: best.value, note: `Accel P-term peak plateaued (~${cp.toFixed(0)}).` };
+			}
+		}
+		const next = round(last.value <= 0 ? 50000 : last.value * 2);
+		if (next > A_MAX) { return { kind: "accept", value: last.value, note: `Reached the A limit (${A_MAX}).` }; }
+		if (attempts.length >= this.maxAttempts) {
+			const best = bestMove(attempts, (m) => m.pTermAccelPeak);
+			return { kind: "accept", value: best.value, note: "Max attempts reached." };
+		}
+		return { kind: "set", value: next, note: `Increasing A to ${next}.` };
+	},
+};
+
+export const V_STRATEGY: MoveTermStrategy = {
+	term: "v",
+	label: "V (velocity feed-forward)",
+	start: 0,
+	maxAttempts: 9,
+	decide(attempts) {
+		const last = attempts[attempts.length - 1];
+		if (!last.metrics.hasMove) { return noMove; }
+		if (Math.abs(last.metrics.pTermCruiseMean) <= V_CRUISE_OK) {
+			return { kind: "accept", value: last.value, note: `Steady-speed P-term ~0 (${last.metrics.pTermCruiseMean.toFixed(1)}).` };
+		}
+		if (attempts.length >= 2) {
+			const pm = Math.abs(attempts[attempts.length - 2].metrics.pTermCruiseMean);
+			const cm = Math.abs(last.metrics.pTermCruiseMean);
+			if (pm > 0 && (pm - cm) / pm < AV_PLATEAU) {
+				const best = bestMove(attempts, (m) => Math.abs(m.pTermCruiseMean));
+				return { kind: "accept", value: best.value, note: `Steady-speed P-term plateaued (~${last.metrics.pTermCruiseMean.toFixed(1)}).` };
+			}
+		}
+		const next = round(last.value <= 0 ? 100 : last.value * 1.6);
+		if (next > V_MAX) { return { kind: "accept", value: last.value, note: `Reached the V limit (${V_MAX}).` }; }
+		if (attempts.length >= this.maxAttempts) {
+			const best = bestMove(attempts, (m) => Math.abs(m.pTermCruiseMean));
+			return { kind: "accept", value: best.value, note: "Max attempts reached." };
+		}
+		return { kind: "set", value: next, note: `Increasing V to ${next}.` };
+	},
+};
+
+/** Feed-forward auto-tune sequence (needs a G1 move + an axis): A, then V. */
+export const AUTOTUNE_FF_SEQUENCE: Array<MoveTermStrategy> = [A_STRATEGY, V_STRATEGY];
+
+/** One-line summary of a move capture's metrics for the auto-tune log. */
+export function describeMove(m: MoveMetrics): string {
+	return `accel peak ${m.pTermAccelPeak.toFixed(0)}, cruise mean ${m.pTermCruiseMean.toFixed(1)}`;
 }

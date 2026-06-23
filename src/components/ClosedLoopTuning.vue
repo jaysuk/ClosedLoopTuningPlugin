@@ -13,6 +13,14 @@
 			No closed-loop drivers found. Connect a Duet 3 board with a 1HCL / M23CL configured for an axis or extruder.
 		</v-alert>
 
+		<v-alert type="warning" variant="tonal" density="compact" class="mb-3" icon="mdi-connection">
+			<strong>Disconnect the motor from the motion system before tuning.</strong>
+			Uncouple it from the belt / leadscrew (or detach the belt) so the shaft can spin freely. Tuning
+			drives the motor hard and deliberately provokes oscillation to find the limits — doing that while
+			it's coupled to the machine can stress or damage the mechanics. Reconnect before printing, and
+			re-run a quick check once coupled (the loaded inertia shifts the ideal values slightly).
+		</v-alert>
+
 		<div class="d-flex align-center mb-2">
 			<v-icon class="mr-2">mdi-chart-bell-curve-cumulative</v-icon>
 			<span class="text-subtitle-1">Closed Loop Tuning</span>
@@ -117,9 +125,10 @@
 			<template #item.4>
 				<v-card flat>
 					<div class="text-body-2 mb-3">
-						Set the motor current to its final value, make sure the axis has room to move, then let
-						<strong>Auto-tune</strong> do the work — or tune one term at a time manually below.
-						<HelpTip :href="DOCS.tuning" text="Order: P (fastest rise without oscillation) → D (remove overshoot) → I (remove steady-state error). Auto-tune cycles each term automatically, running a step capture between every change and backing off on oscillation. Click for the full guide." />
+						Set the motor current to its final value and make sure the motor can spin freely (uncoupled —
+						see the note above), then run <strong>Auto-tune</strong>. It tunes P, D and I from step jumps,
+						then A and V from a short back-and-forth move. Manual term-by-term tuning is available below.
+						<HelpTip :href="DOCS.tuning" text="Auto-tune cycles each term: P (rise time) → D (overshoot) → I (steady-state error) from step jumps, then A (accel) → V (velocity) from a G1 move. It captures after every change, converges when the response stops improving, and backs off on oscillation. Click for the full guide." />
 					</div>
 
 					<!-- Auto-tune -->
@@ -127,12 +136,22 @@
 						<v-card-text>
 							<div class="d-flex align-center flex-wrap ga-2">
 								<v-btn color="primary" :disabled="!selectedDriver || autoRunning || recording" :loading="autoRunning" prepend-icon="mdi-auto-fix" @click="startAutoTune">
-									Auto-tune (P → D → I)
+									Auto-tune (P → D → I → A → V)
 								</v-btn>
 								<v-btn v-if="autoRunning" color="error" variant="tonal" prepend-icon="mdi-stop" @click="abortAutoTune">Abort</v-btn>
-								<HelpTip :href="DOCS.tuning" text="Fully automatic: cycles P then D then I, running a step capture after each change and converging when the response stops improving. Bounded and backs off on oscillation. Keep an emergency stop handy the first time." />
+								<HelpTip :href="DOCS.tuning" text="Fully automatic and bounded. P/D/I use step jumps; A/V use a back-and-forth move along the axis (skipped for extruders). Keep an emergency stop handy the first time." />
 								<v-spacer />
 								<span class="text-caption text-medium-emphasis">{{ autoStatus }}</span>
+							</div>
+							<div class="d-flex flex-wrap ga-1 mt-2">
+								<v-chip v-for="t in pidSummary" :key="t.term" size="small"
+										:color="autoRunning && wizardStep.term === t.term ? 'primary' : undefined"
+										:variant="autoRunning && wizardStep.term === t.term ? 'flat' : 'tonal'">{{ t.term.toUpperCase() }} = {{ t.value }}</v-chip>
+							</div>
+							<div class="d-flex align-center flex-wrap ga-3 mt-2">
+								<span class="text-caption text-medium-emphasis">A/V test move:</span>
+								<v-text-field v-model.number="avDistance" type="number" label="Distance (mm)" density="compact" variant="outlined" hide-details style="max-width: 150px"><template #append-inner><HelpTip text="Length of the back-and-forth move used to tune A and V — long enough to reach steady speed. Default 50 mm." /></template></v-text-field>
+								<v-text-field v-model.number="avFeed" type="number" label="Feed (mm/min)" density="compact" variant="outlined" hide-details style="max-width: 160px"><template #append-inner><HelpTip text="Speed of the A/V test move. Higher exercises the feed-forward terms more. Default 6000 mm/min (100 mm/s)." /></template></v-text-field>
 							</div>
 							<div v-if="autoLog.length" class="cl-autolog mt-2">
 								<div v-for="(line, idx) in autoLog" :key="idx">{{ line }}</div>
@@ -140,7 +159,8 @@
 						</v-card-text>
 					</v-card>
 
-					<v-row dense>
+					<div v-if="!autoRunning" class="text-caption text-medium-emphasis mb-1">Manual tuning</div>
+					<v-row v-if="!autoRunning" dense>
 						<v-col cols="12" md="5">
 							<v-card variant="outlined">
 								<v-card-text>
@@ -194,7 +214,7 @@
 						</v-col>
 					</v-row>
 
-					<v-expansion-panels class="mt-3" variant="accordion">
+					<v-expansion-panels v-if="!autoRunning" class="mt-3" variant="accordion">
 						<v-expansion-panel>
 							<v-expansion-panel-title>
 								Advanced: manual capture
@@ -231,6 +251,23 @@
 						<code>M569</code>/<code>M906</code>/microstepping setup) and the mode + calibration lines into your homing file.
 						<HelpTip :href="DOCS.tuning" text="RRF programs these registers itself from M569/M906/microstepping, so the M569.1 line must come AFTER that setup. The mode switch and calibration belong in the homing file so they run every power-on." />
 					</div>
+
+					<v-alert type="info" variant="tonal" density="compact" class="mb-3">
+						<div class="text-subtitle-2 mb-1">What a well-tuned move looks like</div>
+						<div class="text-body-2">
+							Run a test move, then tick <strong>Current Error</strong> (and optionally Measured + Target Motor Steps) in the Plot panel:
+							<ul class="mt-1">
+								<li><strong>Current Error</strong> stays small and <strong>centred on zero</strong> — typically within a few encoder counts — with no steady drift away from zero. This is the single best indicator.</li>
+								<li><strong>Measured</strong> tracks <strong>Target</strong> closely the whole move: it rises into the steady-speed section without lagging behind, and settles at the end with little or no overshoot or ringing.</li>
+								<li>A little high-frequency “fuzz” on the error is normal (encoder resolution); a slow bow away from zero, a big spike at the start/stop, or growing oscillation are not.</li>
+							</ul>
+							<div class="mt-1 text-medium-emphasis">
+								Bad signs: the error drifts off zero (raise <strong>I</strong>), spikes during accel/decel (raise <strong>A</strong>), sits offset during steady speed (raise <strong>V</strong>), overshoots the target (raise <strong>D</strong>), or oscillates/“sings” (lower <strong>P</strong>, or <strong>D</strong> if it’s the high-frequency kind).
+							</div>
+						</div>
+						<HelpTip class="ml-1" :href="DOCS.tuning" text="The wiki shows annotated example plots of good vs poorly-tuned responses. The error should hover around zero at the encoder's resolution; if it's an order of magnitude larger than the encoder step, keep tuning." />
+					</v-alert>
+
 					<v-row dense>
 						<v-col cols="12" md="6">
 							<v-card variant="outlined" class="mb-2">
@@ -336,9 +373,9 @@ import {
 	parsePidReply, type CalibrationMove, type EncoderType, type LoopMode, type PidConfig,
 } from "../model/m569";
 import { parseCapture, type ParsedCapture } from "../model/csv";
-import { analyzeCapture, type StepMetrics } from "../model/analysis";
+import { analyzeCapture, analyzeMove, type MoveMetrics, type StepMetrics } from "../model/analysis";
 import { WIZARD_STEPS, type Recommendation } from "../model/wizard";
-import { AUTOTUNE_SEQUENCE, describeMetrics, type Attempt, type TermStrategy } from "../model/autotune";
+import { AUTOTUNE_FF_SEQUENCE, AUTOTUNE_SEQUENCE, describeMetrics, describeMove, type Attempt, type MoveAttempt, type MoveTermStrategy, type TermStrategy } from "../model/autotune";
 import { applying, applyUpdateNow, dismissCurrentUpdate, pendingReload, updateState } from "../model/updateCheck";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -362,7 +399,7 @@ interface SavedState {
 	step?: number; wizardIndex?: number; selectedDriver?: string | null; currentMode?: LoopMode | null;
 	encoderType?: EncoderType; modeD?: Partial<typeof DEFAULT_MODE_D>; pid?: Partial<PidConfig>;
 	samples?: number; sampleRate?: number; moveMode?: "step" | "custom"; customMove?: string;
-	recordKeys?: Array<string>; viewKeys?: Array<string>;
+	recordKeys?: Array<string>; viewKeys?: Array<string>; avDistance?: number; avFeed?: number;
 }
 function loadState(): SavedState {
 	try { return JSON.parse(localStorage.getItem(LS_STATE) ?? "{}") as SavedState; } catch { return {}; }
@@ -404,6 +441,7 @@ function persistState(): void {
 				currentMode: currentMode.value, encoderType: encoderType.value, modeD: { ...modeD }, pid: { ...pid },
 				samples: samples.value, sampleRate: sampleRate.value, moveMode: moveMode.value,
 				customMove: customMove.value, recordKeys: recordKeys.value, viewKeys: viewKeys.value,
+				avDistance: avDistance.value, avFeed: avFeed.value,
 			} satisfies SavedState));
 		} catch { /* storage unavailable */ }
 	}, 300);
@@ -416,6 +454,9 @@ const autoRunning = ref(false);
 const autoCancel = ref(false);
 const autoStatus = ref("");
 const autoLog = ref<Array<string>>([]);
+const avDistance = ref(saved.avDistance ?? 50);   // mm — A/V test move length
+const avFeed = ref(saved.avFeed ?? 6000);          // mm/min — A/V test move feedrate
+watch([avDistance, avFeed], persistState);
 
 const confirmOpen = ref(false);
 const confirmCommand = ref("");
@@ -455,6 +496,13 @@ const selectedBoard = computed<any>(() => {
 	const addr = parseInt(selectedDriver.value.split(".")[0]);
 	return (machineStore.model as any).boards?.find((b: any) => b && b.canAddress === addr) ?? null;
 });
+
+/** Axis letter the selected driver belongs to (null for extruders / unknown — A/V can't be auto-tuned then). */
+function axisLetterForDriver(): string | null {
+	if (!selectedDriver.value) { return null; }
+	const ax = (machineStore.model as any).move?.axes?.find((a: any) => (a.drivers ?? []).some((d: any) => `${d.board}.${d.driver}` === selectedDriver.value));
+	return ax?.letter ?? null;
+}
 
 // --- Mode ---
 async function setMode(mode: LoopMode): Promise<void> {
@@ -546,17 +594,24 @@ watch(() => selectedBoard.value?.closedLoop?.runs, async (runs) => {
 	recording.value = false;
 });
 
-async function loadLatestCapture(): Promise<void> {
+/** Load the newest capture CSV into the chart; returns the parsed capture (no analysis). */
+async function loadLatestCsv(): Promise<ParsedCapture | null> {
 	try {
 		const list = await machineStore.getFileList(CAPTURE_DIR);
 		const files = list.filter((f: any) => !f.isDirectory && f.name.endsWith(".csv"))
 			.sort((a: any, b: any) => (b.lastModified ?? 0) - (a.lastModified ?? 0));
-		if (files.length === 0) { return; }
+		if (files.length === 0) { return null; }
 		const text = await (machineStore as any).download({ filename: `${CAPTURE_DIR}/${files[0].name}`, type: "text" }, false, false, false) as string;
 		rawText.value = text;
 		capture.value = parseCapture(text);
-		metrics.value = analyzeCapture(capture.value, sampleRate.value);
-	} catch (e) { console.warn("[ClosedLoopTuning] loadLatestCapture failed", e); }
+		return capture.value;
+	} catch (e) { console.warn("[ClosedLoopTuning] loadLatestCsv failed", e); return null; }
+}
+
+/** Manual record path: load newest CSV and analyse it as a step response. */
+async function loadLatestCapture(): Promise<void> {
+	const c = await loadLatestCsv();
+	if (c) { metrics.value = analyzeCapture(c, sampleRate.value); }
 }
 
 const availableViewVars = computed(() => CAPTURE_VARIABLES.filter((v) => capture.value && capture.value.columns[v.header]));
@@ -564,6 +619,7 @@ function pinOverlay(): void { overlayCapture.value = capture.value; }
 
 // --- Wizard ---
 const wizardStep = computed(() => steps[wizardIndex.value]);
+const pidSummary = computed(() => (["p", "d", "i", "v", "a"] as const).map((term) => ({ term, value: (pid as Record<string, number>)[term] })));
 const verdictType = computed(() => {
 	switch (recommendation.value?.verdict) {
 		case "accept": return "success";
@@ -609,21 +665,39 @@ async function waitForRuns(startRuns: number, timeoutMs: number): Promise<boolea
 	return false;
 }
 
-/** Fire one step-manoeuvre capture and return its analysis metrics (null on failure/timeout). */
-async function captureStep(): Promise<StepMetrics | null> {
-	moveMode.value = "step";
-	recordKeys.value = ["measuredMotorSteps", "targetMotorSteps", "currentError", "pidPTerm"];
+const varIds = (keys: Array<string>) => keys.map((k) => CAPTURE_VARIABLES.find((v) => v.key === k)?.id ?? 0);
+
+/** Run a capture command (built directly, not from the user's manual settings), wait for it to finish, load the CSV. */
+async function runCapture(opts: Parameters<typeof buildCaptureCommand>[0]): Promise<ParsedCapture | null> {
 	const startRuns = selectedBoard.value?.closedLoop?.runs ?? -1;
-	const reply = await machineStore.sendCode(buildCaptureCommand(captureOptions()), false, false);
+	const reply = await machineStore.sendCode(buildCaptureCommand(opts), false, false);
 	if (reply && reply.startsWith("Error:")) {
 		uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", reply);
 		return null;
 	}
-	const captureMs = sampleRate.value > 0 ? (samples.value / sampleRate.value) * 1000 : 4000;
+	const captureMs = opts.rate > 0 ? (opts.samples / opts.rate) * 1000 : 4000;
 	if (!(await waitForRuns(startRuns, captureMs + 8000))) { return null; }
 	await delay(300); // let the CSV finish writing
-	await loadLatestCapture();
+	return loadLatestCsv();
+}
+
+/** Step-manoeuvre capture → step metrics (for P/D/I). */
+async function captureStep(): Promise<StepMetrics | null> {
+	const c = await runCapture({ driver: selectedDriver.value ?? "", samples: samples.value, activate: 0, rate: sampleRate.value, variables: varIds(["measuredMotorSteps", "targetMotorSteps", "currentError", "pidPTerm"]), manoeuvre: 64 });
+	if (!c) { return null; }
+	metrics.value = analyzeCapture(c, sampleRate.value);
 	return metrics.value;
+}
+
+/** G1-move capture → move metrics (for A/V). Captures the outward move, then returns the axis to start. */
+async function captureMove(): Promise<MoveMetrics | null> {
+	const axis = axisLetterForDriver();
+	if (!axis) { uiStore.makeNotification(LogLevel.warning, "Closed Loop Tuning", "A/V tuning needs the driver's axis — skipped."); return null; }
+	viewKeys.value = ["pidPTerm", "targetMotorSteps"];
+	const c = await runCapture({ driver: selectedDriver.value ?? "", samples: samples.value, activate: 1, rate: sampleRate.value, variables: varIds(["targetMotorSteps", "pidPTerm", "measuredMotorSteps"]), manoeuvre: 0, move: `G91 G1 H2 ${axis}${avDistance.value} F${avFeed.value} G90` });
+	try { await machineStore.sendCode(`G91 G1 H2 ${axis}-${avDistance.value} F${avFeed.value} G90`, false, false); } catch { /* ignore return-move error */ }
+	if (!c) { return null; }
+	return analyzeMove(c, sampleRate.value);
 }
 
 function log(line: string): void { autoLog.value = [...autoLog.value, line].slice(-40); }
@@ -655,30 +729,69 @@ async function autoTuneTerm(strategy: TermStrategy): Promise<boolean> {
 	return true;
 }
 
+/** Drive a feed-forward term (A/V) to convergence using a G1-move capture. */
+async function autoTuneMoveTerm(strategy: MoveTermStrategy): Promise<boolean> {
+	let value = strategy.start;
+	const attempts: Array<MoveAttempt> = [];
+	for (let k = 0; k <= strategy.maxAttempts; k++) {
+		if (autoCancel.value) { return false; }
+		(pid as any)[strategy.term] = value;
+		await applyPid();
+		await delay(400);
+		autoStatus.value = `${strategy.label}: testing ${strategy.term.toUpperCase()}=${value}…`;
+		const m = await captureMove();
+		if (!m) { log(`${strategy.label}: capture failed — skipping.`); return false; }
+		attempts.push({ value, metrics: m });
+		log(`${strategy.label}: ${strategy.term.toUpperCase()}=${value} → ${describeMove(m)}`);
+		const d = strategy.decide(attempts);
+		if (d.kind === "fail") { log(`${strategy.label}: ${d.reason}`); return false; }
+		if (d.kind === "accept") { (pid as any)[strategy.term] = d.value; await applyPid(); log(`${strategy.label}: ✓ ${d.note}`); return true; }
+		value = d.value;
+	}
+	return true;
+}
+
 function startAutoTune(): void {
 	if (!selectedDriver.value) { return; }
-	askConfirm("Auto-tune will repeatedly move the driver to measure its step response", runAutoTune);
+	const hasAxis = !!axisLetterForDriver();
+	const msg = hasAxis
+		? "Auto-tune will repeatedly move the driver: short step jumps to tune P/D/I, then back-and-forth moves along the axis to tune A/V"
+		: "Auto-tune will repeatedly move the driver with short step jumps to tune P/D/I (A/V need an axis and will be skipped)";
+	askConfirm(msg, runAutoTune);
 }
 
 async function runAutoTune(): Promise<void> {
 	autoRunning.value = true;
 	autoCancel.value = false;
 	autoLog.value = [];
-	wizardIndex.value = 0;
+	viewKeys.value = ["measuredMotorSteps", "targetMotorSteps", "currentError"];
 	try {
-		// P: zero the other terms first so P is measured alone.
+		// Phase 1 — P/D/I from the step response. Zero the other terms first so P is measured alone.
 		pid.i = 0; pid.d = 0; pid.v = 0; pid.a = 0;
 		await applyPid();
+		let ok = true;
 		for (const strategy of AUTOTUNE_SEQUENCE) {
-			wizardIndex.value = AUTOTUNE_SEQUENCE.indexOf(strategy);
-			if (autoCancel.value) { break; }
-			const ok = await autoTuneTerm(strategy);
-			if (!ok) { break; }
+			wizardIndex.value = WIZARD_STEPS.findIndex((s) => s.term === strategy.term);
+			if (autoCancel.value) { ok = false; break; }
+			if (!(await autoTuneTerm(strategy))) { ok = false; break; }
 		}
-		if (autoCancel.value) {
-			autoStatus.value = "Auto-tune aborted.";
-		} else {
-			autoStatus.value = `Auto-tune complete — P=${pid.p} D=${pid.d} I=${pid.i}.`;
+		// Phase 2 — A/V feed-forward from a G1 move (best-effort; needs an axis).
+		if (ok && !autoCancel.value) {
+			if (axisLetterForDriver()) {
+				log("Tuning A/V on a moving axis…");
+				for (const strategy of AUTOTUNE_FF_SEQUENCE) {
+					wizardIndex.value = WIZARD_STEPS.findIndex((s) => s.term === strategy.term);
+					if (autoCancel.value) { break; }
+					await autoTuneMoveTerm(strategy); // don't fail the whole run if A/V can't converge
+				}
+			} else {
+				log("A/V skipped — this driver has no axis (extruder?).");
+			}
+		}
+		autoStatus.value = autoCancel.value
+			? "Auto-tune aborted."
+			: `Auto-tune complete — P=${pid.p} D=${pid.d} I=${pid.i} A=${pid.a} V=${pid.v}.`;
+		if (!autoCancel.value) {
 			uiStore.makeNotification(LogLevel.success, "Closed Loop Tuning", autoStatus.value + " Review the plot, then save to config.g.");
 		}
 	} catch (e) {
