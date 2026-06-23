@@ -125,11 +125,11 @@
 			<template #item.4>
 				<v-card flat>
 					<div class="text-body-2 mb-3">
-						Set the motor current to its final value and make sure the motor can spin freely (uncoupled —
-						see the note above), then run <strong>Auto-tune</strong>. It switches to closed loop, calibrates
-						the encoder, tunes P, D and I from step jumps, then A and V from a short move. Manual term-by-term
-						tuning is available below.
-						<HelpTip :href="DOCS.tuning" text="Auto-tune does it all: ensures closed loop, runs the M569.6 encoder calibration for your encoder type (Step 3), then cycles P (rise time) → D (overshoot) → I (steady-state error) from step jumps and A → V from a G1 move. It captures after every change, converges when the response stops improving, and backs off on oscillation." />
+						First switch to closed/assisted loop and calibrate (Steps 2-3), set the motor current to its
+						final value, and uncouple the motor (see the note above). Then run <strong>Auto-tune</strong>:
+						it tunes P, D and I from step jumps, then A and V from a short move. Manual term-by-term tuning
+						is available below.
+						<HelpTip :href="DOCS.tuning" text="Auto-tune cycles P (rise time) → D (overshoot) → I (steady-state error) from step jumps, then A → V from a G1 move. It captures after every change, converges when the response stops improving, and backs off on oscillation. It does NOT change the loop mode or calibrate — do those in Steps 2-3 first." />
 					</div>
 
 					<!-- Auto-tune -->
@@ -757,8 +757,8 @@ function startAutoTune(): void {
 	if (!selectedDriver.value) { return; }
 	const hasAxis = !!axisLetterForDriver();
 	const msg = hasAxis
-		? "Auto-tune will switch to closed loop, calibrate the encoder, then move the driver: step jumps to tune P/D/I and back-and-forth moves to tune A/V. Make sure the motor is uncoupled from the machine."
-		: "Auto-tune will switch to closed loop, calibrate the encoder, then move the driver with step jumps to tune P/D/I (A/V need an axis and will be skipped). Make sure the motor is uncoupled.";
+		? "Auto-tune will repeatedly move the driver: step jumps to tune P/D/I, then back-and-forth moves to tune A/V. Make sure the driver is already in closed loop and calibrated (Steps 2-3) and the motor is uncoupled."
+		: "Auto-tune will repeatedly move the driver with step jumps to tune P/D/I (A/V need an axis and will be skipped). Make sure the driver is already in closed loop and calibrated (Steps 2-3) and the motor is uncoupled.";
 	askConfirm(msg, runAutoTune);
 }
 
@@ -768,38 +768,9 @@ async function runAutoTune(): Promise<void> {
 	autoLog.value = [];
 	viewKeys.value = ["measuredMotorSteps", "targetMotorSteps", "currentError"];
 	try {
-		// The step manoeuvre only moves in closed/assisted loop — the board may have reverted to open
-		// loop (e.g. after a reboot) even if the plugin remembers otherwise, so (re)assert the mode.
-		const mode: LoopMode = currentMode.value === "assisted" ? "assisted" : "closed";
-		log(`Ensuring ${MODE_LABELS[mode]} — sending ${buildModeCommand(selectedDriver.value ?? "", mode, modeD)}`);
-		await send(buildModeCommand(selectedDriver.value ?? "", mode, modeD));
-		currentMode.value = mode;
-		await delay(600);
-
-		// Calibrate the encoder — closed loop can't drive the motor until polarity/zeroing is established
-		// (an uncalibrated loop shows a large standing error that grows with P, exactly as seen on no-move
-		// captures). Required every power-on for quadrature; persisted for magnetic/linear.
-		const calMoves = requiredMoveIds.value;
-		if (calMoves.length === 0) {
-			log("⚠ No encoder calibration configured — set the encoder type in Step 3, or closed loop won't move.");
-		}
-		for (const cid of calMoves) {
-			if (autoCancel.value) { break; }
-			const move = CALIBRATION_MOVES.find((c) => c.id === cid);
-			autoStatus.value = `Calibrating (M569.6 V${cid})…`;
-			log(`Calibrating: ${move?.name ?? "M569.6 V" + cid}…`);
-			const reply = await machineStore.sendCode(buildCalibrationCommand(selectedDriver.value ?? "", cid), false, true);
-			if (reply && /error|fail/i.test(reply)) {
-				log(`Calibration failed: ${reply}`);
-				autoStatus.value = "Auto-tune stopped — calibration failed.";
-				uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", `Calibration failed: ${reply}`);
-				return;
-			}
-			if (reply) { log(reply.trim()); }
-			await delay(800);
-		}
-
-		// Phase 1 — P/D/I from the step response. Zero the other terms first so P is measured alone.
+		// The driver must already be in closed/assisted loop and calibrated (Steps 2-3) — auto-tune does
+		// NOT change the mode or calibrate. Phase 1: P/D/I from the step response; zero the other terms
+		// first so P is measured alone.
 		pid.i = 0; pid.d = 0; pid.v = 0; pid.a = 0;
 		await applyPid();
 		let ok = true;

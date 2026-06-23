@@ -6,13 +6,13 @@ import {
 } from "../model/m569";
 
 describe("mode commands", () => {
-	it("uses D4 closed / D5 assisted / D2 open by default", () => {
-		expect(buildModeCommand("50.0", "closed")).toBe("M569 P50.0 D4 S1");
-		expect(buildModeCommand("50.0", "assisted")).toBe("M569 P50.0 D5 S1");
-		expect(buildModeCommand("50.0", "open")).toBe("M569 P50.0 D2 S1");
+	it("uses D4 closed / D5 assisted / D2 open by default, with no S (direction) param", () => {
+		expect(buildModeCommand("50.0", "closed")).toBe("M569 P50.0 D4");
+		expect(buildModeCommand("50.0", "assisted")).toBe("M569 P50.0 D5");
+		expect(buildModeCommand("50.0", "open")).toBe("M569 P50.0 D2");
 	});
 	it("honours overridden D-values", () => {
-		expect(buildModeCommand("50.0", "open", { ...DEFAULT_MODE_D, open: 0 })).toBe("M569 P50.0 D0 S1");
+		expect(buildModeCommand("50.0", "open", { ...DEFAULT_MODE_D, open: 0 })).toBe("M569 P50.0 D0");
 	});
 });
 

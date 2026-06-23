@@ -31,9 +31,13 @@ export const MODE_LABELS: Record<LoopMode, string> = {
 	closed: "Closed loop",
 };
 
-/** `M569 P<driver> D<n> S1` — switch a driver's loop mode. */
+/**
+ * `M569 P<driver> D<n>` — switch a driver's loop mode. ONLY the D (mode) parameter: never send S here,
+ * because M569 S is the motor *direction* (S0/S1) and forcing it would flip a driver configured with
+ * a reversed direction, inverting the closed-loop polarity.
+ */
 export function buildModeCommand(driver: string, mode: LoopMode, dValues: ModeCommandConfig = DEFAULT_MODE_D): string {
-	return `M569 P${driver} D${dValues[mode]} S1`;
+	return `M569 P${driver} D${dValues[mode]}`;
 }
 
 // --- Encoder types (M569.1 T parameter) ---
