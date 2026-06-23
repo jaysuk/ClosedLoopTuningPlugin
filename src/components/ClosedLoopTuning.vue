@@ -329,7 +329,7 @@ import { LogLevel, useUiStore } from "@/stores/ui";
 import { HelpTip } from "dwc-plugin-runtime";
 
 import CaptureChart from "./CaptureChart.vue";
-import { CAPTURE_DIR, DOCS } from "../model/constants";
+import { CAPTURE_DIR, DOCS, LS_STATE } from "../model/constants";
 import {
 	buildCalibrationCommand, buildCaptureCommand, buildModeCommand, buildPidCommand,
 	CALIBRATION_MOVES, CAPTURE_VARIABLES, DEFAULT_MODE_D, ENCODER_TYPES, MODE_LABELS,
@@ -357,29 +357,59 @@ const modeHelp: Record<LoopMode, string> = {
 };
 const stepTitles = ["1. Driver", "2. Loop mode", "3. Calibrate", "4. Tune PID", "5. Test & save"];
 
-const step = ref(1);
-const selectedDriver = ref<string | null>(null);
-const currentMode = ref<LoopMode | null>(null);
-const encoderType = ref<EncoderType>(2);
-const modeD = reactive({ ...DEFAULT_MODE_D });
-const pid = reactive<PidConfig>({ p: 100, i: 0, d: 0, v: 0, a: 0, warn: null, err: null });
+// Persisted UI state — restored on mount so navigating away and back keeps your place.
+interface SavedState {
+	step?: number; wizardIndex?: number; selectedDriver?: string | null; currentMode?: LoopMode | null;
+	encoderType?: EncoderType; modeD?: Partial<typeof DEFAULT_MODE_D>; pid?: Partial<PidConfig>;
+	samples?: number; sampleRate?: number; moveMode?: "step" | "custom"; customMove?: string;
+	recordKeys?: Array<string>; viewKeys?: Array<string>;
+}
+function loadState(): SavedState {
+	try { return JSON.parse(localStorage.getItem(LS_STATE) ?? "{}") as SavedState; } catch { return {}; }
+}
+const saved = loadState();
+
+const step = ref(saved.step ?? 1);
+const selectedDriver = ref<string | null>(saved.selectedDriver ?? null);
+const currentMode = ref<LoopMode | null>(saved.currentMode ?? null);
+const encoderType = ref<EncoderType>(saved.encoderType ?? 2);
+const modeD = reactive({ ...DEFAULT_MODE_D, ...(saved.modeD ?? {}) });
+const pid = reactive<PidConfig>({ p: 100, i: 0, d: 0, v: 0, a: 0, warn: null, err: null, ...(saved.pid ?? {}) });
 const applyingPid = ref(false);
 
-const samples = ref(2000);
-const sampleRate = ref(2000);
-const moveMode = ref<"step" | "custom">("step");
-const customMove = ref("G91 G1 H2 X50 F6000 G90");
-const recordKeys = ref<Array<string>>(["measuredMotorSteps", "targetMotorSteps", "currentError", "pidPTerm"]);
+const samples = ref(saved.samples ?? 2000);
+const sampleRate = ref(saved.sampleRate ?? 2000);
+const moveMode = ref<"step" | "custom">(saved.moveMode ?? "step");
+const customMove = ref(saved.customMove ?? "G91 G1 H2 X50 F6000 G90");
+const recordKeys = ref<Array<string>>(saved.recordKeys ?? ["measuredMotorSteps", "targetMotorSteps", "currentError", "pidPTerm"]);
 const recording = ref(false);
 
 const capture = ref<ParsedCapture | null>(null);
 const overlayCapture = ref<ParsedCapture | null>(null);
 const rawText = ref<string>("");
 const metrics = ref<StepMetrics | null>(null);
-const viewKeys = ref<Array<string>>(["measuredMotorSteps", "targetMotorSteps", "currentError"]);
+const viewKeys = ref<Array<string>>(saved.viewKeys ?? ["measuredMotorSteps", "targetMotorSteps", "currentError"]);
 
-const wizardIndex = ref(0);
+const wizardIndex = ref(saved.wizardIndex ?? 0);
 const recommendation = ref<Recommendation | null>(null);
+
+// Save the lightweight selections (not the captured CSV) whenever they change, debounced.
+let saveTimer: ReturnType<typeof setTimeout> | undefined;
+function persistState(): void {
+	if (saveTimer) { clearTimeout(saveTimer); }
+	saveTimer = setTimeout(() => {
+		try {
+			localStorage.setItem(LS_STATE, JSON.stringify({
+				step: step.value, wizardIndex: wizardIndex.value, selectedDriver: selectedDriver.value,
+				currentMode: currentMode.value, encoderType: encoderType.value, modeD: { ...modeD }, pid: { ...pid },
+				samples: samples.value, sampleRate: sampleRate.value, moveMode: moveMode.value,
+				customMove: customMove.value, recordKeys: recordKeys.value, viewKeys: viewKeys.value,
+			} satisfies SavedState));
+		} catch { /* storage unavailable */ }
+	}, 300);
+}
+watch([step, wizardIndex, selectedDriver, currentMode, encoderType, modeD, pid, samples, sampleRate, moveMode, customMove, recordKeys, viewKeys],
+	persistState, { deep: true });
 
 // --- Auto-tune ---
 const autoRunning = ref(false);
