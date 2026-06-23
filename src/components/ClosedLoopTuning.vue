@@ -117,11 +117,28 @@
 			<template #item.4>
 				<v-card flat>
 					<div class="text-body-2 mb-3">
-						Tune one term at a time using a step response. Work through them in order — each "Run step &amp; analyse"
-						applies a sudden 4-step target change, measures the response, and tells you whether to raise, lower or
-						keep the term. Set motor current to its final value before tuning.
-						<HelpTip :href="DOCS.tuning" text="Order: P (fastest rise without oscillation) → D (remove overshoot) → I (remove steady-state error) → optional A/V feed-forward for moving loads. Click for the full guide with example plots." />
+						Set the motor current to its final value, make sure the axis has room to move, then let
+						<strong>Auto-tune</strong> do the work — or tune one term at a time manually below.
+						<HelpTip :href="DOCS.tuning" text="Order: P (fastest rise without oscillation) → D (remove overshoot) → I (remove steady-state error). Auto-tune cycles each term automatically, running a step capture between every change and backing off on oscillation. Click for the full guide." />
 					</div>
+
+					<!-- Auto-tune -->
+					<v-card variant="outlined" class="mb-3" :color="autoRunning ? 'primary' : undefined">
+						<v-card-text>
+							<div class="d-flex align-center flex-wrap ga-2">
+								<v-btn color="primary" :disabled="!selectedDriver || autoRunning || recording" :loading="autoRunning" prepend-icon="mdi-auto-fix" @click="startAutoTune">
+									Auto-tune (P → D → I)
+								</v-btn>
+								<v-btn v-if="autoRunning" color="error" variant="tonal" prepend-icon="mdi-stop" @click="abortAutoTune">Abort</v-btn>
+								<HelpTip :href="DOCS.tuning" text="Fully automatic: cycles P then D then I, running a step capture after each change and converging when the response stops improving. Bounded and backs off on oscillation. Keep an emergency stop handy the first time." />
+								<v-spacer />
+								<span class="text-caption text-medium-emphasis">{{ autoStatus }}</span>
+							</div>
+							<div v-if="autoLog.length" class="cl-autolog mt-2">
+								<div v-for="(line, idx) in autoLog" :key="idx">{{ line }}</div>
+							</div>
+						</v-card-text>
+					</v-card>
 
 					<v-row dense>
 						<v-col cols="12" md="5">
@@ -135,7 +152,7 @@
 									<div class="text-caption mb-1"><strong>Goal:</strong> {{ wizardStep.goal }}</div>
 									<div class="text-caption text-medium-emphasis mb-2">{{ wizardStep.instructions }}</div>
 									<div class="d-flex ga-2 align-center mb-2">
-										<v-btn size="small" color="info" :disabled="!selectedDriver || recording" :loading="recording" @click="runWizardCapture">
+										<v-btn size="small" color="info" :disabled="!selectedDriver || recording || autoRunning" :loading="recording" @click="runWizardCapture">
 											<v-icon class="mr-1">mdi-record</v-icon> Run step &amp; analyse
 										</v-btn>
 										<v-btn v-if="wizardStep.term && wizardStep.defaultStart !== undefined" size="small" variant="text"
@@ -198,7 +215,7 @@
 								<div class="d-flex flex-wrap mb-1">
 									<v-checkbox v-for="v in captureVariables" :key="v.key" v-model="recordKeys" :value="v.key" :label="v.header" density="compact" hide-details class="cl-var" />
 								</div>
-								<v-btn size="small" color="info" :disabled="!canRecord || recording" :loading="recording" @click="record()"><v-icon class="mr-1">mdi-record</v-icon> Record</v-btn>
+								<v-btn size="small" color="info" :disabled="!canRecord || recording || autoRunning" :loading="recording" @click="record()"><v-icon class="mr-1">mdi-record</v-icon> Record</v-btn>
 								<div v-if="selectedDriver" class="text-caption text-medium-emphasis mt-1"><code>{{ capturePreview }}</code></div>
 							</v-expansion-panel-text>
 						</v-expansion-panel>
@@ -321,6 +338,7 @@ import {
 import { parseCapture, type ParsedCapture } from "../model/csv";
 import { analyzeCapture, type StepMetrics } from "../model/analysis";
 import { WIZARD_STEPS, type Recommendation } from "../model/wizard";
+import { AUTOTUNE_SEQUENCE, describeMetrics, type Attempt, type TermStrategy } from "../model/autotune";
 import { applying, applyUpdateNow, dismissCurrentUpdate, pendingReload, updateState } from "../model/updateCheck";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -362,6 +380,12 @@ const viewKeys = ref<Array<string>>(["measuredMotorSteps", "targetMotorSteps", "
 
 const wizardIndex = ref(0);
 const recommendation = ref<Recommendation | null>(null);
+
+// --- Auto-tune ---
+const autoRunning = ref(false);
+const autoCancel = ref(false);
+const autoStatus = ref("");
+const autoLog = ref<Array<string>>([]);
 
 const confirmOpen = ref(false);
 const confirmCommand = ref("");
@@ -540,6 +564,103 @@ function applySuggestion(): void {
 	}
 }
 
+// --- Auto-tune: run a step capture and resolve when its analysis is ready ---
+const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** Wait for the board's closed-loop run counter to advance (capture finished), or time out. */
+async function waitForRuns(startRuns: number, timeoutMs: number): Promise<boolean> {
+	const t0 = Date.now();
+	while (Date.now() - t0 < timeoutMs) {
+		if (autoCancel.value) { return false; }
+		const r = selectedBoard.value?.closedLoop?.runs;
+		if (r != null && r !== startRuns) { return true; }
+		await delay(200);
+	}
+	return false;
+}
+
+/** Fire one step-manoeuvre capture and return its analysis metrics (null on failure/timeout). */
+async function captureStep(): Promise<StepMetrics | null> {
+	moveMode.value = "step";
+	recordKeys.value = ["measuredMotorSteps", "targetMotorSteps", "currentError", "pidPTerm"];
+	const startRuns = selectedBoard.value?.closedLoop?.runs ?? -1;
+	const reply = await machineStore.sendCode(buildCaptureCommand(captureOptions()), false, false);
+	if (reply && reply.startsWith("Error:")) {
+		uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", reply);
+		return null;
+	}
+	const captureMs = sampleRate.value > 0 ? (samples.value / sampleRate.value) * 1000 : 4000;
+	if (!(await waitForRuns(startRuns, captureMs + 8000))) { return null; }
+	await delay(300); // let the CSV finish writing
+	await loadLatestCapture();
+	return metrics.value;
+}
+
+function log(line: string): void { autoLog.value = [...autoLog.value, line].slice(-40); }
+
+/** Drive one term to convergence using its strategy. Returns false to abort the whole run. */
+async function autoTuneTerm(strategy: TermStrategy): Promise<boolean> {
+	let value = strategy.start;
+	const attempts: Array<Attempt> = [];
+	for (let k = 0; k <= strategy.maxAttempts; k++) {
+		if (autoCancel.value) { return false; }
+		(pid as any)[strategy.term] = value;
+		await applyPid();
+		await delay(400); // settle
+		autoStatus.value = `${strategy.label}: testing ${strategy.term.toUpperCase()}=${value}…`;
+		const m = await captureStep();
+		if (!m) { log(`${strategy.label}: capture failed — aborting.`); return false; }
+		attempts.push({ value, metrics: m });
+		log(`${strategy.label}: ${strategy.term.toUpperCase()}=${value} → ${describeMetrics(m)}`);
+		const d = strategy.decide(attempts);
+		if (d.kind === "fail") { log(`${strategy.label}: ${d.reason}`); return false; }
+		if (d.kind === "accept") {
+			(pid as any)[strategy.term] = d.value;
+			await applyPid();
+			log(`${strategy.label}: ✓ ${d.note}`);
+			return true;
+		}
+		value = d.value;
+	}
+	return true;
+}
+
+function startAutoTune(): void {
+	if (!selectedDriver.value) { return; }
+	askConfirm("Auto-tune will repeatedly move the driver to measure its step response", runAutoTune);
+}
+
+async function runAutoTune(): Promise<void> {
+	autoRunning.value = true;
+	autoCancel.value = false;
+	autoLog.value = [];
+	wizardIndex.value = 0;
+	try {
+		// P: zero the other terms first so P is measured alone.
+		pid.i = 0; pid.d = 0; pid.v = 0; pid.a = 0;
+		await applyPid();
+		for (const strategy of AUTOTUNE_SEQUENCE) {
+			wizardIndex.value = AUTOTUNE_SEQUENCE.indexOf(strategy);
+			if (autoCancel.value) { break; }
+			const ok = await autoTuneTerm(strategy);
+			if (!ok) { break; }
+		}
+		if (autoCancel.value) {
+			autoStatus.value = "Auto-tune aborted.";
+		} else {
+			autoStatus.value = `Auto-tune complete — P=${pid.p} D=${pid.d} I=${pid.i}.`;
+			uiStore.makeNotification(LogLevel.success, "Closed Loop Tuning", autoStatus.value + " Review the plot, then save to config.g.");
+		}
+	} catch (e) {
+		console.warn("[ClosedLoopTuning] auto-tune failed", e);
+		autoStatus.value = "Auto-tune stopped (see console).";
+	} finally {
+		autoRunning.value = false;
+	}
+}
+
+function abortAutoTune(): void { autoCancel.value = true; autoStatus.value = "Stopping after this capture…"; }
+
 // --- Test & save ---
 async function runTestMove(): Promise<void> {
 	moveMode.value = "custom";
@@ -612,6 +733,16 @@ watch(selectedDriver, (d) => { if (d) { void loadPid(); } });
 }
 :deep(.cl-active-term .v-field) {
 	outline: 2px solid rgb(var(--v-theme-primary));
+	border-radius: 4px;
+}
+.cl-autolog {
+	max-height: 140px;
+	overflow-y: auto;
+	font-family: monospace;
+	font-size: 0.74rem;
+	line-height: 1.35;
+	background: rgba(var(--v-theme-on-surface), 0.05);
+	padding: 6px 8px;
 	border-radius: 4px;
 }
 </style>
