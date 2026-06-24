@@ -811,9 +811,9 @@ async function runAutoTune(): Promise<void> {
 				if (autoCancel.value) { ok = false; break; }
 				if (!(await autoTuneTerm(strategy))) { ok = false; break; }
 			}
-			// A/V feed-forward (needs a G1 move + an axis) — only on the final cycle, after P/D/I have
-			// settled, since they're slower and far less coupled to the P/D/I iteration.
-			if (ok && !autoCancel.value && cycle === totalCycles) {
+			// A/V feed-forward (needs a G1 move + an axis) — run every cycle so they iterate alongside
+			// P/D/I (a too-low V leaves a steady-speed lag; a too-low A leaves accel/decel spikes).
+			if (ok && !autoCancel.value) {
 				if (axisLetterForDriver()) {
 					log("Tuning A/V on a moving axis…");
 					for (const strategy of AUTOTUNE_FF_SEQUENCE) {

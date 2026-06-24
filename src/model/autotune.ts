@@ -161,10 +161,10 @@ export interface MoveTermStrategy {
 	decide(attempts: Array<MoveAttempt>): AutoDecision;
 }
 
-export const A_MAX = 1_000_000;
-export const V_MAX = 5000;
-export const AV_PLATEAU = 0.1;        // <10% improvement → stop raising
-export const V_CRUISE_OK = 5;         // |mean P term| in cruise considered ~zero
+export const A_MAX = 2_000_000;
+export const V_MAX = 10000;
+export const AV_PLATEAU = 0.05;       // <5% improvement → stop raising (push further before settling)
+export const V_CRUISE_OK = 3;         // |mean P term| in cruise considered ~zero
 
 const noMove: AutoDecision = { kind: "fail", reason: "No steady-speed move detected — increase the A/V test move length or speed so the axis reaches cruise." };
 
@@ -177,7 +177,7 @@ export const A_STRATEGY: MoveTermStrategy = {
 	term: "a",
 	label: "A (accel feed-forward)",
 	start: 0,
-	maxAttempts: 8,
+	maxAttempts: 10,
 	decide(attempts) {
 		const last = attempts[attempts.length - 1];
 		if (!last.metrics.hasMove) { return noMove; }
@@ -204,7 +204,7 @@ export const V_STRATEGY: MoveTermStrategy = {
 	term: "v",
 	label: "V (velocity feed-forward)",
 	start: 0,
-	maxAttempts: 9,
+	maxAttempts: 11,
 	decide(attempts) {
 		const last = attempts[attempts.length - 1];
 		if (!last.metrics.hasMove) { return noMove; }
