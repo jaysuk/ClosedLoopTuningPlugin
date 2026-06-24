@@ -126,12 +126,21 @@ export function analyzeStep(series: CaptureSeries): StepMetrics {
 	}
 	const settlingTime = lastOutside >= 0 && lastOutside < n - 1 ? Math.max(0, time[lastOutside] - time[startIdx]) : (lastOutside < 0 ? 0 : null);
 
-	// Oscillation proxy: sign changes of error after the step.
+	// Oscillation count: zero-crossings of the error, but only counting a crossing when the half-cycle
+	// before it had a real amplitude. Encoder noise jitters ±a fraction of a step around zero, which
+	// would otherwise register as hundreds of "oscillations" and wrongly flag a stable gain as ringing.
+	const oscThreshold = Math.max(0.5, absStep * 0.05);
 	let oscillations = 0;
 	let prevSign = 0;
+	let halfCyclePeak = 0;
 	for (let i = startIdx; i < n; i++) {
-		const s = Math.sign(error[i]);
-		if (s !== 0 && prevSign !== 0 && s !== prevSign) { oscillations++; }
+		const e = error[i];
+		halfCyclePeak = Math.max(halfCyclePeak, Math.abs(e));
+		const s = Math.sign(e);
+		if (s !== 0 && prevSign !== 0 && s !== prevSign) {
+			if (halfCyclePeak >= oscThreshold) { oscillations++; }
+			halfCyclePeak = 0;
+		}
 		if (s !== 0) { prevSign = s; }
 	}
 

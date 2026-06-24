@@ -208,13 +208,16 @@ export const V_STRATEGY: MoveTermStrategy = {
 	decide(attempts) {
 		const last = attempts[attempts.length - 1];
 		if (!last.metrics.hasMove) { return noMove; }
-		if (Math.abs(last.metrics.pTermCruiseMean) <= V_CRUISE_OK) {
+		const cmAbs = Math.abs(last.metrics.pTermCruiseMean);
+		if (cmAbs <= V_CRUISE_OK) {
 			return { kind: "accept", value: last.value, note: `Steady-speed P-term ~0 (${last.metrics.pTermCruiseMean.toFixed(1)}).` };
 		}
-		if (attempts.length >= 2) {
+		// Only honour a "plateau" once the cruise lag is already small. V reduces the lag monotonically,
+		// so two equal-but-large noisy readings early on must NOT stop the ramp (the cause of V settling
+		// at a large residual lag on an unlucky cycle) — keep raising V until it's near zero or capped.
+		if (attempts.length >= 2 && cmAbs <= V_CRUISE_OK * 4) {
 			const pm = Math.abs(attempts[attempts.length - 2].metrics.pTermCruiseMean);
-			const cm = Math.abs(last.metrics.pTermCruiseMean);
-			if (pm > 0 && (pm - cm) / pm < AV_PLATEAU) {
+			if (pm > 0 && (pm - cmAbs) / pm < AV_PLATEAU) {
 				const best = bestMove(attempts, (m) => Math.abs(m.pTermCruiseMean));
 				return { kind: "accept", value: best.value, note: `Steady-speed P-term plateaued (~${last.metrics.pTermCruiseMean.toFixed(1)}).` };
 			}
