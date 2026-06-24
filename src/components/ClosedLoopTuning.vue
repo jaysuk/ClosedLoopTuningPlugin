@@ -36,7 +36,14 @@
 			</v-tooltip>
 		</div>
 
-		<About v-model="aboutOpen" :has-session="!!tuneSession" @download-tuning="downloadTuningReport" />
+		<AboutDialog v-model="aboutOpen" plugin-id="ClosedLoopTuning" title="Closed Loop Tuning"
+					 :description="aboutDescription" :model="machineStore.model"
+					 repo="https://github.com/jaysuk/ClosedLoopTuningPlugin"
+					 :docs-url="DOCS.tuning" docs-label="Duet 1HCL tuning guide"
+					 :update-available="updateState?.updateAvailable ?? false" :latest-version="updateState?.latestVersion"
+					 :checking="checking" :applying="applying" :pending-reload="pendingReload" :auto-check="autoCheck"
+					 :extra-actions="aboutExtraActions"
+					 @check-update="onCheckUpdate" @apply-update="applyUpdateNow" @toggle-auto-check="onToggleAutoCheck" />
 
 		<v-stepper v-model="step" :items="stepTitles" editable flat>
 			<!-- 1. Driver -->
@@ -398,9 +405,8 @@ import { computed, nextTick, reactive, ref, watch } from "vue";
 import { useMachineStore } from "@/stores/machine";
 import { LogLevel, useUiStore } from "@/stores/ui";
 
-import { HelpTip, buildReport, downloadReport } from "dwc-plugin-runtime";
+import { HelpTip, buildReport, downloadReport, AboutDialog, type AboutExtraAction } from "dwc-plugin-runtime";
 
-import About from "./About.vue";
 import CaptureChart from "./CaptureChart.vue";
 import { evaluateTune, gradeColor, severityColor, severityIcon, type Term, type TuneEvaluation } from "../model/evaluate";
 import { CAPTURE_DIR, DOCS, LS_STATE, PLUGIN_ID } from "../model/constants";
@@ -413,7 +419,7 @@ import { parseCapture, type ParsedCapture } from "../model/csv";
 import { analyzeCapture, analyzeMove, type MoveMetrics, type StepMetrics } from "../model/analysis";
 import { WIZARD_STEPS, type Recommendation } from "../model/wizard";
 import { AUTOTUNE_FF_SEQUENCE, AUTOTUNE_SEQUENCE, describeMetrics, describeMove, type Attempt, type MoveAttempt, type MoveTermStrategy, type TermStrategy } from "../model/autotune";
-import { applying, applyUpdateNow, dismissCurrentUpdate, pendingReload, updateState } from "../model/updateCheck";
+import { applying, applyUpdateNow, checking, dismissCurrentUpdate, pendingReload, runUpdateCheck, setUpdateChecksEnabled, updateChecksEnabled, updateState } from "../model/updateCheck";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -546,6 +552,15 @@ function downloadTuningReport(): void {
 	const report = buildReport({ pluginId: PLUGIN_ID, pluginVersion: version, model: machineStore.model, state: tuneSession.value, note: "Closed Loop auto-tune session (log + every capture)" });
 	downloadReport(report, `closed-loop-tuning-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
 }
+
+// About dialog (standardised runtime AboutDialog) wiring.
+const aboutDescription = "Tunes Duet 3 closed-loop drivers (1HCL / M23CL): loop mode, encoder calibration, and automatic PID + feed-forward tuning with capture analysis.";
+const autoCheck = ref(updateChecksEnabled());
+const aboutExtraActions = computed<Array<AboutExtraAction>>(() => [
+	{ label: tuneSession.value ? "Download tuning report" : "Download tuning report (run auto-tune first)", icon: "mdi-download", color: "primary", disabled: !tuneSession.value, onClick: downloadTuningReport },
+]);
+function onCheckUpdate(): void { void runUpdateCheck({ force: true, notify: true }); }
+function onToggleAutoCheck(v: boolean): void { autoCheck.value = v; setUpdateChecksEnabled(v); }
 
 // --- Update banner ---
 const updateBanner = computed(() => {
