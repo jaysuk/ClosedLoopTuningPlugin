@@ -29,7 +29,14 @@
 			<v-spacer />
 			<v-chip v-if="selectedDriver" size="small" variant="tonal" class="mr-2">Driver {{ selectedDriver }}</v-chip>
 			<v-chip v-if="currentMode" size="small" :color="currentMode === 'open' ? 'grey' : 'success'" variant="flat">{{ MODE_LABELS[currentMode] }}</v-chip>
+			<v-tooltip text="About, updates & diagnostics" location="bottom">
+				<template #activator="{ props: tip }">
+					<v-btn v-bind="tip" icon="mdi-information-outline" variant="text" size="small" class="ml-1" @click="aboutOpen = true" />
+				</template>
+			</v-tooltip>
 		</div>
+
+		<About v-model="aboutOpen" :has-session="!!tuneSession" @download-tuning="downloadTuningReport" />
 
 		<v-stepper v-model="step" :items="stepTitles" editable flat>
 			<!-- 1. Driver -->
@@ -155,14 +162,25 @@
 								<v-text-field v-model.number="avDistance" type="number" label="Distance (mm)" density="compact" variant="outlined" hide-details style="max-width: 150px"><template #append-inner><HelpTip text="Length of the back-and-forth move used to tune A and V — long enough to reach steady speed. Default 50 mm." /></template></v-text-field>
 								<v-text-field v-model.number="avFeed" type="number" label="Feed (mm/min)" density="compact" variant="outlined" hide-details style="max-width: 160px"><template #append-inner><HelpTip text="Speed of the A/V test move. Higher exercises the feed-forward terms more. Default 6000 mm/min (100 mm/s)." /></template></v-text-field>
 							</div>
-							<div v-if="autoLog.length" class="cl-autolog mt-2">
+							<div v-if="autoLog.length" ref="autoLogEl" class="cl-autolog mt-2">
 								<div v-for="(line, idx) in autoLog" :key="idx">{{ line }}</div>
+							</div>
+							<div v-if="tuneSession && !autoRunning" class="d-flex align-center ga-2 mt-2">
+								<v-btn size="small" variant="tonal" prepend-icon="mdi-download" @click="downloadTuningReport">Download results</v-btn>
+								<HelpTip text="Saves the full auto-tune session — log, final values and every capture — as one JSON file (machine host details scrubbed). Send it over if a result looks wrong and it can be analysed." />
+								<span class="text-caption text-medium-emphasis">{{ tuneSession.captures.length }} captures</span>
 							</div>
 						</v-card-text>
 					</v-card>
 
-					<div v-if="!autoRunning" class="text-caption text-medium-emphasis mb-1">Manual tuning</div>
-					<v-row v-if="!autoRunning" dense>
+					<v-expansion-panels v-if="!autoRunning" v-model="manualPanels" class="mt-2" variant="accordion">
+						<v-expansion-panel>
+							<v-expansion-panel-title>
+								Manual tuning — optional (auto-tune already does this)
+								<HelpTip class="ml-1" :href="DOCS.tuning" text="Tune one term at a time by hand: pick a term, run a step, read the recommendation, apply it. Only needed if you want to override the auto-tuner." />
+							</v-expansion-panel-title>
+							<v-expansion-panel-text>
+								<v-row dense>
 						<v-col cols="12" md="5">
 							<v-card variant="outlined">
 								<v-card-text>
@@ -215,9 +233,9 @@
 							</v-card>
 						</v-col>
 					</v-row>
-
-					<v-expansion-panels v-if="!autoRunning" class="mt-3" variant="accordion">
-						<v-expansion-panel>
+					</v-expansion-panel-text>
+				</v-expansion-panel>
+				<v-expansion-panel>
 							<v-expansion-panel-title>
 								Advanced: manual capture
 								<HelpTip class="ml-1" :href="DOCS.m569_5" text="For power users: record any combination of variables, at a chosen rate, during the step manoeuvre or a custom move. Useful for tuning A/V on a steady-speed G1 move." />
@@ -255,19 +273,8 @@
 					</div>
 
 					<v-alert type="info" variant="tonal" density="compact" class="mb-3">
-						<div class="text-subtitle-2 mb-1">What a well-tuned move looks like</div>
-						<div class="text-body-2">
-							Run a test move, then tick <strong>Current Error</strong> (and optionally Measured + Target Motor Steps) in the Plot panel:
-							<ul class="mt-1">
-								<li><strong>Current Error</strong> stays small and <strong>centred on zero</strong> — typically within a few encoder counts — with no steady drift away from zero. This is the single best indicator.</li>
-								<li><strong>Measured</strong> tracks <strong>Target</strong> closely the whole move: it rises into the steady-speed section without lagging behind, and settles at the end with little or no overshoot or ringing.</li>
-								<li>A little high-frequency “fuzz” on the error is normal (encoder resolution); a slow bow away from zero, a big spike at the start/stop, or growing oscillation are not.</li>
-							</ul>
-							<div class="mt-1 text-medium-emphasis">
-								Bad signs: the error drifts off zero (raise <strong>I</strong>), spikes during accel/decel (raise <strong>A</strong>), sits offset during steady speed (raise <strong>V</strong>), overshoots the target (raise <strong>D</strong>), or oscillates/“sings” (lower <strong>P</strong>, or <strong>D</strong> if it’s the high-frequency kind).
-							</div>
-						</div>
-						<HelpTip class="ml-1" :href="DOCS.tuning" text="The wiki shows annotated example plots of good vs poorly-tuned responses. The error should hover around zero at the encoder's resolution; if it's an order of magnitude larger than the encoder step, keep tuning." />
+						Run a test move — the <strong>Evaluation</strong> panel (right) grades it automatically and tells you exactly what, if anything, to change. No need to read the graph yourself.
+						<HelpTip class="ml-1" :href="DOCS.tuning" text="The evaluation segments the move and measures the position error in each region (rest / accel / steady speed), in motor steps. A good drive holds the error to a small fraction of a step, centred on zero. Click for the wiki's annotated good-vs-bad example plots." />
 					</v-alert>
 
 					<v-row dense>
@@ -305,6 +312,32 @@
 				<CaptureChart :capture="capture" :overlay="overlayCapture" :selected-keys="viewKeys" :sample-rate="sampleRate" :raw-text="rawText" />
 			</v-col>
 			<v-col cols="12" md="3">
+				<v-card v-if="evaluation" class="mb-2" :variant="evaluation.grade === 'unknown' ? 'tonal' : 'flat'" :color="gradeColor(evaluation.grade)">
+					<v-card-text class="py-3">
+						<div class="d-flex align-center mb-1">
+							<v-icon class="mr-2">{{ gradeIcon }}</v-icon>
+							<span class="text-h6 text-capitalize">{{ evaluation.grade }}</span>
+							<v-spacer />
+							<span v-if="evaluation.grade !== 'unknown'" class="text-h6">{{ evaluation.score }}<span class="text-caption">/100</span></span>
+							<HelpTip class="ml-1" text="An automatic verdict on the last capture: the plugin segments the move (rest / accelerating / steady speed), measures the position error in each region in motor steps, and grades it. Each point below names the term to change and which way." />
+						</div>
+						<div class="text-body-2 cl-on-grade mb-2">{{ evaluation.headline }}</div>
+						<v-list density="compact" class="cl-eval-list pa-0" bg-color="transparent">
+							<v-list-item v-for="(f, i) in evaluation.findings" :key="i" class="px-0">
+								<template #prepend>
+									<v-icon size="small" :color="severityColor(f.severity)" class="mr-2">{{ severityIcon(f.severity) }}</v-icon>
+								</template>
+								<v-list-item-title class="text-body-2">{{ f.title }}</v-list-item-title>
+								<v-list-item-subtitle class="cl-finding-detail">{{ f.detail }}</v-list-item-subtitle>
+								<div v-if="f.fix" class="d-flex align-center ga-1 mt-1">
+									<v-icon size="x-small">mdi-arrow-right-bold</v-icon>
+									<span class="text-caption font-weight-medium">{{ f.fix }}</span>
+									<v-btn v-if="f.term" size="x-small" variant="tonal" class="ml-1" @click="goToManualTerm(f.term)">Tune {{ f.term.toUpperCase() }}</v-btn>
+								</div>
+							</v-list-item>
+						</v-list>
+					</v-card-text>
+				</v-card>
 				<v-card class="mb-2">
 					<v-card-title class="py-2 text-subtitle-1 d-flex align-center">
 						Analysis
@@ -360,15 +393,17 @@
 </template>
 
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from "vue";
+import { computed, nextTick, reactive, ref, watch } from "vue";
 
 import { useMachineStore } from "@/stores/machine";
 import { LogLevel, useUiStore } from "@/stores/ui";
 
-import { HelpTip } from "dwc-plugin-runtime";
+import { HelpTip, buildReport, downloadReport } from "dwc-plugin-runtime";
 
+import About from "./About.vue";
 import CaptureChart from "./CaptureChart.vue";
-import { CAPTURE_DIR, DOCS, LS_STATE } from "../model/constants";
+import { evaluateTune, gradeColor, severityColor, severityIcon, type Term, type TuneEvaluation } from "../model/evaluate";
+import { CAPTURE_DIR, DOCS, LS_STATE, PLUGIN_ID } from "../model/constants";
 import {
 	buildCalibrationCommand, buildCaptureCommand, buildModeCommand, buildPidCommand,
 	CALIBRATION_MOVES, CAPTURE_VARIABLES, DEFAULT_MODE_D, ENCODER_TYPES, MODE_LABELS,
@@ -464,6 +499,53 @@ watch([avDistance, avFeed, cycles], persistState);
 const confirmOpen = ref(false);
 const confirmCommand = ref("");
 let confirmAction: (() => Promise<void>) | null = null;
+
+// --- About dialog + manual-panel control + live evaluation ---
+const aboutOpen = ref(false);
+const manualPanels = ref<number | undefined>(undefined);
+const autoLogEl = ref<HTMLElement | null>(null);
+
+/** Automatic plain-language verdict on the most recent capture (see model/evaluate.ts). */
+const evaluation = computed<TuneEvaluation | null>(() => capture.value ? evaluateTune(capture.value, sampleRate.value) : null);
+const gradeIcon = computed(() => {
+	switch (evaluation.value?.grade) {
+		case "excellent": return "mdi-star-circle";
+		case "good": return "mdi-check-circle";
+		case "fair": return "mdi-alert-circle";
+		case "poor": return "mdi-close-circle";
+		default: return "mdi-help-circle";
+	}
+});
+/** Jump to a term in the manual tuner (expands the panel) when the user clicks a fix suggestion. */
+function goToManualTerm(term: Term): void {
+	const idx = WIZARD_STEPS.findIndex((s) => s.term === term);
+	if (idx >= 0) { wizardIndex.value = idx; }
+	manualPanels.value = 0;
+	step.value = 4;
+}
+
+// Keep the auto-tune log scrolled to the newest line.
+watch(() => autoLog.value.length, () => { void nextTick(() => { const el = autoLogEl.value; if (el) { el.scrollTop = el.scrollHeight; } }); });
+
+// --- Auto-tune session capture (for the downloadable results report) ---
+interface SessionCapture { phase: string; value?: number; metrics?: unknown; csv: string }
+interface TuneSession {
+	startedAt: string; finishedAt?: string; driver: string | null; mode: LoopMode | null;
+	encoderType: EncoderType; cycles: number; finalPid?: PidConfig; log: Array<string>;
+	captures: Array<SessionCapture>; evaluation?: TuneEvaluation | null;
+}
+const tuneSession = ref<TuneSession | null>(null);
+function recordSessionCapture(phase: string, value: number | undefined, metrics: unknown): void {
+	if (tuneSession.value && rawText.value) {
+		tuneSession.value.captures.push({ phase, value, metrics, csv: rawText.value });
+	}
+}
+function downloadTuningReport(): void {
+	if (!tuneSession.value) { return; }
+	const version = ((machineStore.model as any)?.plugins?.get?.("ClosedLoopTuning")?.version) ?? "unknown";
+	const report = buildReport({ pluginId: PLUGIN_ID, pluginVersion: version, model: machineStore.model, state: tuneSession.value, note: "Closed Loop auto-tune session (log + every capture)" });
+	downloadReport(report, `closed-loop-tuning-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
+}
 
 // --- Update banner ---
 const updateBanner = computed(() => {
@@ -739,6 +821,7 @@ async function autoTuneTerm(strategy: TermStrategy): Promise<boolean> {
 		const m = await captureStep();
 		if (!m) { log(`${strategy.label}: capture failed — aborting.`); return false; }
 		attempts.push({ value, metrics: m });
+		recordSessionCapture(strategy.term, value, m);
 		log(`${strategy.label}: ${strategy.term.toUpperCase()}=${value} → ${describeMetrics(m)}`);
 		const d = strategy.decide(attempts);
 		if (d.kind === "fail") { log(`${strategy.label}: ${d.reason}`); return false; }
@@ -766,6 +849,7 @@ async function autoTuneMoveTerm(strategy: MoveTermStrategy): Promise<boolean> {
 		const m = await captureMove();
 		if (!m) { log(`${strategy.label}: capture failed — skipping.`); return false; }
 		attempts.push({ value, metrics: m });
+		recordSessionCapture(strategy.term, value, m);
 		log(`${strategy.label}: ${strategy.term.toUpperCase()}=${value} → ${describeMove(m)}`);
 		const d = strategy.decide(attempts);
 		if (d.kind === "fail") { log(`${strategy.label}: ${d.reason}`); return false; }
@@ -790,6 +874,10 @@ async function runAutoTune(): Promise<void> {
 	autoLog.value = [];
 	viewKeys.value = ["measuredMotorSteps", "targetMotorSteps", "currentError"];
 	const totalCycles = Math.max(1, Math.round(cycles.value || 1));
+	tuneSession.value = {
+		startedAt: new Date().toISOString(), driver: selectedDriver.value, mode: currentMode.value,
+		encoderType: encoderType.value, cycles: totalCycles, log: [], captures: [],
+	};
 	try {
 		// Ensure the driver is in a feedback mode — the step manoeuvre only moves in closed/assisted loop,
 		// and the board can come up in open loop after a reboot/reload. Uses the corrected mode command
@@ -830,13 +918,19 @@ async function runAutoTune(): Promise<void> {
 			? "Auto-tune aborted."
 			: `Auto-tune complete — P=${pid.p} D=${pid.d} I=${pid.i} A=${pid.a} V=${pid.v}.`;
 		if (!autoCancel.value) {
-			uiStore.makeNotification(LogLevel.success, "Closed Loop Tuning", autoStatus.value + " Review the plot, then save to config.g.");
+			uiStore.makeNotification(LogLevel.success, "Closed Loop Tuning", autoStatus.value + " Review the evaluation, then save to config.g.");
 		}
 	} catch (e) {
 		console.warn("[ClosedLoopTuning] auto-tune failed", e);
 		autoStatus.value = "Auto-tune stopped (see console).";
 	} finally {
 		autoRunning.value = false;
+		if (tuneSession.value) {
+			tuneSession.value.finishedAt = new Date().toISOString();
+			tuneSession.value.finalPid = { ...pid };
+			tuneSession.value.log = [...autoLog.value];
+			tuneSession.value.evaluation = evaluation.value;
+		}
 	}
 }
 
@@ -915,6 +1009,19 @@ watch(selectedDriver, (d) => { if (d) { void loadPid(); } });
 :deep(.cl-active-term .v-field) {
 	outline: 2px solid rgb(var(--v-theme-primary));
 	border-radius: 4px;
+}
+.cl-eval-list :deep(.v-list-item) {
+	min-height: 0;
+	margin-bottom: 4px;
+}
+.cl-finding-detail {
+	white-space: normal !important;
+	opacity: 0.92;
+	font-size: 0.74rem;
+	line-height: 1.3;
+}
+.cl-on-grade {
+	opacity: 0.95;
 }
 .cl-autolog {
 	max-height: 140px;

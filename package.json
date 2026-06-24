@@ -1,6 +1,6 @@
 {
   "name": "closed-loop-tuning",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Tune and visualise the Duet closed-loop driver (1HCL / M23CL): mode + calibration control, guided PID tuning, automatic step-response analysis — a Duet Web Control 3.7 plugin.",
   "private": true,
   "license": "GPL-3.0-or-later",

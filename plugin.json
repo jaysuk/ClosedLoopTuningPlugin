@@ -2,7 +2,7 @@
 	"id": "ClosedLoopTuning",
 	"name": "Closed Loop Tuning",
 	"author": "Louis Irwin, Juan Rosario (3.7 port + rework by James Skitt)",
-	"version": "2.0.0",
+	"version": "2.1.0",
 	"license": "GPL-3.0-or-later",
 	"homepage": "https://github.com/jaysuk/ClosedLoopTuningPlugin",
 	"dwcVersion": "auto-major",
