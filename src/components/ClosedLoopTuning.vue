@@ -13,12 +13,13 @@
 			No closed-loop drivers found. Connect a Duet 3 board with a 1HCL / M23CL configured for an axis or extruder.
 		</v-alert>
 
-		<v-alert type="warning" variant="tonal" density="compact" class="mb-3" icon="mdi-connection">
-			<strong>Disconnect the motor from the motion system before tuning.</strong>
-			Uncouple it from the belt / leadscrew (or detach the belt) so the shaft can spin freely. Tuning
-			drives the motor hard and deliberately provokes oscillation to find the limits — doing that while
-			it's coupled to the machine can stress or damage the mechanics. Reconnect before printing, and
-			re-run a quick check once coupled (the loaded inertia shifts the ideal values slightly).
+		<v-alert type="warning" variant="tonal" density="compact" class="mb-3" icon="mdi-axis-arrow">
+			<strong>Tune with the axis loaded — coupled to the belt/leadscrew, under real load.</strong>
+			Home the axis first: tuning moves ignore endstops and soft limits, so the plugin can only keep them
+			off the frame if it knows where the axis actually is. Before each move it centres the axis
+			(see the "Safety margin" setting below) and clamps the move to stay inside that margin of the
+			travel limits — but an unhomed axis, or one whose limits the machine hasn't reported, isn't protected
+			at all. Keep an emergency stop within reach the first time.
 		</v-alert>
 
 		<div class="d-flex align-center mb-2">
@@ -168,7 +169,9 @@
 								<span class="text-caption text-medium-emphasis">A/V test move:</span>
 								<v-text-field v-model.number="avDistance" type="number" label="Distance (mm)" density="compact" variant="outlined" hide-details style="max-width: 150px"><template #append-inner><HelpTip text="Length of the back-and-forth move used to tune A and V — long enough to reach steady speed. Default 50 mm." /></template></v-text-field>
 								<v-text-field v-model.number="avFeed" type="number" label="Feed (mm/min)" density="compact" variant="outlined" hide-details style="max-width: 160px"><template #append-inner><HelpTip text="Speed of the A/V test move. Higher exercises the feed-forward terms more. Default 6000 mm/min (100 mm/s)." /></template></v-text-field>
+								<v-text-field v-model.number="marginMm" type="number" :min="0" label="Safety margin (mm)" density="compact" variant="outlined" hide-details style="max-width: 170px"><template #append-inner><HelpTip text="Kept clear of the axis's min/max limits. Tuning moves are auto-clamped inside this margin, and (if needed) the axis is centred in its travel before tuning starts. Only enforced on a homed axis." /></template></v-text-field>
 							</div>
+							<div v-if="axisTravelInfo" class="text-caption text-medium-emphasis mt-1">{{ axisTravelInfo }}</div>
 							<div v-if="autoLog.length" ref="autoLogEl" class="cl-autolog mt-2">
 								<div v-for="(line, idx) in autoLog" :key="idx">{{ line }}</div>
 							</div>
@@ -258,7 +261,10 @@
 										</v-radio-group>
 									</v-col>
 								</v-row>
-								<v-text-field v-if="moveMode === 'custom'" v-model="customMove" label="Move G-code" density="compact" variant="outlined" hide-details class="mb-2" placeholder="G91 G1 H2 X50 F6000 G90" />
+								<v-text-field v-if="moveMode === 'custom'" v-model="customMove" label="Move G-code" density="compact" variant="outlined" hide-details class="mb-2" placeholder="G91 G1 H2 X50 F6000 G90">
+									<template #append-inner><HelpTip text="Unlike the auto-generated tuning moves, this distance is NOT checked against the axis's travel limits — it's your responsibility. The axis is still centred first if needed." /></template>
+								</v-text-field>
+								<div v-if="moveMode === 'custom' && axisTravelInfo" class="text-caption text-medium-emphasis mb-1">{{ axisTravelInfo }}</div>
 								<div class="d-flex flex-wrap mb-1">
 									<v-checkbox v-for="v in captureVariables" :key="v.key" v-model="recordKeys" :value="v.key" :label="v.header" density="compact" hide-details class="cl-var" />
 								</div>
@@ -290,8 +296,9 @@
 								<v-card-title class="py-2 text-subtitle-2">Test move</v-card-title>
 								<v-card-text>
 									<v-text-field v-model="customMove" label="Test move G-code" density="compact" variant="outlined" hide-details class="mb-2" placeholder="G91 G1 H2 X50 F6000 G90">
-										<template #append-inner><HelpTip text="A real G1 move (recorded while it runs). Watch Current Error in the plot — a well-tuned drive keeps it small and centred on zero." /></template>
+										<template #append-inner><HelpTip text="A real G1 move (recorded while it runs). Watch Current Error in the plot — a well-tuned drive keeps it small and centred on zero. This distance isn't checked against the travel limits, so keep it within the range shown below." /></template>
 									</v-text-field>
+									<div v-if="axisTravelInfo" class="text-caption text-medium-emphasis mb-1">{{ axisTravelInfo }}</div>
 									<v-btn size="small" color="info" :disabled="!selectedDriver || recording" :loading="recording" @click="runTestMove"><v-icon class="mr-1">mdi-record</v-icon> Run test move</v-btn>
 								</v-card-text>
 							</v-card>
@@ -386,12 +393,12 @@
 			<v-card>
 				<v-card-title>Confirm movement</v-card-title>
 				<v-card-text>
-					This will move the selected driver and may not respect endstops. Make sure the axis is in a safe position (usually the centre) with room to move.
+					{{ confirmMessage }}
 					<div class="text-caption text-medium-emphasis mt-2"><code>{{ confirmCommand }}</code></div>
 				</v-card-text>
 				<v-card-actions>
 					<v-spacer />
-					<v-btn variant="text" @click="confirmOpen = false">Cancel</v-btn>
+					<v-btn variant="text" @click="confirmCancel">Cancel</v-btn>
 					<v-btn color="primary" @click="confirmProceed">Proceed</v-btn>
 				</v-card-actions>
 			</v-card>
@@ -417,6 +424,10 @@ import {
 } from "../model/m569";
 import { parseCapture, type ParsedCapture } from "../model/csv";
 import { analyzeCapture, analyzeMove, type MoveMetrics, type StepMetrics } from "../model/analysis";
+import {
+	CENTER_TOLERANCE_MM, CENTERING_FEED_MM_MIN, DEFAULT_MARGIN_MM,
+	getAxisLimits, midpoint, planSymmetricMove, type AxisLimits,
+} from "../model/limits";
 import { WIZARD_STEPS, type Recommendation } from "../model/wizard";
 import { AUTOTUNE_FF_SEQUENCE, AUTOTUNE_SEQUENCE, describeMetrics, describeMove, type Attempt, type MoveAttempt, type MoveTermStrategy, type TermStrategy } from "../model/autotune";
 import { applying, applyUpdateNow, checking, dismissCurrentUpdate, pendingReload, runUpdateCheck, setUpdateChecksEnabled, updateChecksEnabled, updateState } from "../model/updateCheck";
@@ -443,6 +454,7 @@ interface SavedState {
 	encoderType?: EncoderType; modeD?: Partial<typeof DEFAULT_MODE_D>; pid?: Partial<PidConfig>;
 	samples?: number; sampleRate?: number; moveMode?: "step" | "custom"; customMove?: string;
 	recordKeys?: Array<string>; viewKeys?: Array<string>; avDistance?: number; avFeed?: number; cycles?: number;
+	marginMm?: number;
 }
 function loadState(): SavedState {
 	try { return JSON.parse(localStorage.getItem(LS_STATE) ?? "{}") as SavedState; } catch { return {}; }
@@ -484,7 +496,7 @@ function persistState(): void {
 				currentMode: currentMode.value, encoderType: encoderType.value, modeD: { ...modeD }, pid: { ...pid },
 				samples: samples.value, sampleRate: sampleRate.value, moveMode: moveMode.value,
 				customMove: customMove.value, recordKeys: recordKeys.value, viewKeys: viewKeys.value,
-				avDistance: avDistance.value, avFeed: avFeed.value, cycles: cycles.value,
+				avDistance: avDistance.value, avFeed: avFeed.value, cycles: cycles.value, marginMm: marginMm.value,
 			} satisfies SavedState));
 		} catch { /* storage unavailable */ }
 	}, 300);
@@ -500,11 +512,18 @@ const autoLog = ref<Array<string>>([]);
 const avDistance = ref(saved.avDistance ?? 50);   // mm — A/V test move length
 const avFeed = ref(saved.avFeed ?? 6000);          // mm/min — A/V test move feedrate
 const cycles = ref(saved.cycles ?? 3);             // how many times to iterate P→D→I
-watch([avDistance, avFeed, cycles], persistState);
+const marginMm = ref(saved.marginMm ?? DEFAULT_MARGIN_MM); // mm — kept clear of each travel limit
+watch([avDistance, avFeed, cycles, marginMm], persistState);
 
 const confirmOpen = ref(false);
 const confirmCommand = ref("");
+const confirmMessage = ref("");
+const DEFAULT_CONFIRM_MESSAGE = "This will move the selected driver. On an axis with known travel limits it "
+	+ "will first centre the axis and then keep moves within the configured margin of min/max — but that only "
+	+ "works once the axis is homed. Extruders, or axes the object model hasn't reported a position for yet, "
+	+ "aren't checked at all, so make sure there's room to move.";
 let confirmAction: (() => Promise<void>) | null = null;
+let confirmResolve: ((ok: boolean) => void) | null = null;
 
 // --- About dialog + manual-panel control + live evaluation ---
 const aboutOpen = ref(false);
@@ -607,6 +626,15 @@ function axisLetterForDriver(): string | null {
 	return axisForDriver()?.letter ?? null;
 }
 
+/** Human-readable summary of the driver's axis travel/position, shown next to the safety margin setting. */
+const axisTravelInfo = computed(() => {
+	const limits = getAxisLimits(axisForDriver());
+	if (!limits) { return ""; }
+	const homedNote = limits.homed ? "" : " — NOT HOMED, moves will be refused";
+	return `${limits.letter}: travel ${limits.min}–${limits.max} mm, currently ${limits.position.toFixed(1)} mm, `
+		+ `${marginMm.value} mm margin${homedNote}`;
+});
+
 // --- Mode ---
 async function setMode(mode: LoopMode): Promise<void> {
 	if (!selectedDriver.value) { return; }
@@ -677,6 +705,9 @@ async function record(): Promise<void> {
 		uiStore.makeNotification(LogLevel.warning, "Closed Loop Tuning", "Enter a move before recording.");
 		return;
 	}
+	// Centre first if needed — this doesn't bounds-check a custom move's distance (it's arbitrary
+	// G-code), only makes sure it's starting from the middle of the axis's travel.
+	if (!(await ensureAxisReady(getAxisLimits(axisForDriver())))) { return; }
 	runsAtStart = selectedBoard.value?.closedLoop?.runs ?? -1;
 	recording.value = true;
 	try {
@@ -785,23 +816,66 @@ async function runCapture(opts: Parameters<typeof buildCaptureCommand>[0]): Prom
 	return loadLatestCsv();
 }
 
+const MIN_STEP_DISTANCE_FRACTION = 0.5; // require at least half the intended step-jump distance to bother capturing
+const MIN_AV_DISTANCE_FRACTION = 0.25;  // ...and a quarter of the intended A/V move
+const MIN_AV_DISTANCE_FLOOR_MM = 2;
+
+/**
+ * Gate before any axis-moving capture. Tuning moves use G1's H2 (individual motor) mode, which drives
+ * the motor directly and bypasses RRF's kinematics — so M208 soft limits never apply to them. This is
+ * the only thing keeping a tuning move off the frame now that tuning happens on the loaded axis.
+ * Requires the axis to be homed (otherwise its position relative to the frame is unknown); if it isn't
+ * already near the middle of its travel, warns the user and moves it there first via a normal
+ * (kinematics-respecting) G1 move, so the tuning move has room on both sides. No-op for extruders or
+ * axes the object model hasn't reported a position for yet.
+ */
+async function ensureAxisReady(limits: AxisLimits | null): Promise<boolean> {
+	if (!limits) { return true; }
+	if (!limits.homed) {
+		uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", `${limits.letter} is not homed — home it first so the plugin knows its position relative to the frame.`);
+		return false;
+	}
+	const mid = midpoint(limits);
+	if (Math.abs(mid - limits.position) < CENTER_TOLERANCE_MM) { return true; }
+	const move = `G90 G1 ${limits.letter}${mid.toFixed(3)} F${CENTERING_FEED_MM_MIN}`;
+	const message = `Before tuning, ${limits.letter} will move to the middle of its travel `
+		+ `(${mid.toFixed(1)} mm — currently ${limits.position.toFixed(1)} mm) so it has room to move safely `
+		+ `in both directions. Make sure the axis is clear, then proceed.`;
+	if (!(await confirmAsync(message, move))) { return false; }
+	await send(move);
+	await send("M400"); // block until the centering move finishes
+	await delay(400);    // let the object model catch up before we read the new position back
+	return true;
+}
+
 /**
  * Step-response capture (for P/D/I). Uses a small, fast G1 move (~16 full steps) which behaves like a
  * step jump — the firmware V64 manoeuvre doesn't reliably move on all setups, whereas a real
  * closed-loop G1 move does (it's also what the official plugin/wiki tune from). The outward move is
  * captured, then the axis is returned to its start. Falls back to V64 for drivers with no axis (extruders).
+ * The direction and distance are chosen to stay within the configured margin of the axis's travel limits.
  */
 async function captureStep(): Promise<StepMetrics | null> {
 	const ax = axisForDriver();
+	if (!(await ensureAxisReady(getAxisLimits(ax)))) { return null; }
+	const limits = getAxisLimits(axisForDriver()); // re-read: ensureAxisReady may have moved the axis
 	const stepVars = varIds(["measuredMotorSteps", "targetMotorSteps", "currentError", "pidPTerm"]);
 	let c: ParsedCapture | null;
 	if (ax?.letter) {
 		const stepsPerMm = Number(ax.stepsPerMm) || 80;
 		const micro = Number(ax.microstepping?.value) || 16;
-		const dist = Math.max(0.1, (micro / stepsPerMm) * 16);   // ~16 full steps ≈ a step jump
-		const move = `G91 G1 H2 ${ax.letter}${dist.toFixed(3)} F18000 G90`;
+		const desired = Math.max(0.1, (micro / stepsPerMm) * 16);   // ~16 full steps ≈ a step jump
+		let dist = desired;
+		let sign: 1 | -1 = 1;
+		if (limits) {
+			const plan = planSymmetricMove(limits, desired, marginMm.value, desired * MIN_STEP_DISTANCE_FRACTION);
+			if ("error" in plan) { log(`Step capture: ${plan.error}`); uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", plan.error); return null; }
+			dist = plan.distance; sign = plan.sign;
+		}
+		const signedDist = sign * dist;
+		const move = `G91 G1 H2 ${ax.letter}${signedDist.toFixed(3)} F18000 G90`;
 		c = await runCapture({ driver: selectedDriver.value ?? "", samples: samples.value, activate: 1, rate: sampleRate.value, variables: stepVars, manoeuvre: 0, move });
-		try { await machineStore.sendCode(`G91 G1 H2 ${ax.letter}-${dist.toFixed(3)} F18000 G90`, false, false); } catch { /* return move */ }
+		try { await machineStore.sendCode(`G91 G1 H2 ${ax.letter}${(-signedDist).toFixed(3)} F18000 G90`, false, false); } catch { /* return move */ }
 	} else {
 		c = await runCapture({ driver: selectedDriver.value ?? "", samples: samples.value, activate: 0, rate: sampleRate.value, variables: stepVars, manoeuvre: 64 });
 	}
@@ -810,13 +884,28 @@ async function captureStep(): Promise<StepMetrics | null> {
 	return metrics.value;
 }
 
-/** G1-move capture → move metrics (for A/V). Captures the outward move, then returns the axis to start. */
+/**
+ * G1-move capture → move metrics (for A/V). Captures the outward move, then returns the axis to start.
+ * The direction and distance are chosen to stay within the configured margin of the axis's travel limits.
+ */
 async function captureMove(): Promise<MoveMetrics | null> {
-	const axis = axisLetterForDriver();
+	const axisObj = axisForDriver();
+	const axis = axisObj?.letter ?? null;
 	if (!axis) { uiStore.makeNotification(LogLevel.warning, "Closed Loop Tuning", "A/V tuning needs the driver's axis — skipped."); return null; }
+	if (!(await ensureAxisReady(getAxisLimits(axisObj)))) { return null; }
+	const limits = getAxisLimits(axisForDriver()); // re-read: ensureAxisReady may have moved the axis
+	let dist = avDistance.value;
+	let sign: 1 | -1 = 1;
+	if (limits) {
+		const minDist = Math.max(MIN_AV_DISTANCE_FLOOR_MM, avDistance.value * MIN_AV_DISTANCE_FRACTION);
+		const plan = planSymmetricMove(limits, avDistance.value, marginMm.value, minDist);
+		if ("error" in plan) { log(`A/V capture: ${plan.error}`); uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", plan.error); return null; }
+		dist = plan.distance; sign = plan.sign;
+	}
+	const signedDist = sign * dist;
 	viewKeys.value = ["pidPTerm", "targetMotorSteps"];
-	const c = await runCapture({ driver: selectedDriver.value ?? "", samples: samples.value, activate: 1, rate: sampleRate.value, variables: varIds(["targetMotorSteps", "pidPTerm", "measuredMotorSteps"]), manoeuvre: 0, move: `G91 G1 H2 ${axis}${avDistance.value} F${avFeed.value} G90` });
-	try { await machineStore.sendCode(`G91 G1 H2 ${axis}-${avDistance.value} F${avFeed.value} G90`, false, false); } catch { /* ignore return-move error */ }
+	const c = await runCapture({ driver: selectedDriver.value ?? "", samples: samples.value, activate: 1, rate: sampleRate.value, variables: varIds(["targetMotorSteps", "pidPTerm", "measuredMotorSteps"]), manoeuvre: 0, move: `G91 G1 H2 ${axis}${signedDist.toFixed(3)} F${avFeed.value} G90` });
+	try { await machineStore.sendCode(`G91 G1 H2 ${axis}${(-signedDist).toFixed(3)} F${avFeed.value} G90`, false, false); } catch { /* ignore return-move error */ }
 	if (!c) { return null; }
 	return analyzeMove(c, sampleRate.value);
 }
@@ -878,8 +967,8 @@ function startAutoTune(): void {
 	if (!selectedDriver.value) { return; }
 	const hasAxis = !!axisLetterForDriver();
 	const msg = hasAxis
-		? "Auto-tune will switch to closed loop, then repeatedly move the driver: step jumps to tune P/D/I, then back-and-forth moves to tune A/V. Make sure you've calibrated (Step 3) and the motor is uncoupled."
-		: "Auto-tune will switch to closed loop, then repeatedly move the driver with step jumps to tune P/D/I (A/V need an axis and will be skipped). Make sure you've calibrated (Step 3) and the motor is uncoupled.";
+		? "Auto-tune will switch to closed loop, then repeatedly move the driver: step jumps to tune P/D/I, then back-and-forth moves to tune A/V. It will first move the axis to the middle of its travel (you'll get a separate prompt for that) and keeps every move inside the configured safety margin — but only on a homed axis. Make sure you've calibrated (Step 3) and the axis is homed."
+		: "Auto-tune will switch to closed loop, then repeatedly move the driver with step jumps to tune P/D/I (A/V need an axis and will be skipped). Make sure you've calibrated (Step 3) first.";
 	askConfirm(msg, runAutoTune);
 }
 
@@ -984,16 +1073,38 @@ async function copyConfig(): Promise<void> {
 }
 
 // --- Shared confirm + send ---
-function askConfirm(command: string, action: () => Promise<void>): void {
+function askConfirm(command: string, action: () => Promise<void>, message = DEFAULT_CONFIRM_MESSAGE): void {
 	confirmCommand.value = command;
+	confirmMessage.value = message;
 	confirmAction = action;
+	confirmResolve = null;
 	confirmOpen.value = true;
+}
+/** Promise-based confirm for gating a step inside an async flow (e.g. centering before a move). */
+function confirmAsync(message: string, command: string): Promise<boolean> {
+	return new Promise((resolve) => {
+		confirmCommand.value = command;
+		confirmMessage.value = message;
+		confirmAction = null;
+		confirmResolve = resolve;
+		confirmOpen.value = true;
+	});
 }
 async function confirmProceed(): Promise<void> {
 	confirmOpen.value = false;
 	const action = confirmAction;
+	const resolve = confirmResolve;
 	confirmAction = null;
+	confirmResolve = null;
 	if (action) { await action(); }
+	if (resolve) { resolve(true); }
+}
+function confirmCancel(): void {
+	confirmOpen.value = false;
+	const resolve = confirmResolve;
+	confirmAction = null;
+	confirmResolve = null;
+	if (resolve) { resolve(false); }
 }
 async function send(code: string): Promise<void> {
 	try {
