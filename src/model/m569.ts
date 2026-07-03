@@ -74,6 +74,32 @@ export function buildCalibrationCommand(driver: string, moveId: number): string 
 	return `M569.6 P${driver} V${moveId}`;
 }
 
+export interface CalibrationReplyResult {
+	/** True only when the reply is unambiguously a success (no "Error:", and not a bare/unrecognised reply). */
+	ok: boolean;
+	/** Residual error reported by a V3 calibration check, when present. */
+	residual: number | null;
+	message: string;
+}
+
+/**
+ * Parse an `M569.6` reply. Firmware reply wording isn't guaranteed stable across RRF versions, so this
+ * only claims success on an unambiguous "Error:"-free reply, and degrades to `ok:false` with the raw
+ * message otherwise — callers should treat automated preflight calibration as a best-effort step and
+ * fall back to a driver-tracking probe (measured motion, not reply text) as the real ground truth.
+ */
+export function parseCalibrationReply(reply: string): CalibrationReplyResult {
+	const text = (reply ?? "").trim();
+	if (!text) {
+		return { ok: false, residual: null, message: "No reply from the driver." };
+	}
+	if (/^error\s*:/i.test(text)) {
+		return { ok: false, residual: null, message: text };
+	}
+	const residualMatch = /residual\s*(?:error)?\s*[:=]?\s*([0-9.]+)/i.exec(text);
+	return { ok: true, residual: residualMatch ? Number(residualMatch[1]) : null, message: text };
+}
+
 // --- Capture variables (M569.5 D bitmask) ---
 
 export interface CaptureVariable {

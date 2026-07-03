@@ -8,7 +8,7 @@ import {
 import { SIGNAL_D_STRATEGY, SIGNAL_P_STRATEGY, P_STRATEGY, D_STRATEGY, I_STRATEGY } from "../model/autotune";
 import type { PidConfig } from "../model/m569";
 import type { TuneSignal } from "../model/signal";
-import type { TuneStats } from "../model/evaluate";
+import type { TuneEvaluation, TuneStats } from "../model/evaluate";
 
 function stats(over: Partial<TuneStats> = {}): TuneStats {
 	return {
@@ -35,6 +35,10 @@ const GOOD_STEP = stepM();
 
 const basePid = (): PidConfig => ({ p: 100, i: 0, d: 0, v: 0, a: 0, warn: null, err: null });
 
+function evaluation(over: Partial<TuneEvaluation> = {}): TuneEvaluation {
+	return { grade: "good", score: 90, headline: "", findings: [], stats: stats(), ...over };
+}
+
 function fakeEffects(over: Partial<TuneEffects> = {}): { effects: TuneEffects; log: Array<string> } {
 	const log: Array<string> = [];
 	const effects: TuneEffects = {
@@ -42,6 +46,8 @@ function fakeEffects(over: Partial<TuneEffects> = {}): { effects: TuneEffects; l
 		readPid: vi.fn(async () => basePid()),
 		captureSignal: vi.fn(async () => GOOD_SIGNAL),
 		captureStep: vi.fn(async () => GOOD_STEP),
+		runCalibration: vi.fn(async () => "ok"),
+		evaluateCapture: vi.fn(async () => null),
 		ensureReady: vi.fn(async () => true),
 		log: (line: string) => log.push(line),
 		status: () => {},
@@ -253,24 +259,26 @@ describe("runAutoTune — safety: snapshot and rollback", () => {
 		expect(effects.captureSignal).not.toHaveBeenCalled();
 	});
 
-	it("aborts before touching anything when ensureReady() fails", async () => {
+	it("fails cleanly (and still runs the restore, harmlessly) when ensureReady() fails before anything is touched", async () => {
 		const { effects } = fakeEffects({ ensureReady: vi.fn(async () => false) });
 		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
 		expect(result.ok).toBe(false);
-		expect(result.restored).toBeFalsy();
 		expect(effects.captureSignal).not.toHaveBeenCalled();
 	});
 });
 
 describe("runAutoTune — Ku/Tu seeding", () => {
 	it("finds a sustained oscillation and seeds P/I/D from it", async () => {
-		let call = 0;
+		let lastAppliedP = 0;
+		const applyPid = vi.fn(async (p: PidConfig) => { lastAppliedP = p.p; });
 		const captureSignal = vi.fn(async () => {
-			call++;
-			if (call === 3) { return sig({ oscPeriod: 0.05, stats: { restRing: 5 } }); } // P=70 on the 3rd seeding probe
-			return sig({ oscPeriod: null, stats: { restRing: 0 } }); // no oscillation yet / post-seed tuning
+			// P=70 is the 3rd value the seeding ramp tries (30 → 50 → 70); flag that one as a clean,
+			// non-saturating sustained oscillation — everything else (the preflight probe included)
+			// looks stable with no oscillation.
+			if (lastAppliedP === 70) { return sig({ oscPeriod: 0.05, stats: { restRing: 5 } }); }
+			return sig({ oscPeriod: null, stats: { restRing: 0 } });
 		});
-		const { effects, log } = fakeEffects({ captureSignal });
+		const { effects, log } = fakeEffects({ applyPid, captureSignal });
 		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
 		expect(result.ok).toBe(true);
 		expect(result.ku).toBe(70);
@@ -322,5 +330,105 @@ describe("runAutoTune — ITAE plateau early-stop", () => {
 		const cycleLines = log.filter((l) => l.includes("──── Cycle"));
 		expect(cycleLines.length).toBeLessThan(5);
 		expect(log.some((l) => l.includes("ITAE") && l.includes("stopping early"))).toBe(true);
+	});
+});
+
+describe("runAutoTune — preflight (axis drivers)", () => {
+	it("skips calibration entirely when the driver is already tracking", async () => {
+		const runCalibration = vi.fn(async () => "ok");
+		const { effects } = fakeEffects({ runCalibration }); // default captureSignal (GOOD_SIGNAL) already tracks
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true, calibrationMoveIds: [1, 2] });
+		expect(result.ok).toBe(true);
+		expect(result.preflightActions).toEqual([]);
+		expect(runCalibration).not.toHaveBeenCalled();
+	});
+
+	it("runs calibration and re-probes when the driver isn't tracking, then proceeds", async () => {
+		let calibrated = false;
+		const runCalibration = vi.fn(async (moveId: number) => { calibrated = true; return `Calibration V${moveId} complete`; });
+		const captureSignal = vi.fn(async () => (calibrated ? GOOD_SIGNAL : sig({ stats: { movePeak: 500 } })));
+		const { effects } = fakeEffects({ runCalibration, captureSignal });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true, calibrationMoveIds: [1, 2] });
+		expect(result.ok).toBe(true);
+		expect(result.preflightActions).toEqual(["V1", "V2"]);
+		expect(runCalibration).toHaveBeenCalledTimes(2);
+	});
+
+	it("fails cleanly (with restore) when not tracking and no calibration is configured", async () => {
+		const captureSignal = vi.fn(async () => sig({ stats: { movePeak: 500 } })); // never tracks
+		const snapshot: PidConfig = { p: 42, i: 1, d: 2, v: 3, a: 4, warn: null, err: null };
+		const { effects } = fakeEffects({ captureSignal, readPid: vi.fn(async () => snapshot) });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true, calibrationMoveIds: [] });
+		expect(result.ok).toBe(false);
+		expect(result.restored).toBe(true);
+		expect(result.pid).toEqual(snapshot);
+		expect(result.reason).toContain("no calibration is configured");
+	});
+
+	it("fails cleanly when calibration doesn't fix the tracking problem", async () => {
+		const runCalibration = vi.fn(async () => "did nothing useful");
+		const captureSignal = vi.fn(async () => sig({ stats: { movePeak: 500 } })); // stays unstable regardless
+		const { effects } = fakeEffects({ runCalibration, captureSignal });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true, calibrationMoveIds: [1] });
+		expect(result.ok).toBe(false);
+		expect(result.restored).toBe(true);
+		expect(result.preflightActions).toEqual(["V1"]);
+		expect(result.reason).toContain("Still not tracking");
+	});
+
+	it("skips the tracking probe entirely for extruders (no axis)", async () => {
+		const captureSignal = vi.fn(async () => null); // would fail the run if it were ever called
+		const { effects } = fakeEffects({ captureSignal });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: false });
+		expect(result.ok).toBe(true); // converges via the legacy captureStep path instead
+		expect(captureSignal).not.toHaveBeenCalled();
+	});
+});
+
+describe("runAutoTune — final verification", () => {
+	it("skips the correction pass when the grade is already good", async () => {
+		const evaluateCapture = vi.fn(async () => evaluation({ grade: "excellent", score: 96 }));
+		const { effects } = fakeEffects({ evaluateCapture });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
+		expect(result.ok).toBe(true);
+		expect(result.evaluation?.grade).toBe("excellent");
+		expect(evaluateCapture).toHaveBeenCalledTimes(1);
+	});
+
+	it("applies one bounded correction pass when the grade is below good, and keeps it if it helps", async () => {
+		let call = 0;
+		const evaluateCapture = vi.fn(async () => {
+			call++;
+			return call === 1
+				? evaluation({ grade: "fair", score: 60, findings: [{ severity: "warn", title: "Slight standing error", detail: "x", term: "d", direction: "up" }] })
+				: evaluation({ grade: "good", score: 85 });
+		});
+		const { effects } = fakeEffects({ evaluateCapture });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
+		expect(result.ok).toBe(true);
+		expect(result.evaluation?.grade).toBe("good");
+		expect(evaluateCapture).toHaveBeenCalledTimes(2);
+		expect(result.pid.d).toBeGreaterThan(0); // D was raised from 0 by the correction
+	});
+
+	it("reverts the correction pass if it doesn't help, keeping the pre-correction evaluation", async () => {
+		let call = 0;
+		const evaluateCapture = vi.fn(async () => {
+			call++;
+			return call === 1
+				? evaluation({ grade: "fair", score: 60, findings: [{ severity: "warn", title: "x", detail: "x", term: "p", direction: "up" }] })
+				: evaluation({ grade: "poor", score: 20 }); // correction made it worse
+		});
+		const { effects } = fakeEffects({ evaluateCapture });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
+		expect(result.ok).toBe(true);
+		expect(result.evaluation?.grade).toBe("fair"); // reverted — reports the pre-correction grade
+	});
+
+	it("doesn't fail the run when the verification capture itself fails", async () => {
+		const { effects } = fakeEffects({ evaluateCapture: vi.fn(async () => null) });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
+		expect(result.ok).toBe(true);
+		expect(result.evaluation).toBeUndefined();
 	});
 });

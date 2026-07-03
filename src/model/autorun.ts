@@ -19,16 +19,23 @@
  *  - **Cycle semantics**: cycle 1 seeds and fully tunes every term; cycles ≥2 refine from the values the
  *    previous cycle accepted (not from scratch), and the run stops early once the tracking-error
  *    objective (ITAE) stops improving meaningfully between cycles.
+ *  - **Preflight** (axis drivers only): forces closed/assisted mode, then probes with a safe baseline
+ *    PID — if the driver isn't tracking the commanded move, it runs whatever calibration moves it's
+ *    given and re-probes once before giving up. The probe (does it actually track?) is the ground
+ *    truth, not the calibration command's reply text, which firmware doesn't guarantee is stable.
+ *  - **Final verification**: after the tune completes, one more capture is graded with `evaluateTune`.
+ *    A grade below "good" gets exactly one bounded correction pass (±20% per flagged term, from the
+ *    evaluation's own findings) — re-verified once, and only kept if it didn't make things worse.
  *
  * Every side effect (sending G-code, capturing, waiting, logging) is injected via `TuneEffects`, so this
  * module has no DWC/Vue import and is fully deterministic to test.
  */
 import type { StepMetrics } from "./analysis";
 import {
-	AUTOTUNE_SEQUENCE, AUTOTUNE_SIGNAL_SEQUENCE, describeMetrics, type Attempt,
-	type SignalAttempt, type SignalStrategy, type TermStrategy,
+	A_MAX, AUTOTUNE_SEQUENCE, AUTOTUNE_SIGNAL_SEQUENCE, D_MAX, I_MAX, P_MAX, V_MAX, describeMetrics,
+	type Attempt, type SignalAttempt, type SignalStrategy, type TermStrategy,
 } from "./autotune";
-import { RING_WARN } from "./evaluate";
+import { RING_WARN, type Grade, type TuneEvaluation } from "./evaluate";
 import type { PidConfig } from "./m569";
 import { describeSignal, medianSignal, signalUnstable, type TuneSignal } from "./signal";
 import type { PidTerm } from "./wizard";
@@ -44,9 +51,14 @@ export interface TuneEffects {
 	captureStep(): Promise<StepMetrics | null>;
 	/**
 	 * Whatever "ready to tune" means for this driver — mode switch, axis centering/homing check, etc.
-	 * Called once before cycle 1. Returning false aborts the run before anything is changed.
+	 * Called once before cycle 1 (and again, cheaply, before the preflight probe). Returning false
+	 * aborts the run before anything is changed.
 	 */
 	ensureReady(): Promise<boolean>;
+	/** Run one `M569.6` calibration/tuning manoeuvre and return its raw reply (preflight only). */
+	runCalibration(moveId: number): Promise<string>;
+	/** One fresh capture, graded with `evaluateTune` (final verification only). Null if it fails. */
+	evaluateCapture(): Promise<TuneEvaluation | null>;
 	log(line: string): void;
 	status(line: string): void;
 	/** Notified after every capture that feeds a decision (session recording, wizard-step highlighting). */
@@ -68,6 +80,11 @@ export interface AutoRunOptions {
 	seedRule?: SeedRule;
 	/** Aggressiveness scalar for the "amigo" rule (bigger = faster/hotter). Default 1. */
 	seedLambda?: number;
+	/**
+	 * Calibration moves (`M569.6` V-ids) to try during preflight if the driver isn't tracking, in
+	 * order. Axis drivers only; extruders keep the pre-Phase-3 behaviour (calibration stays manual).
+	 */
+	calibrationMoveIds?: Array<number>;
 }
 
 export interface AutoRunAttempt {
@@ -86,6 +103,10 @@ export interface AutoRunResult {
 	/** Ultimate gain/period found during seeding, when it succeeded. */
 	ku?: number;
 	tu?: number;
+	/** Calibration moves actually run during preflight (empty if the driver was already tracking). */
+	preflightActions?: Array<string>;
+	/** Final verification grade (axis drivers only; undefined if verification couldn't run). */
+	evaluation?: TuneEvaluation;
 }
 
 const VERIFY_RETRIES_DEFAULT = 2;
@@ -379,6 +400,134 @@ async function runExtruderCycle(effects: TuneEffects, pid: PidConfig, cycle: num
 	return { ok: true, attempts };
 }
 
+// ---- Preflight (axis drivers only) ----
+
+export interface PreflightResult {
+	ok: boolean;
+	reason?: string;
+	actions: Array<string>;
+}
+
+/**
+ * Force closed/assisted mode, then confirm the driver is actually tracking a commanded move with a
+ * safe baseline PID. If not, run the given calibration moves once and re-probe. A saturating/runaway
+ * probe (not the calibration reply text) is what "not tracking" means here. Extruders skip this
+ * entirely — calibration there stays a manual Step-3 action, unchanged from before Phase 3.
+ */
+async function preflight(effects: TuneEffects, hasAxis: boolean, calibrationMoveIds: Array<number>): Promise<PreflightResult> {
+	if (effects.isCancelled()) { return { ok: false, reason: "Cancelled.", actions: [] }; }
+	if (!(await effects.ensureReady())) {
+		return { ok: false, reason: "Not ready to tune (see log).", actions: [] };
+	}
+	if (!hasAxis) { return { ok: true, actions: [] }; }
+	if (effects.isCancelled()) { return { ok: false, reason: "Cancelled.", actions: [] }; }
+
+	const probe = async (): Promise<TuneSignal | null> => {
+		await effects.applyPid({ p: SEED_START, i: 0, d: 0, v: 0, a: 0 });
+		await effects.delay(SETTLE_DELAY_MS);
+		return effects.captureSignal();
+	};
+
+	let signal = await probe();
+	if (signal && !signalUnstable(signal)) { return { ok: true, actions: [] }; }
+
+	if (!calibrationMoveIds.length) {
+		return {
+			ok: false,
+			actions: [],
+			reason: signal
+				? "The driver isn't tracking the commanded move, and no calibration is configured for this encoder type — check wiring/polarity manually."
+				: "The preflight probe capture failed.",
+		};
+	}
+
+	effects.log("Preflight: the driver isn't tracking a commanded move — attempting calibration.");
+	const actions: Array<string> = [];
+	for (const moveId of calibrationMoveIds) {
+		if (effects.isCancelled()) { return { ok: false, reason: "Cancelled.", actions }; }
+		const reply = await effects.runCalibration(moveId);
+		actions.push(`V${moveId}`);
+		effects.log(`Preflight: ran calibration V${moveId} → ${reply.slice(0, 160)}`);
+	}
+
+	signal = await probe();
+	if (signal && !signalUnstable(signal)) {
+		effects.log("Preflight: calibration fixed it — the driver is now tracking.");
+		return { ok: true, actions };
+	}
+	return { ok: false, actions, reason: "Still not tracking the commanded move after calibration — check wiring/encoder setup manually." };
+}
+
+// ---- Final verification + bounded correction pass ----
+
+const GRADE_RANK: Record<Grade, number> = { excellent: 4, good: 3, fair: 2, poor: 1, unknown: 0 };
+const CORRECTION_FACTOR = 0.2; // ±20% per flagged term
+/** Where each term starts from zero — mirrors each strategy's own first non-zero value. */
+const ZERO_START: Record<PidTerm, number> = { p: SEED_START, i: 1000, d: 0.01, a: 50000, v: 100 };
+const TERM_MAX: Record<PidTerm, number> = { p: P_MAX, i: I_MAX, d: D_MAX, a: A_MAX, v: V_MAX };
+
+function clampTerm(term: PidTerm, value: number): number {
+	return Math.min(TERM_MAX[term], Math.max(0, value));
+}
+
+/**
+ * One ±20%-per-term correction derived directly from the evaluation's own findings (each finding
+ * already names the term and direction to adjust) — at most one adjustment per term, only for
+ * warn/bad-severity findings.
+ */
+export function planCorrections(evaluation: TuneEvaluation, pid: PidConfig): Array<{ term: PidTerm; value: number }> {
+	const seen = new Set<PidTerm>();
+	const out: Array<{ term: PidTerm; value: number }> = [];
+	for (const f of evaluation.findings) {
+		if (!f.term || !f.direction) { continue; }
+		if (f.severity !== "warn" && f.severity !== "bad") { continue; }
+		const term = f.term as PidTerm;
+		if (seen.has(term)) { continue; }
+		seen.add(term);
+		const current = pid[term];
+		let value: number;
+		if (current > 0) {
+			value = current * (f.direction === "up" ? 1 + CORRECTION_FACTOR : 1 - CORRECTION_FACTOR);
+		} else {
+			value = f.direction === "up" ? ZERO_START[term] : 0;
+		}
+		out.push({ term, value: clampTerm(term, round(value, 4)) });
+	}
+	return out;
+}
+
+interface FinalVerification {
+	evaluation?: TuneEvaluation;
+	correctionApplied: boolean;
+}
+
+/** Grade the tuned result; if it's below "good", try exactly one bounded correction, keeping it only if it helped. */
+async function runFinalVerification(effects: TuneEffects, pid: PidConfig): Promise<FinalVerification> {
+	const before = await effects.evaluateCapture();
+	if (!before) { return { correctionApplied: false }; }
+	if (GRADE_RANK[before.grade] >= GRADE_RANK.good) { return { evaluation: before, correctionApplied: false }; }
+
+	const corrections = planCorrections(before, pid);
+	if (!corrections.length) { return { evaluation: before, correctionApplied: false }; }
+
+	const snapshot: PidConfig = { ...pid };
+	for (const c of corrections) { pid[c.term] = c.value; }
+	effects.log(`Final verification: grade "${before.grade}" — applying one correction pass (${corrections.map((c) => `${c.term.toUpperCase()}→${c.value}`).join(", ")}).`);
+	await effects.applyPid(pid);
+	await effects.delay(SETTLE_DELAY_MS);
+	const after = await effects.evaluateCapture();
+
+	if (after && GRADE_RANK[after.grade] >= GRADE_RANK[before.grade]) {
+		effects.log(`Final verification: correction pass ${after.grade === before.grade ? "held at" : "improved it to"} "${after.grade}".`);
+		return { evaluation: after, correctionApplied: true };
+	}
+	// The correction didn't help (or the re-check failed) — revert rather than leave a worse tune.
+	Object.assign(pid, snapshot);
+	await effects.applyPid(pid);
+	effects.log("Final verification: the correction pass didn't help — reverted to the pre-correction values.");
+	return { evaluation: before, correctionApplied: false };
+}
+
 // ---- Top-level run ----
 
 export async function runAutoTune(effects: TuneEffects, startPid: PidConfig, opts: AutoRunOptions): Promise<AutoRunResult> {
@@ -393,15 +542,21 @@ export async function runAutoTune(effects: TuneEffects, startPid: PidConfig, opt
 	const pid: PidConfig = { ...startPid };
 	const attempts: Array<AutoRunAttempt> = [];
 	let ku: number | undefined, tu: number | undefined;
+	let preflightActions: Array<string> = [];
 
 	let ok = true;
 	let reason: string | undefined;
 	try {
-		if (!(await effects.ensureReady())) {
-			return { ok: false, reason: "Not ready to tune (see log).", pid: restoreTarget, restored: false, attempts };
+		const pre = await preflight(effects, opts.hasAxis, opts.calibrationMoveIds ?? []);
+		preflightActions = pre.actions;
+		if (!pre.ok) {
+			// Preflight's own probe may already have applied a baseline PID to the firmware — fall through
+			// to the same restore path every other failure uses, rather than leaving that baseline in place.
+			ok = false;
+			reason = pre.reason ?? "Preflight failed.";
 		}
 		let prevItae: number | undefined;
-		for (let cycle = 1; cycle <= totalCycles; cycle++) {
+		for (let cycle = 1; ok && cycle <= totalCycles; cycle++) {
 			if (effects.isCancelled()) { ok = false; reason = "Cancelled."; break; }
 			effects.log(`──── Cycle ${cycle} of ${totalCycles} ────`);
 			const result = opts.hasAxis
@@ -429,7 +584,15 @@ export async function runAutoTune(effects: TuneEffects, startPid: PidConfig, opt
 	if (!ok) {
 		effects.log(`Auto-tune stopped: ${reason ?? "cancelled"}. Restoring the PID values from before this run.`);
 		await effects.applyPid(restoreTarget);
-		return { ok: false, reason, pid: restoreTarget, restored: true, attempts, ku, tu };
+		return { ok: false, reason, pid: restoreTarget, restored: true, attempts, ku, tu, preflightActions };
 	}
-	return { ok: true, pid, attempts, ku, tu };
+
+	let evaluation: TuneEvaluation | undefined;
+	try {
+		const verification = await runFinalVerification(effects, pid);
+		evaluation = verification.evaluation;
+	} catch (e) {
+		effects.log(`Final verification skipped: ${e instanceof Error ? e.message : String(e)}`);
+	}
+	return { ok: true, pid, attempts, ku, tu, preflightActions, evaluation };
 }

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
 	buildCalibrationCommand, buildCaptureCommand, buildModeCommand, buildPidCommand,
-	captureBitmask, DEFAULT_MODE_D, parsePidReply,
+	captureBitmask, DEFAULT_MODE_D, parseCalibrationReply, parsePidReply,
 } from "../model/m569";
 
 describe("mode commands", () => {
@@ -35,6 +35,29 @@ describe("calibration command", () => {
 	it("builds M569.6 with the manoeuvre id", () => {
 		expect(buildCalibrationCommand("50.0", 1)).toBe("M569.6 P50.0 V1");
 		expect(buildCalibrationCommand("51.0", 2)).toBe("M569.6 P51.0 V2");
+	});
+});
+
+describe("parseCalibrationReply", () => {
+	it("treats an Error: reply as a failure", () => {
+		const r = parseCalibrationReply("Error: driver 50.0 does not support closed loop calibration");
+		expect(r.ok).toBe(false);
+		expect(r.residual).toBeNull();
+	});
+	it("treats an empty reply as a failure (no ground truth about what happened)", () => {
+		expect(parseCalibrationReply("").ok).toBe(false);
+		expect(parseCalibrationReply("   ").ok).toBe(false);
+	});
+	it("treats any non-error reply as a success", () => {
+		const r = parseCalibrationReply("Calibration complete");
+		expect(r.ok).toBe(true);
+		expect(r.residual).toBeNull();
+		expect(r.message).toBe("Calibration complete");
+	});
+	it("extracts a residual error figure when the reply reports one (V3 check)", () => {
+		const r = parseCalibrationReply("Calibration check: residual error 0.42");
+		expect(r.ok).toBe(true);
+		expect(r.residual).toBe(0.42);
 	});
 });
 

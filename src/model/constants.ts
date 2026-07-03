@@ -17,6 +17,9 @@ export const LS_STATE = "closedLoopTuning.state";
 /** Directory the firmware writes M569.5 capture CSVs to. */
 export const CAPTURE_DIR = "0:/sys/closed-loop";
 
+/** The machine's main config file — the automated "save to config.g" write target. */
+export const CONFIG_FILE = "0:/sys/config.g";
+
 /** Duet documentation links used by the in-UI help tooltips. */
 export const DOCS = {
 	tuning: "https://docs.duet3d.com/User_manual/Tuning/Duet_3_1HCL_tuning",

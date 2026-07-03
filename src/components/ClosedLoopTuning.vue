@@ -309,6 +309,7 @@
 									config.g block
 									<v-spacer />
 									<v-btn size="x-small" variant="text" prepend-icon="mdi-content-copy" :disabled="!selectedDriver" @click="copyConfig">Copy</v-btn>
+									<v-btn size="x-small" variant="text" prepend-icon="mdi-content-save" :disabled="!selectedDriver" class="ml-1" @click="openSaveToConfigG">Save to config.g</v-btn>
 								</v-card-title>
 								<v-card-text>
 									<pre class="cl-config">{{ configBlock }}</pre>
@@ -393,13 +394,30 @@
 			<v-card>
 				<v-card-title>Confirm movement</v-card-title>
 				<v-card-text>
-					{{ confirmMessage }}
+					<div style="white-space: pre-line;">{{ confirmMessage }}</div>
 					<div class="text-caption text-medium-emphasis mt-2"><code>{{ confirmCommand }}</code></div>
 				</v-card-text>
 				<v-card-actions>
 					<v-spacer />
 					<v-btn variant="text" @click="confirmCancel">Cancel</v-btn>
 					<v-btn color="primary" @click="confirmProceed">Proceed</v-btn>
+				</v-card-actions>
+			</v-card>
+		</v-dialog>
+
+		<v-dialog v-model="configWriteConfirmOpen" max-width="520">
+			<v-card>
+				<v-card-title>Write to config.g?</v-card-title>
+				<v-card-text>
+					This downloads config.g from the board, saves a timestamped backup, inserts/updates a single
+					marked block for driver {{ selectedDriver }}, and uploads the result — nothing outside that
+					block is touched. The board needs a restart for the change to take effect.
+					<pre class="cl-config mt-2">{{ configBlock }}</pre>
+				</v-card-text>
+				<v-card-actions>
+					<v-spacer />
+					<v-btn variant="text" @click="configWriteConfirmOpen = false">Cancel</v-btn>
+					<v-btn color="primary" :loading="savingConfig" @click="confirmSaveToConfigG">Write config.g</v-btn>
 				</v-card-actions>
 			</v-card>
 		</v-dialog>
@@ -416,7 +434,8 @@ import { HelpTip, buildReport, downloadReport, AboutDialog, type AboutExtraActio
 
 import CaptureChart from "./CaptureChart.vue";
 import { evaluateTune, gradeColor, severityColor, severityIcon, type Term, type TuneEvaluation } from "../model/evaluate";
-import { CAPTURE_DIR, DOCS, LS_STATE, PLUGIN_ID } from "../model/constants";
+import { CAPTURE_DIR, CONFIG_FILE, DOCS, LS_STATE, PLUGIN_ID } from "../model/constants";
+import { upsertTuneBlock } from "../model/config";
 import {
 	buildCalibrationCommand, buildCaptureCommand, buildModeCommand, buildPidCommand,
 	CALIBRATION_MOVES, CAPTURE_VARIABLES, DEFAULT_MODE_D, ENCODER_TYPES, MODE_LABELS,
@@ -667,6 +686,14 @@ function runCalibration(c: CalibrationMove): void {
 	askConfirm(buildCalibrationCommand(selectedDriver.value, c.id), async () => { await send(buildCalibrationCommand(selectedDriver.value!, c.id)); });
 }
 
+/** Non-interactive calibration for auto-tune's preflight — already covered by the upfront consent dialog. */
+async function runCalibrationSilent(moveId: number): Promise<string> {
+	if (!selectedDriver.value) { return "No driver selected."; }
+	try {
+		return await machineStore.sendCode(buildCalibrationCommand(selectedDriver.value, moveId), false, false);
+	} catch (e) { console.warn("[ClosedLoopTuning] runCalibrationSilent failed", e); return `Error: ${e instanceof Error ? e.message : String(e)}`; }
+}
+
 // --- PID ---
 const pidPreview = computed(() => selectedDriver.value ? buildPidCommand(selectedDriver.value, pid) : "");
 async function loadPid(): Promise<void> {
@@ -837,10 +864,15 @@ async function ensureAxisReady(limits: AxisLimits | null): Promise<boolean> {
 	const mid = midpoint(limits);
 	if (Math.abs(mid - limits.position) < CENTER_TOLERANCE_MM) { return true; }
 	const move = `G90 G1 ${limits.letter}${mid.toFixed(3)} F${CENTERING_FEED_MM_MIN}`;
-	const message = `Before tuning, ${limits.letter} will move to the middle of its travel `
-		+ `(${mid.toFixed(1)} mm — currently ${limits.position.toFixed(1)} mm) so it has room to move safely `
-		+ `in both directions. Make sure the axis is clear, then proceed.`;
-	if (!(await confirmAsync(message, move))) { return false; }
+	if (autoRunning.value) {
+		// Auto-tune's upfront consent dialog already covers centering moves — no per-move prompt mid-run.
+		log(`Centering ${limits.letter} to ${mid.toFixed(1)} mm (was ${limits.position.toFixed(1)} mm) — consented to upfront.`);
+	} else {
+		const message = `Before tuning, ${limits.letter} will move to the middle of its travel `
+			+ `(${mid.toFixed(1)} mm — currently ${limits.position.toFixed(1)} mm) so it has room to move safely `
+			+ `in both directions. Make sure the axis is clear, then proceed.`;
+		if (!(await confirmAsync(message, move))) { return false; }
+	}
 	await send(move);
 	await send("M400"); // block until the centering move finishes
 	await delay(400);    // let the object model catch up before we read the new position back
@@ -890,7 +922,12 @@ async function captureStep(): Promise<StepMetrics | null> {
  * "step" move and "A/V" move judged by different (and, for step, wrong) metrics. Captures the outward
  * move, then returns the axis to start. Distance/direction stay within the configured safety margin.
  */
-async function captureSignal(): Promise<TuneSignal | null> {
+/**
+ * The unified trapezoid-move capture, shared by `captureSignal` (tuning decisions → TuneSignal) and
+ * `evaluateCapture` (final-verification grading → TuneEvaluation) so both analyse the exact same kind
+ * of move instead of duplicating the move-planning/execution logic.
+ */
+async function captureRaw(): Promise<ParsedCapture | null> {
 	const axisObj = axisForDriver();
 	const axis = axisObj?.letter ?? null;
 	if (!axis) { uiStore.makeNotification(LogLevel.warning, "Closed Loop Tuning", "Signal-based tuning needs the driver's axis — skipped."); return null; }
@@ -902,8 +939,18 @@ async function captureSignal(): Promise<TuneSignal | null> {
 	viewKeys.value = ["measuredMotorSteps", "targetMotorSteps", "pidPTerm"];
 	const c = await runCapture({ driver: selectedDriver.value ?? "", samples: samples.value, activate: 1, rate: sampleRate.value, variables: varIds(["targetMotorSteps", "pidPTerm", "measuredMotorSteps"]), manoeuvre: 0, move: `G91 G1 H2 ${axis}${signedDist.toFixed(3)} F${avFeed.value} G90` });
 	try { await machineStore.sendCode(`G91 G1 H2 ${axis}${(-signedDist).toFixed(3)} F${avFeed.value} G90`, false, false); } catch { /* ignore return-move error */ }
-	if (!c) { return null; }
-	return computeTuneSignal(c, sampleRate.value);
+	return c;
+}
+
+async function captureSignal(): Promise<TuneSignal | null> {
+	const c = await captureRaw();
+	return c ? computeTuneSignal(c, sampleRate.value) : null;
+}
+
+/** Final-verification grading: a fresh capture judged the same way the Step-5 evaluation panel does. */
+async function evaluateCapture(): Promise<TuneEvaluation | null> {
+	const c = await captureRaw();
+	return c ? evaluateTune(c, sampleRate.value) : null;
 }
 
 function log(line: string): void { autoLog.value = [...autoLog.value, line].slice(-40); }
@@ -927,6 +974,8 @@ function buildTuneEffects(): TuneEffects {
 		readPid: readPidSnapshot,
 		captureSignal,
 		captureStep,
+		runCalibration: runCalibrationSilent,
+		evaluateCapture,
 		ensureReady: async () => {
 			// The step/signal captures only move in closed/assisted loop, and the board can come up in
 			// open loop after a reboot/reload. Uses the corrected mode command (D only — never S, which
@@ -953,7 +1002,13 @@ function startAutoTune(): void {
 	if (!selectedDriver.value) { return; }
 	const hasAxis = !!axisLetterForDriver();
 	const msg = hasAxis
-		? "Auto-tune will switch to closed loop, then repeatedly move the driver back and forth, tuning P, D, I, A and V from the same trapezoid move each time (starting with a brief search for a good starting point). It will first move the axis to the middle of its travel (you'll get a separate prompt for that) and keeps every move inside the configured safety margin — but only on a homed axis. Make sure you've calibrated (Step 3) and the axis is homed."
+		? "Auto-tune will run everything below without asking again — make sure the axis is clear and you've calibrated (Step 3) and homed it:\n"
+			+ "• Switch to closed/assisted loop.\n"
+			+ "• Check the driver is tracking a move; if not, run calibration automatically (this can include a full rotation of the motor) and check again.\n"
+			+ "• Move the axis to the middle of its travel if it isn't already there.\n"
+			+ "• Repeatedly move it back and forth, tuning P, D, I, A and V from the same trapezoid move each time (starting with a brief search for a good starting point), keeping every move inside the configured safety margin.\n"
+			+ "• Grade the result and, if needed, make one bounded correction pass.\n"
+			+ "Review the evaluation afterwards, then save to config.g yourself."
 		: "Auto-tune will switch to closed loop, then repeatedly move the driver with step jumps to tune P/D/I (A/V need an axis and will be skipped). Make sure you've calibrated (Step 3) first.";
 	askConfirm(msg, runAutoTune);
 }
@@ -970,10 +1025,11 @@ async function runAutoTune(): Promise<void> {
 		encoderType: encoderType.value, cycles: totalCycles, log: [], captures: [],
 	};
 	try {
-		const result = await runAutoTuneCore(buildTuneEffects(), { ...pid }, { cycles: totalCycles, hasAxis });
+		const result = await runAutoTuneCore(buildTuneEffects(), { ...pid }, { cycles: totalCycles, hasAxis, calibrationMoveIds: requiredMoveIds.value });
 		Object.assign(pid, result.pid);
 		if (result.ok) {
-			autoStatus.value = `Auto-tune complete — P=${pid.p} D=${pid.d} I=${pid.i} A=${pid.a} V=${pid.v}.`;
+			const gradeNote = result.evaluation ? ` Final grade: ${result.evaluation.grade} (${result.evaluation.score}/100).` : "";
+			autoStatus.value = `Auto-tune complete — P=${pid.p} D=${pid.d} I=${pid.i} A=${pid.a} V=${pid.v}.${gradeNote}`;
 			uiStore.makeNotification(LogLevel.success, "Closed Loop Tuning", autoStatus.value + " Review the evaluation, then save to config.g.");
 		} else {
 			autoStatus.value = result.restored
@@ -1025,6 +1081,40 @@ async function copyConfig(): Promise<void> {
 		uiStore.makeNotification(LogLevel.success, "Closed Loop Tuning", "config.g block copied to clipboard.");
 	} catch {
 		uiStore.makeNotification(LogLevel.warning, "Closed Loop Tuning", "Couldn't access the clipboard — select and copy the block manually.");
+	}
+}
+
+// --- Automated config.g write (opt-in, explicit confirm) ---
+const configWriteConfirmOpen = ref(false);
+const savingConfig = ref(false);
+function openSaveToConfigG(): void { if (selectedDriver.value) { configWriteConfirmOpen.value = true; } }
+async function confirmSaveToConfigG(): Promise<void> {
+	savingConfig.value = true;
+	try { await saveToConfigG(); } finally { savingConfig.value = false; configWriteConfirmOpen.value = false; }
+}
+async function saveToConfigG(): Promise<void> {
+	if (!selectedDriver.value) { return; }
+	try {
+		const currentText = await (machineStore as any).download({ filename: CONFIG_FILE, type: "text" }, false, false, false) as string;
+		const result = upsertTuneBlock(currentText, {
+			driver: selectedDriver.value,
+			pid,
+			mode: currentMode.value === "assisted" ? "assisted" : "closed",
+			modeD,
+			calibrationMoveIds: requiredMoveIds.value,
+		});
+		if (!result.changed) {
+			uiStore.makeNotification(LogLevel.info, "Closed Loop Tuning", "config.g already has these values — nothing to write.");
+			return;
+		}
+		// Belt-and-suspenders backup of our own, on top of whatever DWC does automatically for config.g uploads.
+		const backupName = `${CONFIG_FILE}.clt-${new Date().toISOString().replace(/[:.]/g, "-")}.bak`;
+		await (machineStore as any).upload({ filename: backupName, content: currentText }, false, false, false);
+		await (machineStore as any).upload({ filename: CONFIG_FILE, content: result.text }, false, true, true);
+		uiStore.makeNotification(LogLevel.success, "Closed Loop Tuning", `config.g ${result.replaced ? "updated" : "written"} (backup: ${backupName.split("/").pop()}). Restart the board to apply it.`);
+	} catch (e) {
+		console.warn("[ClosedLoopTuning] saveToConfigG failed", e);
+		uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", `Couldn't write config.g: ${e instanceof Error ? e.message : String(e)}`);
 	}
 }
 
