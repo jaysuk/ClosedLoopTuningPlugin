@@ -429,8 +429,8 @@ import {
 	getAxisLimits, midpoint, planCaptureProfile, planSymmetricMove, type AxisLimits,
 } from "../model/limits";
 import { WIZARD_STEPS, type Recommendation } from "../model/wizard";
-import { computeTuneSignal, describeSignal, type TuneSignal } from "../model/signal";
-import { AUTOTUNE_SEQUENCE, AUTOTUNE_SIGNAL_SEQUENCE, describeMetrics, type Attempt, type SignalAttempt, type SignalStrategy, type TermStrategy } from "../model/autotune";
+import { computeTuneSignal, type TuneSignal } from "../model/signal";
+import { runAutoTune as runAutoTuneCore, type TuneEffects } from "../model/autorun";
 import { applying, applyUpdateNow, checking, dismissCurrentUpdate, pendingReload, runUpdateCheck, setUpdateChecksEnabled, updateChecksEnabled, updateState } from "../model/updateCheck";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -908,62 +908,52 @@ async function captureSignal(): Promise<TuneSignal | null> {
 
 function log(line: string): void { autoLog.value = [...autoLog.value, line].slice(-40); }
 
-/** Drive one term to convergence using its strategy. Returns false to abort the whole run. */
-async function autoTuneTerm(strategy: TermStrategy): Promise<boolean> {
-	let value = strategy.start;
-	const attempts: Array<Attempt> = [];
-	for (let k = 0; k <= strategy.maxAttempts; k++) {
-		if (autoCancel.value) { return false; }
-		(pid as any)[strategy.term] = value;
-		await applyPid();
-		await delay(400); // settle
-		autoStatus.value = `${strategy.label}: testing ${strategy.term.toUpperCase()}=${value}…`;
-		const m = await captureStep();
-		if (!m) { log(`${strategy.label}: capture failed — aborting.`); return false; }
-		attempts.push({ value, metrics: m });
-		recordSessionCapture(strategy.term, value, m);
-		log(`${strategy.label}: ${strategy.term.toUpperCase()}=${value} → ${describeMetrics(m)}`);
-		const d = strategy.decide(attempts);
-		if (d.kind === "fail") { log(`${strategy.label}: ${d.reason}`); return false; }
-		if (d.kind === "accept") {
-			(pid as any)[strategy.term] = d.value;
-			await applyPid();
-			log(`${strategy.label}: ✓ ${d.note}`);
-			return true;
-		}
-		value = d.value;
-	}
-	return true;
+/**
+ * Read the driver's current PID back from the firmware (a fresh snapshot, independent of the `pid`
+ * reactive) — this is what auto-tune restores to if the run is cancelled or fails partway through.
+ */
+async function readPidSnapshot(): Promise<PidConfig | null> {
+	if (!selectedDriver.value) { return null; }
+	try {
+		const reply = await machineStore.sendCode(`M569.1 P${selectedDriver.value}`, false, false);
+		return parsePidReply(reply);
+	} catch (e) { console.warn("[ClosedLoopTuning] readPidSnapshot failed", e); return null; }
 }
 
-/** Drive one term to convergence using the unified TuneSignal (P/D/I/A/V on drivers with an axis). */
-async function autoTuneSignalTerm(strategy: SignalStrategy): Promise<boolean> {
-	let value = strategy.start;
-	const attempts: Array<SignalAttempt> = [];
-	for (let k = 0; k <= strategy.maxAttempts; k++) {
-		if (autoCancel.value) { return false; }
-		(pid as any)[strategy.term] = value;
-		await applyPid();
-		await delay(400);
-		autoStatus.value = `${strategy.label}: testing ${strategy.term.toUpperCase()}=${value}…`;
-		const signal = await captureSignal();
-		if (!signal) { log(`${strategy.label}: capture failed — aborting.`); return false; }
-		attempts.push({ value, signal });
-		recordSessionCapture(strategy.term, value, signal);
-		log(`${strategy.label}: ${strategy.term.toUpperCase()}=${value} → ${describeSignal(signal)}`);
-		const d = strategy.decide(attempts);
-		if (d.kind === "fail") { log(`${strategy.label}: ${d.reason}`); return false; }
-		if (d.kind === "accept") { (pid as any)[strategy.term] = d.value; await applyPid(); log(`${strategy.label}: ✓ ${d.note}`); return true; }
-		value = d.value;
-	}
-	return true;
+/** Wire the orchestrator in src/model/autorun.ts to this component's G-code/UI side effects. */
+function buildTuneEffects(): TuneEffects {
+	return {
+		applyPid: async (p) => { Object.assign(pid, p); await applyPid(); },
+		readPid: readPidSnapshot,
+		captureSignal,
+		captureStep,
+		ensureReady: async () => {
+			// The step/signal captures only move in closed/assisted loop, and the board can come up in
+			// open loop after a reboot/reload. Uses the corrected mode command (D only — never S, which
+			// is direction). This does NOT calibrate; that's the user's job (Step 3).
+			const mode: LoopMode = currentMode.value === "assisted" ? "assisted" : "closed";
+			log(`Ensuring ${MODE_LABELS[mode]} — ${buildModeCommand(selectedDriver.value ?? "", mode, modeD)}`);
+			await send(buildModeCommand(selectedDriver.value ?? "", mode, modeD));
+			currentMode.value = mode;
+			await delay(600);
+			return true; // per-capture axis centering/homing checks happen inside captureSignal/captureStep
+		},
+		log,
+		status: (s) => { autoStatus.value = s; },
+		onAttempt: (term, value, metric) => {
+			wizardIndex.value = WIZARD_STEPS.findIndex((s) => s.term === term);
+			recordSessionCapture(term, value, metric);
+		},
+		isCancelled: () => autoCancel.value,
+		delay,
+	};
 }
 
 function startAutoTune(): void {
 	if (!selectedDriver.value) { return; }
 	const hasAxis = !!axisLetterForDriver();
 	const msg = hasAxis
-		? "Auto-tune will switch to closed loop, then repeatedly move the driver back and forth, tuning P, D, I, A and V from the same trapezoid move each time. It will first move the axis to the middle of its travel (you'll get a separate prompt for that) and keeps every move inside the configured safety margin — but only on a homed axis. Make sure you've calibrated (Step 3) and the axis is homed."
+		? "Auto-tune will switch to closed loop, then repeatedly move the driver back and forth, tuning P, D, I, A and V from the same trapezoid move each time (starting with a brief search for a good starting point). It will first move the axis to the middle of its travel (you'll get a separate prompt for that) and keeps every move inside the configured safety margin — but only on a homed axis. Make sure you've calibrated (Step 3) and the axis is homed."
 		: "Auto-tune will switch to closed loop, then repeatedly move the driver with step jumps to tune P/D/I (A/V need an axis and will be skipped). Make sure you've calibrated (Step 3) first.";
 	askConfirm(msg, runAutoTune);
 }
@@ -974,50 +964,21 @@ async function runAutoTune(): Promise<void> {
 	autoLog.value = [];
 	viewKeys.value = ["measuredMotorSteps", "targetMotorSteps", "currentError"];
 	const totalCycles = Math.max(1, Math.round(cycles.value || 1));
+	const hasAxis = !!axisLetterForDriver();
 	tuneSession.value = {
 		startedAt: new Date().toISOString(), driver: selectedDriver.value, mode: currentMode.value,
 		encoderType: encoderType.value, cycles: totalCycles, log: [], captures: [],
 	};
 	try {
-		// Ensure the driver is in a feedback mode — the step manoeuvre only moves in closed/assisted loop,
-		// and the board can come up in open loop after a reboot/reload. Uses the corrected mode command
-		// (D only — never S, which is direction). It does NOT calibrate; that's the user's job (Step 3).
-		const mode: LoopMode = currentMode.value === "assisted" ? "assisted" : "closed";
-		log(`Ensuring ${MODE_LABELS[mode]} — ${buildModeCommand(selectedDriver.value ?? "", mode, modeD)}`);
-		await send(buildModeCommand(selectedDriver.value ?? "", mode, modeD));
-		currentMode.value = mode;
-		await delay(600);
-
-		const hasAxis = !!axisLetterForDriver();
-		let ok = true;
-		for (let cycle = 1; cycle <= totalCycles && ok && !autoCancel.value; cycle++) {
-			log(`──── Cycle ${cycle} of ${totalCycles} ────`);
-			// First cycle: zero the other terms so P is measured alone. Later cycles refine P/D/I/A/V with
-			// the previously-found values in place (each term re-converges given the others — coordinate descent).
-			if (cycle === 1) { pid.i = 0; pid.d = 0; pid.v = 0; pid.a = 0; await applyPid(); }
-			if (hasAxis) {
-				// Signal-based path: one trapezoid capture serves every term (P/D/I/A/V), judged on the
-				// unified TuneSignal instead of step-response metrics that a trapezoid move would invalidate.
-				for (const strategy of AUTOTUNE_SIGNAL_SEQUENCE) {
-					wizardIndex.value = WIZARD_STEPS.findIndex((s) => s.term === strategy.term);
-					if (autoCancel.value) { ok = false; break; }
-					if (!(await autoTuneSignalTerm(strategy))) { ok = false; break; }
-				}
-			} else {
-				// No axis (extruder) — fall back to the firmware V64 step manoeuvre; A/V need a moving axis.
-				for (const strategy of AUTOTUNE_SEQUENCE) {
-					wizardIndex.value = WIZARD_STEPS.findIndex((s) => s.term === strategy.term);
-					if (autoCancel.value) { ok = false; break; }
-					if (!(await autoTuneTerm(strategy))) { ok = false; break; }
-				}
-				log("A/V skipped — this driver has no axis (extruder?).");
-			}
-		}
-		autoStatus.value = autoCancel.value
-			? "Auto-tune aborted."
-			: `Auto-tune complete — P=${pid.p} D=${pid.d} I=${pid.i} A=${pid.a} V=${pid.v}.`;
-		if (!autoCancel.value) {
+		const result = await runAutoTuneCore(buildTuneEffects(), { ...pid }, { cycles: totalCycles, hasAxis });
+		Object.assign(pid, result.pid);
+		if (result.ok) {
+			autoStatus.value = `Auto-tune complete — P=${pid.p} D=${pid.d} I=${pid.i} A=${pid.a} V=${pid.v}.`;
 			uiStore.makeNotification(LogLevel.success, "Closed Loop Tuning", autoStatus.value + " Review the evaluation, then save to config.g.");
+		} else {
+			autoStatus.value = result.restored
+				? `Auto-tune stopped (${result.reason ?? "see log"}) — PID restored to its values from before this run.`
+				: `Auto-tune stopped: ${result.reason ?? "see log"}.`;
 		}
 	} catch (e) {
 		console.warn("[ClosedLoopTuning] auto-tune failed", e);
