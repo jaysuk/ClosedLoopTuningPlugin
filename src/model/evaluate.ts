@@ -8,7 +8,7 @@
  * to change and the direction, mirroring the auto-tuner's own logic:
  *   bias at rest → I · lag at steady speed → V · spikes in accel/decel → A · overshoot → D · ringing → P↓/D↑
  */
-import { buildSeries } from "./analysis";
+import { buildSeries, segmentMove } from "./analysis";
 import type { ParsedCapture } from "./csv";
 
 export type Severity = "good" | "info" | "warn" | "bad";
@@ -64,15 +64,16 @@ export interface TuneEvaluation {
 
 // Thresholds in motor steps. Tuned to the Duet 1HCL wiki's "good" guidance (error a small fraction of
 // a step at rest) while staying tolerant of the high-frequency encoder fuzz that's always present.
-const REST_GOOD = 0.25;
+// Exported: the auto-tune strategies accept/reject against the same bar the evaluator grades with.
+export const REST_GOOD = 0.25;
 const REST_FAIR = 0.6;
-const CRUISE_GOOD = 0.35;
+export const CRUISE_GOOD = 0.35;
 const CRUISE_FAIR = 1.0;
-const ACCEL_GOOD = 1.2;
+export const ACCEL_GOOD = 1.2;
 const ACCEL_FAIR = 3.0;
-const OVERSHOOT_GOOD = 1.0;
+export const OVERSHOOT_GOOD = 1.0;
 const OVERSHOOT_FAIR = 2.5;
-const RING_WARN = 4;       // significant oscillation cycles after stop
+export const RING_WARN = 4;       // significant oscillation cycles after stop
 
 function mean(a: Array<number>): number { return a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0; }
 function std(a: Array<number>): number {
@@ -111,35 +112,26 @@ export function tuneStats(capture: ParsedCapture, sampleRateHz: number): TuneSta
 	const n = measured.length;
 	const error = measured.map((m, i) => m - target[i]);
 
-	const dtOf = (i: number) => (time[i] - time[i - 1]) || (sampleRateHz > 0 ? 1 / sampleRateHz : 1);
-	const vel: Array<number> = [0];
-	for (let i = 1; i < n; i++) { vel.push((target[i] - target[i - 1]) / dtOf(i)); }
-	const absVel = vel.map(Math.abs);
-	const maxV = peak(absVel);
-	if (maxV <= 1e-6) {
+	// Shared segmentation (analysis.ts) — the same classes the tuning signal and move analysis use.
+	const seg = segmentMove(target, time, sampleRateHz);
+	if (!seg.moved) {
 		// No commanded motion — judge the standing error only.
 		const restNoise = std(error);
 		return { ...empty, restBias: mean(error), restNoise, restRing: ringCount(error, Math.max(0.3, 3 * restNoise)), restSamples: n };
 	}
-	const acc: Array<number> = [0];
-	for (let i = 1; i < n; i++) { acc.push((vel[i] - vel[i - 1]) / dtOf(i)); }
-	const maxA = peak(acc) || 1e-9;
 	const moveDir = Math.sign(target[n - 1] - target[0]) || 1;
 
 	const restErr: Array<number> = [];
 	const cruiseErr: Array<number> = [];
 	const accelErr: Array<number> = [];
 	const moveErr: Array<number> = [];
-	// Index after which the motor is stopped for good (target velocity stays ~0 to the end).
-	let lastMoving = 0;
-	for (let i = 0; i < n; i++) { if (absVel[i] >= 0.08 * maxV) { lastMoving = i; } }
-
 	for (let i = 1; i < n; i++) {
-		const v = absVel[i], a = Math.abs(acc[i]), e = error[i];
-		if (i > lastMoving) { restErr.push(e); continue; }
+		const e = error[i];
+		const c = seg.classes[i];
+		if (c === "rest") { restErr.push(e); continue; }
 		moveErr.push(e);
-		if (v >= 0.6 * maxV && a < 0.2 * maxA) { cruiseErr.push(e); }
-		else if (a >= 0.3 * maxA && v > 0.1 * maxV) { accelErr.push(e); }
+		if (c === "cruise") { cruiseErr.push(e); }
+		else if (c === "accel") { accelErr.push(e); }
 	}
 
 	const restNoise = std(restErr);

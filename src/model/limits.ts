@@ -71,3 +71,48 @@ export function planSymmetricMove(limits: AxisLimits, desiredDistance: number, m
 	}
 	return { distance: Math.min(desiredDistance, best), sign: useMax ? 1 : -1 };
 }
+
+export interface CaptureProfile {
+	/** mm, positive magnitude */
+	distance: number;
+	sign: 1 | -1;
+	/** Seconds the move itself takes at the given feed. */
+	moveTimeS: number;
+	/** Seconds of the capture window left over after the move — the at-rest tail I/D/ring metrics need. */
+	restTimeS: number;
+}
+
+const CAPTURE_REST_FRACTION_DEFAULT = 0.3;   // reserve this fraction of the capture window for the at-rest tail
+const CAPTURE_MIN_DISTANCE_FRACTION = 0.25;  // ...but still require this fraction of the desired distance
+
+/**
+ * Size a single trapezoid tuning move so its capture window has both a real accel/cruise/decel section
+ * AND a meaningful at-rest tail afterward — one capture serving every P/D/I/A/V decision instead of a
+ * separate "step" move and "A/V" move. Distance is derived from the feed and the sample window (so it
+ * scales with the capture settings), then clamped to whatever travel `planSymmetricMove` finds safe.
+ */
+export function planCaptureProfile(
+	limits: AxisLimits | null,
+	feedMmPerMin: number,
+	samples: number,
+	sampleRateHz: number,
+	marginMm: number,
+	opts: { restFraction?: number; maxDistanceMm?: number; minDistanceFloorMm?: number } = {},
+): CaptureProfile | { error: string } {
+	const restFraction = opts.restFraction ?? CAPTURE_REST_FRACTION_DEFAULT;
+	const windowS = sampleRateHz > 0 ? samples / sampleRateHz : 4;
+	const feedMmPerS = feedMmPerMin / 60;
+	let desired = windowS * (1 - restFraction) * feedMmPerS;
+	if (opts.maxDistanceMm != null) { desired = Math.min(desired, opts.maxDistanceMm); }
+	if (!(desired > 0) || !(feedMmPerS > 0)) {
+		return { error: "Feed rate or capture window is too small to plan a tuning move." };
+	}
+	if (!limits) {
+		return { distance: desired, sign: 1, moveTimeS: desired / feedMmPerS, restTimeS: Math.max(0, windowS - desired / feedMmPerS) };
+	}
+	const minDistance = Math.max(opts.minDistanceFloorMm ?? 0.05, desired * CAPTURE_MIN_DISTANCE_FRACTION);
+	const plan = planSymmetricMove(limits, desired, marginMm, minDistance);
+	if ("error" in plan) { return plan; }
+	const moveTimeS = plan.distance / feedMmPerS;
+	return { distance: plan.distance, sign: plan.sign, moveTimeS, restTimeS: Math.max(0, windowS - moveTimeS) };
+}

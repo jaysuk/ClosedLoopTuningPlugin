@@ -423,13 +423,14 @@ import {
 	parsePidReply, type CalibrationMove, type EncoderType, type LoopMode, type PidConfig,
 } from "../model/m569";
 import { parseCapture, type ParsedCapture } from "../model/csv";
-import { analyzeCapture, analyzeMove, type MoveMetrics, type StepMetrics } from "../model/analysis";
+import { analyzeCapture, type StepMetrics } from "../model/analysis";
 import {
 	CENTER_TOLERANCE_MM, CENTERING_FEED_MM_MIN, DEFAULT_MARGIN_MM,
-	getAxisLimits, midpoint, planSymmetricMove, type AxisLimits,
+	getAxisLimits, midpoint, planCaptureProfile, planSymmetricMove, type AxisLimits,
 } from "../model/limits";
 import { WIZARD_STEPS, type Recommendation } from "../model/wizard";
-import { AUTOTUNE_FF_SEQUENCE, AUTOTUNE_SEQUENCE, describeMetrics, describeMove, type Attempt, type MoveAttempt, type MoveTermStrategy, type TermStrategy } from "../model/autotune";
+import { computeTuneSignal, describeSignal, type TuneSignal } from "../model/signal";
+import { AUTOTUNE_SEQUENCE, AUTOTUNE_SIGNAL_SEQUENCE, describeMetrics, type Attempt, type SignalAttempt, type SignalStrategy, type TermStrategy } from "../model/autotune";
 import { applying, applyUpdateNow, checking, dismissCurrentUpdate, pendingReload, runUpdateCheck, setUpdateChecksEnabled, updateChecksEnabled, updateState } from "../model/updateCheck";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -817,8 +818,6 @@ async function runCapture(opts: Parameters<typeof buildCaptureCommand>[0]): Prom
 }
 
 const MIN_STEP_DISTANCE_FRACTION = 0.5; // require at least half the intended step-jump distance to bother capturing
-const MIN_AV_DISTANCE_FRACTION = 0.25;  // ...and a quarter of the intended A/V move
-const MIN_AV_DISTANCE_FLOOR_MM = 2;
 
 /**
  * Gate before any axis-moving capture. Tuning moves use G1's H2 (individual motor) mode, which drives
@@ -885,29 +884,26 @@ async function captureStep(): Promise<StepMetrics | null> {
 }
 
 /**
- * G1-move capture → move metrics (for A/V). Captures the outward move, then returns the axis to start.
- * The direction and distance are chosen to stay within the configured margin of the axis's travel limits.
+ * Single trapezoid-move capture for the unified P/D/I/A/V tuning signal. One G1 H2 move sized (via
+ * `planCaptureProfile`) so the capture window holds both a real accel/cruise/decel section AND a
+ * meaningful at-rest tail — the same capture serves every term's decision instead of a separate
+ * "step" move and "A/V" move judged by different (and, for step, wrong) metrics. Captures the outward
+ * move, then returns the axis to start. Distance/direction stay within the configured safety margin.
  */
-async function captureMove(): Promise<MoveMetrics | null> {
+async function captureSignal(): Promise<TuneSignal | null> {
 	const axisObj = axisForDriver();
 	const axis = axisObj?.letter ?? null;
-	if (!axis) { uiStore.makeNotification(LogLevel.warning, "Closed Loop Tuning", "A/V tuning needs the driver's axis — skipped."); return null; }
+	if (!axis) { uiStore.makeNotification(LogLevel.warning, "Closed Loop Tuning", "Signal-based tuning needs the driver's axis — skipped."); return null; }
 	if (!(await ensureAxisReady(getAxisLimits(axisObj)))) { return null; }
 	const limits = getAxisLimits(axisForDriver()); // re-read: ensureAxisReady may have moved the axis
-	let dist = avDistance.value;
-	let sign: 1 | -1 = 1;
-	if (limits) {
-		const minDist = Math.max(MIN_AV_DISTANCE_FLOOR_MM, avDistance.value * MIN_AV_DISTANCE_FRACTION);
-		const plan = planSymmetricMove(limits, avDistance.value, marginMm.value, minDist);
-		if ("error" in plan) { log(`A/V capture: ${plan.error}`); uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", plan.error); return null; }
-		dist = plan.distance; sign = plan.sign;
-	}
-	const signedDist = sign * dist;
-	viewKeys.value = ["pidPTerm", "targetMotorSteps"];
+	const profile = planCaptureProfile(limits, avFeed.value, samples.value, sampleRate.value, marginMm.value, { maxDistanceMm: avDistance.value });
+	if ("error" in profile) { log(`Tuning capture: ${profile.error}`); uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", profile.error); return null; }
+	const signedDist = profile.sign * profile.distance;
+	viewKeys.value = ["measuredMotorSteps", "targetMotorSteps", "pidPTerm"];
 	const c = await runCapture({ driver: selectedDriver.value ?? "", samples: samples.value, activate: 1, rate: sampleRate.value, variables: varIds(["targetMotorSteps", "pidPTerm", "measuredMotorSteps"]), manoeuvre: 0, move: `G91 G1 H2 ${axis}${signedDist.toFixed(3)} F${avFeed.value} G90` });
 	try { await machineStore.sendCode(`G91 G1 H2 ${axis}${(-signedDist).toFixed(3)} F${avFeed.value} G90`, false, false); } catch { /* ignore return-move error */ }
 	if (!c) { return null; }
-	return analyzeMove(c, sampleRate.value);
+	return computeTuneSignal(c, sampleRate.value);
 }
 
 function log(line: string): void { autoLog.value = [...autoLog.value, line].slice(-40); }
@@ -940,21 +936,21 @@ async function autoTuneTerm(strategy: TermStrategy): Promise<boolean> {
 	return true;
 }
 
-/** Drive a feed-forward term (A/V) to convergence using a G1-move capture. */
-async function autoTuneMoveTerm(strategy: MoveTermStrategy): Promise<boolean> {
+/** Drive one term to convergence using the unified TuneSignal (P/D/I/A/V on drivers with an axis). */
+async function autoTuneSignalTerm(strategy: SignalStrategy): Promise<boolean> {
 	let value = strategy.start;
-	const attempts: Array<MoveAttempt> = [];
+	const attempts: Array<SignalAttempt> = [];
 	for (let k = 0; k <= strategy.maxAttempts; k++) {
 		if (autoCancel.value) { return false; }
 		(pid as any)[strategy.term] = value;
 		await applyPid();
 		await delay(400);
 		autoStatus.value = `${strategy.label}: testing ${strategy.term.toUpperCase()}=${value}…`;
-		const m = await captureMove();
-		if (!m) { log(`${strategy.label}: capture failed — skipping.`); return false; }
-		attempts.push({ value, metrics: m });
-		recordSessionCapture(strategy.term, value, m);
-		log(`${strategy.label}: ${strategy.term.toUpperCase()}=${value} → ${describeMove(m)}`);
+		const signal = await captureSignal();
+		if (!signal) { log(`${strategy.label}: capture failed — aborting.`); return false; }
+		attempts.push({ value, signal });
+		recordSessionCapture(strategy.term, value, signal);
+		log(`${strategy.label}: ${strategy.term.toUpperCase()}=${value} → ${describeSignal(signal)}`);
 		const d = strategy.decide(attempts);
 		if (d.kind === "fail") { log(`${strategy.label}: ${d.reason}`); return false; }
 		if (d.kind === "accept") { (pid as any)[strategy.term] = d.value; await applyPid(); log(`${strategy.label}: ✓ ${d.note}`); return true; }
@@ -967,7 +963,7 @@ function startAutoTune(): void {
 	if (!selectedDriver.value) { return; }
 	const hasAxis = !!axisLetterForDriver();
 	const msg = hasAxis
-		? "Auto-tune will switch to closed loop, then repeatedly move the driver: step jumps to tune P/D/I, then back-and-forth moves to tune A/V. It will first move the axis to the middle of its travel (you'll get a separate prompt for that) and keeps every move inside the configured safety margin — but only on a homed axis. Make sure you've calibrated (Step 3) and the axis is homed."
+		? "Auto-tune will switch to closed loop, then repeatedly move the driver back and forth, tuning P, D, I, A and V from the same trapezoid move each time. It will first move the axis to the middle of its travel (you'll get a separate prompt for that) and keeps every move inside the configured safety margin — but only on a homed axis. Make sure you've calibrated (Step 3) and the axis is homed."
 		: "Auto-tune will switch to closed loop, then repeatedly move the driver with step jumps to tune P/D/I (A/V need an axis and will be skipped). Make sure you've calibrated (Step 3) first.";
 	askConfirm(msg, runAutoTune);
 }
@@ -992,30 +988,29 @@ async function runAutoTune(): Promise<void> {
 		currentMode.value = mode;
 		await delay(600);
 
+		const hasAxis = !!axisLetterForDriver();
 		let ok = true;
 		for (let cycle = 1; cycle <= totalCycles && ok && !autoCancel.value; cycle++) {
 			log(`──── Cycle ${cycle} of ${totalCycles} ────`);
-			// First cycle: zero the other terms so P is measured alone. Later cycles refine P/D/I with the
-			// previously-found values in place (each term re-converges given the others — coordinate descent).
+			// First cycle: zero the other terms so P is measured alone. Later cycles refine P/D/I/A/V with
+			// the previously-found values in place (each term re-converges given the others — coordinate descent).
 			if (cycle === 1) { pid.i = 0; pid.d = 0; pid.v = 0; pid.a = 0; await applyPid(); }
-			for (const strategy of AUTOTUNE_SEQUENCE) {
-				wizardIndex.value = WIZARD_STEPS.findIndex((s) => s.term === strategy.term);
-				if (autoCancel.value) { ok = false; break; }
-				if (!(await autoTuneTerm(strategy))) { ok = false; break; }
-			}
-			// A/V feed-forward (needs a G1 move + an axis) — run every cycle so they iterate alongside
-			// P/D/I (a too-low V leaves a steady-speed lag; a too-low A leaves accel/decel spikes).
-			if (ok && !autoCancel.value) {
-				if (axisLetterForDriver()) {
-					log("Tuning A/V on a moving axis…");
-					for (const strategy of AUTOTUNE_FF_SEQUENCE) {
-						wizardIndex.value = WIZARD_STEPS.findIndex((s) => s.term === strategy.term);
-						if (autoCancel.value) { break; }
-						await autoTuneMoveTerm(strategy); // don't fail the whole run if A/V can't converge
-					}
-				} else {
-					log("A/V skipped — this driver has no axis (extruder?).");
+			if (hasAxis) {
+				// Signal-based path: one trapezoid capture serves every term (P/D/I/A/V), judged on the
+				// unified TuneSignal instead of step-response metrics that a trapezoid move would invalidate.
+				for (const strategy of AUTOTUNE_SIGNAL_SEQUENCE) {
+					wizardIndex.value = WIZARD_STEPS.findIndex((s) => s.term === strategy.term);
+					if (autoCancel.value) { ok = false; break; }
+					if (!(await autoTuneSignalTerm(strategy))) { ok = false; break; }
 				}
+			} else {
+				// No axis (extruder) — fall back to the firmware V64 step manoeuvre; A/V need a moving axis.
+				for (const strategy of AUTOTUNE_SEQUENCE) {
+					wizardIndex.value = WIZARD_STEPS.findIndex((s) => s.term === strategy.term);
+					if (autoCancel.value) { ok = false; break; }
+					if (!(await autoTuneTerm(strategy))) { ok = false; break; }
+				}
+				log("A/V skipped — this driver has no axis (extruder?).");
 			}
 		}
 		autoStatus.value = autoCancel.value

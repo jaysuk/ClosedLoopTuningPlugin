@@ -2,12 +2,23 @@
  * Automatic PID tuning controller (pure decision logic — unit-tested).
  *
  * Duet removed their auto-tuner, so this drives the documented manual procedure automatically: for
- * each term in turn (P → D → I) it repeatedly sets a value, runs a step-response capture, reads the
- * analysis metrics, and decides whether to increase, accept, or back off. The UI supplies the
- * capture+analysis side effect; this module only decides the next move, so it's deterministic and
- * testable. Every term is bounded (value caps + max attempts) and backs off on oscillation for safety.
+ * each term in turn it repeatedly sets a value, runs a capture, reads the analysis metrics, and
+ * decides whether to increase, accept, or back off. The UI supplies the capture+analysis side effect;
+ * this module only decides the next move, so it's deterministic and testable.
+ *
+ * Two strategy families, selected once per run by capture kind:
+ *  - SignalStrategy (SIGNAL_* / AUTOTUNE_SIGNAL_SEQUENCE): for drivers with an axis, judged on the
+ *    unified TuneSignal from a trapezoid G1 move — error-domain region stats + PID-P-term effort.
+ *    This is the primary path: step-response metrics are meaningless for trapezoid moves (they're
+ *    dominated by the commanded profile), which is how the old tuner destabilized loaded axes.
+ *  - TermStrategy (P/D/I_STRATEGY / AUTOTUNE_SEQUENCE): legacy step-response path for extruders,
+ *    where the firmware V64 step manoeuvre applies a genuine step and StepMetrics are valid.
+ *
+ * Every strategy is bounded (value caps + max attempts) and vetoes instability before anything else.
  */
-import type { MoveMetrics, StepMetrics } from "./analysis";
+import type { StepMetrics } from "./analysis";
+import { OVERSHOOT_GOOD, REST_GOOD, RING_WARN } from "./evaluate";
+import { SAT_DUTY_LIMIT, signalDiverging, signalUnstable, type TuneSignal } from "./signal";
 import type { PidTerm } from "./wizard";
 
 export interface Attempt {
@@ -47,11 +58,16 @@ function round(v: number, dp = 2): number {
 	return Math.round(v * f) / f;
 }
 
+/** A step attempt whose loop is saturating or oscillating — never acceptable, always back off. */
+function stepUnstable(m: StepMetrics): boolean {
+	return m.pTermSatDuty >= SAT_DUTY_LIMIT || m.oscillations >= P_OSC_LIMIT || m.overshootPct > 60;
+}
+
 /** The fastest (lowest rise time) attempt that wasn't oscillating. */
 function bestStable(attempts: Array<Attempt>): Attempt | null {
 	let best: Attempt | null = null;
 	for (const a of attempts) {
-		if (!a.metrics.hasStep || a.metrics.oscillations >= P_OSC_LIMIT || a.metrics.overshootPct > 60) { continue; }
+		if (!a.metrics.hasStep || stepUnstable(a.metrics)) { continue; }
 		if (a.metrics.riseTime == null) { continue; }
 		if (!best || (best.metrics.riseTime != null && a.metrics.riseTime < best.metrics.riseTime)) { best = a; }
 	}
@@ -68,9 +84,9 @@ export const P_STRATEGY: TermStrategy = {
 	decide(attempts) {
 		const last = attempts[attempts.length - 1];
 		if (!last.metrics.hasStep) { return noStep; }
-		// Oscillating / large overshoot → P too high; fall back to the last stable value.
-		if (last.metrics.oscillations >= P_OSC_LIMIT || last.metrics.overshootPct > 60) {
-			const prior = [...attempts].slice(0, -1).reverse().find((a) => a.metrics.oscillations < P_OSC_LIMIT && a.metrics.overshootPct <= 60);
+		// Oscillating / saturating / large overshoot → P too high; fall back to the last stable value.
+		if (stepUnstable(last.metrics)) {
+			const prior = [...attempts].slice(0, -1).reverse().find((a) => !stepUnstable(a.metrics));
 			const v = prior ? prior.value : round(last.value * 0.6);
 			return { kind: "accept", value: v, note: `P=${last.value} oscillated — backed off to ${v}.` };
 		}
@@ -101,12 +117,13 @@ export const D_STRATEGY: TermStrategy = {
 	decide(attempts) {
 		const last = attempts[attempts.length - 1];
 		if (!last.metrics.hasStep) { return noStep; }
-		if (last.metrics.overshootPct <= D_OVERSHOOT_OK) {
-			return { kind: "accept", value: last.value, note: `Overshoot ${last.metrics.overshootPct.toFixed(0)}% — critically damped.` };
-		}
-		if (last.metrics.oscillations >= D_OSC_LIMIT) {
+		// Saturation first: a railing loop invalidates every other metric.
+		if (last.metrics.pTermSatDuty >= SAT_DUTY_LIMIT || last.metrics.oscillations >= D_OSC_LIMIT) {
 			const v = attempts.length >= 2 ? attempts[attempts.length - 2].value : round(Math.max(0, last.value - 0.05), 3);
 			return { kind: "accept", value: v, note: `D=${last.value} caused ringing — backed off to ${v}.` };
+		}
+		if (last.metrics.overshootPct <= D_OVERSHOOT_OK) {
+			return { kind: "accept", value: last.value, note: `Overshoot ${last.metrics.overshootPct.toFixed(0)}% — critically damped.` };
 		}
 		const next = round(last.value + (last.value < 0.5 ? 0.01 : 0.025), 3);
 		if (next > D_MAX) { return { kind: "accept", value: last.value, note: `Reached the D limit (${D_MAX}).` }; }
@@ -123,12 +140,13 @@ export const I_STRATEGY: TermStrategy = {
 	decide(attempts) {
 		const last = attempts[attempts.length - 1];
 		if (!last.metrics.hasStep) { return noStep; }
-		if (Math.abs(last.metrics.steadyStateError) <= I_SSE_OK) {
-			return { kind: "accept", value: last.value, note: `Steady-state error ${last.metrics.steadyStateError.toFixed(2)} — settled.` };
-		}
-		if (last.metrics.oscillations >= I_OSC_LIMIT) {
+		// Saturation / oscillation first (integral windup rails the loop long before SSE looks bad).
+		if (last.metrics.pTermSatDuty >= SAT_DUTY_LIMIT || last.metrics.oscillations >= I_OSC_LIMIT) {
 			const v = attempts.length >= 2 ? attempts[attempts.length - 2].value : round(last.value * 0.6);
 			return { kind: "accept", value: v, note: `I=${last.value} caused oscillation — backed off to ${v}.` };
+		}
+		if (Math.abs(last.metrics.steadyStateError) <= I_SSE_OK) {
+			return { kind: "accept", value: last.value, note: `Steady-state error ${last.metrics.steadyStateError.toFixed(2)} — settled.` };
 		}
 		const next = round(last.value <= 0 ? 1000 : last.value * 1.5);
 		if (next > I_MAX) { return { kind: "accept", value: last.value, note: `Reached the I limit (${I_MAX}).` }; }
@@ -137,105 +155,213 @@ export const I_STRATEGY: TermStrategy = {
 	},
 };
 
-/** The step-response auto-tune sequence: P, then D, then I. */
+/** Legacy step-response auto-tune sequence (extruders / V64 step manoeuvre): P, then D, then I. */
 export const AUTOTUNE_SEQUENCE: Array<TermStrategy> = [P_STRATEGY, D_STRATEGY, I_STRATEGY];
 
 /** One-line summary of a step capture's metrics for the auto-tune log. */
 export function describeMetrics(m: StepMetrics): string {
 	const rise = m.riseTime == null ? "—" : `${(m.riseTime * 1000).toFixed(0)}ms`;
-	return `rise ${rise}, overshoot ${m.overshootPct.toFixed(0)}%, ss-err ${m.steadyStateError.toFixed(2)}, osc ${m.oscillations}`;
+	const sat = m.pTermSatDuty > 0.01 ? `, sat ${(m.pTermSatDuty * 100).toFixed(0)}%` : "";
+	return `rise ${rise}, overshoot ${m.overshootPct.toFixed(0)}%, ss-err ${m.steadyStateError.toFixed(2)}, osc ${m.oscillations}${sat}`;
 }
 
-// ---- Feed-forward (A / V) auto-tune, driven by a G1 MOVE capture (MoveMetrics) ----
+// ---- Unified TuneSignal strategies (drivers with an axis; trapezoid G1 move captures) ----
 
-export interface MoveAttempt {
+export interface SignalAttempt {
 	value: number;
-	metrics: MoveMetrics;
+	signal: TuneSignal;
 }
 
-export interface MoveTermStrategy {
+export interface SignalStrategy {
 	term: PidTerm;
 	label: string;
 	start: number;
 	maxAttempts: number;
-	decide(attempts: Array<MoveAttempt>): AutoDecision;
+	decide(attempts: Array<SignalAttempt>): AutoDecision;
 }
 
 export const A_MAX = 2_000_000;
 export const V_MAX = 10000;
 export const AV_PLATEAU = 0.05;       // <5% improvement → stop raising (push further before settling)
 export const V_CRUISE_OK = 3;         // |mean P term| in cruise considered ~zero
+export const P_RMS_PLATEAU = 0.05;    // <5% tracking-error improvement → stop raising P
+export const P_NOISE_FLOOR_K = 3;     // moveRms within this × the encoder noise floor → done
+export const P_NOISE_FLOOR_MIN = 0.15; // …with an absolute floor (steps) when restNoise reads ~0
+export const D_RING_WORSE = 2;        // ring cycles added vs the previous attempt → D is amplifying noise
 
-const noMove: AutoDecision = { kind: "fail", reason: "No steady-speed move detected — increase the A/V test move length or speed so the axis reaches cruise." };
+const noMove: AutoDecision = { kind: "fail", reason: "No steady-speed move detected — increase the test move length or speed so the axis reaches cruise." };
 
-/** Attempt with the smallest metric (e.g. accel peak / |cruise mean|). */
-function bestMove(attempts: Array<MoveAttempt>, metric: (m: MoveMetrics) => number): MoveAttempt {
-	return attempts.reduce((best, a) => (metric(a.metrics) < metric(best.metrics) ? a : best), attempts[0]);
+/** Highest stable attempt (values ramp monotonically, so this is the safe value to fall back to). */
+function lastStable(attempts: Array<SignalAttempt>): SignalAttempt | null {
+	let best: SignalAttempt | null = null;
+	for (const a of attempts) { if (!signalUnstable(a.signal)) { best = a; } }
+	return best;
 }
 
-export const A_STRATEGY: MoveTermStrategy = {
+/** Smallest-metric attempt (e.g. rms / accel peak / |cruise mean|), ignoring any that went unstable. */
+function bestBy(attempts: Array<SignalAttempt>, metric: (s: TuneSignal) => number): SignalAttempt {
+	const stable = attempts.filter((a) => !signalUnstable(a.signal));
+	const pool = stable.length ? stable : attempts;
+	return pool.reduce((best, a) => (metric(a.signal) < metric(best.signal) ? a : best), pool[0]);
+}
+
+/** Shared "this value destabilised the loop — revert" decision. */
+function backOff(attempts: Array<SignalAttempt>, term: string, fallback: number): AutoDecision {
+	const last = attempts[attempts.length - 1];
+	const stable = lastStable(attempts.slice(0, -1));
+	const v = stable ? stable.value : fallback;
+	const why = `sat ${(last.signal.pTermSatDuty * 100).toFixed(0)}%, ${last.signal.postMoveOsc} hunt, ${last.signal.stats.restRing} ring`;
+	return { kind: "accept", value: v, note: `${term}=${last.value} destabilised the loop (${why}) — backed off to ${v}.` };
+}
+
+export const SIGNAL_P_STRATEGY: SignalStrategy = {
+	term: "p",
+	label: "P (proportional)",
+	start: 30,
+	maxAttempts: 12,
+	decide(attempts) {
+		const last = attempts[attempts.length - 1];
+		// Stability veto before anything else — a saturating/hunting capture can swamp the move so
+		// badly that no cruise is even detected, so this must precede the has-move check.
+		if (signalUnstable(last.signal)) { return backOff(attempts, "P", round(last.value * 0.5)); }
+		const best = bestBy(attempts, (s) => s.stats.moveRms);
+		if (attempts.length >= 2 && signalDiverging(best.signal, last.signal)) {
+			return { kind: "accept", value: best.value, note: `Tracking error diverging at P=${last.value} — settled on ${best.value}.` };
+		}
+		if (!last.signal.hasMove) { return noMove; }
+		// Tracking error at the encoder noise floor → raising P further only amplifies noise.
+		const floor = P_NOISE_FLOOR_K * Math.max(last.signal.stats.restNoise, P_NOISE_FLOOR_MIN);
+		if (last.signal.stats.moveRms <= floor) {
+			return { kind: "accept", value: last.value, note: `Tracking error ${last.signal.stats.moveRms.toFixed(2)} step rms — at the noise floor.` };
+		}
+		// Diminishing returns on tracking error → settle on the best attempt.
+		if (attempts.length >= 2) {
+			const prevRms = attempts[attempts.length - 2].signal.stats.moveRms;
+			const curRms = last.signal.stats.moveRms;
+			if (prevRms > 0 && (prevRms - curRms) / prevRms < P_RMS_PLATEAU) {
+				return { kind: "accept", value: best.value, note: `Tracking error plateaued (~${curRms.toFixed(2)} step rms).` };
+			}
+		}
+		const next = round(last.value < 100 ? last.value + 20 : last.value * 1.25);
+		if (next > P_MAX) { return { kind: "accept", value: last.value, note: `Reached the P limit (${P_MAX}).` }; }
+		if (attempts.length >= this.maxAttempts) {
+			return { kind: "accept", value: best.value, note: "Max attempts reached." };
+		}
+		return { kind: "set", value: next, note: `Increasing P to ${next}.` };
+	},
+};
+
+export const SIGNAL_D_STRATEGY: SignalStrategy = {
+	term: "d",
+	label: "D (derivative)",
+	start: 0,
+	maxAttempts: 16,
+	decide(attempts) {
+		const last = attempts[attempts.length - 1];
+		if (signalUnstable(last.signal)) { return backOff(attempts, "D", 0); }
+		if (!last.signal.hasMove) { return noMove; }
+		const s = last.signal.stats;
+		// Critically damped: no real overshoot at the stop and no ringing.
+		if (s.settleOvershoot <= OVERSHOOT_GOOD && s.restRing < RING_WARN) {
+			return { kind: "accept", value: last.value, note: `Overshoot ${s.settleOvershoot.toFixed(2)} step, ${s.restRing} ring — critically damped.` };
+		}
+		// D amplifying encoder noise into ring → the previous value was better.
+		if (attempts.length >= 2) {
+			const prev = attempts[attempts.length - 2];
+			if (s.restRing >= RING_WARN && s.restRing > prev.signal.stats.restRing + D_RING_WORSE) {
+				return { kind: "accept", value: prev.value, note: `D=${last.value} increased ringing (${s.restRing} cycles) — backed off to ${prev.value}.` };
+			}
+		}
+		const next = round(last.value + (last.value < 0.5 ? 0.01 : 0.025), 3);
+		if (next > D_MAX) { return { kind: "accept", value: last.value, note: `Reached the D limit (${D_MAX}).` }; }
+		if (attempts.length >= this.maxAttempts) {
+			return { kind: "accept", value: bestBy(attempts, (sig) => sig.stats.settleOvershoot).value, note: "Max attempts reached." };
+		}
+		return { kind: "set", value: next, note: `Increasing D to ${next}.` };
+	},
+};
+
+export const SIGNAL_I_STRATEGY: SignalStrategy = {
+	term: "i",
+	label: "I (integral)",
+	start: 0,
+	maxAttempts: 12,
+	decide(attempts) {
+		const last = attempts[attempts.length - 1];
+		// Integral windup shows up as hunting/ring — vetoed before the bias check.
+		if (signalUnstable(last.signal)) { return backOff(attempts, "I", 0); }
+		if (!last.signal.hasMove) { return noMove; }
+		if (Math.abs(last.signal.stats.restBias) <= REST_GOOD) {
+			return { kind: "accept", value: last.value, note: `Standing error ${last.signal.stats.restBias.toFixed(2)} step — settled.` };
+		}
+		const next = round(last.value <= 0 ? 1000 : last.value * 1.5);
+		if (next > I_MAX) { return { kind: "accept", value: last.value, note: `Reached the I limit (${I_MAX}).` }; }
+		if (attempts.length >= this.maxAttempts) {
+			return { kind: "accept", value: bestBy(attempts, (s) => Math.abs(s.stats.restBias)).value, note: "Max attempts reached." };
+		}
+		return { kind: "set", value: next, note: `Increasing I to ${next}.` };
+	},
+};
+
+export const SIGNAL_A_STRATEGY: SignalStrategy = {
 	term: "a",
 	label: "A (accel feed-forward)",
 	start: 0,
 	maxAttempts: 10,
 	decide(attempts) {
 		const last = attempts[attempts.length - 1];
-		if (!last.metrics.hasMove) { return noMove; }
+		if (signalUnstable(last.signal)) { return backOff(attempts, "A", 0); }
+		if (!last.signal.hasMove) { return noMove; }
 		if (attempts.length >= 2) {
 			const prev = attempts[attempts.length - 2];
-			const pp = prev.metrics.pTermAccelPeak;
-			const cp = last.metrics.pTermAccelPeak;
+			const pp = prev.signal.pTermAccelPeak;
+			const cp = last.signal.pTermAccelPeak;
 			if (pp > 0 && (pp - cp) / pp < AV_PLATEAU) {
 				const best = pp <= cp ? prev : last;
 				return { kind: "accept", value: best.value, note: `Accel P-term peak plateaued (~${cp.toFixed(0)}).` };
 			}
 		}
-		const next = round(last.value <= 0 ? 50000 : last.value * 2);
+		const next = round(last.value <= 0 ? 50000 : last.value * 1.5);
 		if (next > A_MAX) { return { kind: "accept", value: last.value, note: `Reached the A limit (${A_MAX}).` }; }
 		if (attempts.length >= this.maxAttempts) {
-			const best = bestMove(attempts, (m) => m.pTermAccelPeak);
-			return { kind: "accept", value: best.value, note: "Max attempts reached." };
+			return { kind: "accept", value: bestBy(attempts, (s) => s.pTermAccelPeak).value, note: "Max attempts reached." };
 		}
 		return { kind: "set", value: next, note: `Increasing A to ${next}.` };
 	},
 };
 
-export const V_STRATEGY: MoveTermStrategy = {
+export const SIGNAL_V_STRATEGY: SignalStrategy = {
 	term: "v",
 	label: "V (velocity feed-forward)",
 	start: 0,
 	maxAttempts: 11,
 	decide(attempts) {
 		const last = attempts[attempts.length - 1];
-		if (!last.metrics.hasMove) { return noMove; }
-		const cmAbs = Math.abs(last.metrics.pTermCruiseMean);
+		if (signalUnstable(last.signal)) { return backOff(attempts, "V", 0); }
+		if (!last.signal.hasMove) { return noMove; }
+		const cmAbs = Math.abs(last.signal.pTermCruiseMean);
 		if (cmAbs <= V_CRUISE_OK) {
-			return { kind: "accept", value: last.value, note: `Steady-speed P-term ~0 (${last.metrics.pTermCruiseMean.toFixed(1)}).` };
+			return { kind: "accept", value: last.value, note: `Steady-speed P-term ~0 (${last.signal.pTermCruiseMean.toFixed(1)}).` };
 		}
 		// Only honour a "plateau" once the cruise lag is already small. V reduces the lag monotonically,
-		// so two equal-but-large noisy readings early on must NOT stop the ramp (the cause of V settling
-		// at a large residual lag on an unlucky cycle) — keep raising V until it's near zero or capped.
+		// so two equal-but-large noisy readings early on must NOT stop the ramp — keep raising V until
+		// it's near zero or capped.
 		if (attempts.length >= 2 && cmAbs <= V_CRUISE_OK * 4) {
-			const pm = Math.abs(attempts[attempts.length - 2].metrics.pTermCruiseMean);
+			const pm = Math.abs(attempts[attempts.length - 2].signal.pTermCruiseMean);
 			if (pm > 0 && (pm - cmAbs) / pm < AV_PLATEAU) {
-				const best = bestMove(attempts, (m) => Math.abs(m.pTermCruiseMean));
-				return { kind: "accept", value: best.value, note: `Steady-speed P-term plateaued (~${last.metrics.pTermCruiseMean.toFixed(1)}).` };
+				return { kind: "accept", value: bestBy(attempts, (s) => Math.abs(s.pTermCruiseMean)).value, note: `Steady-speed P-term plateaued (~${last.signal.pTermCruiseMean.toFixed(1)}).` };
 			}
 		}
 		const next = round(last.value <= 0 ? 100 : last.value * 1.6);
 		if (next > V_MAX) { return { kind: "accept", value: last.value, note: `Reached the V limit (${V_MAX}).` }; }
 		if (attempts.length >= this.maxAttempts) {
-			const best = bestMove(attempts, (m) => Math.abs(m.pTermCruiseMean));
-			return { kind: "accept", value: best.value, note: "Max attempts reached." };
+			return { kind: "accept", value: bestBy(attempts, (s) => Math.abs(s.pTermCruiseMean)).value, note: "Max attempts reached." };
 		}
 		return { kind: "set", value: next, note: `Increasing V to ${next}.` };
 	},
 };
 
-/** Feed-forward auto-tune sequence (needs a G1 move + an axis): A, then V. */
-export const AUTOTUNE_FF_SEQUENCE: Array<MoveTermStrategy> = [A_STRATEGY, V_STRATEGY];
-
-/** One-line summary of a move capture's metrics for the auto-tune log. */
-export function describeMove(m: MoveMetrics): string {
-	return `accel peak ${m.pTermAccelPeak.toFixed(0)}, cruise mean ${m.pTermCruiseMean.toFixed(1)}`;
-}
+/** Signal-based auto-tune sequence for drivers with an axis: P → D → I → A → V. */
+export const AUTOTUNE_SIGNAL_SEQUENCE: Array<SignalStrategy> = [
+	SIGNAL_P_STRATEGY, SIGNAL_D_STRATEGY, SIGNAL_I_STRATEGY, SIGNAL_A_STRATEGY, SIGNAL_V_STRATEGY,
+];
