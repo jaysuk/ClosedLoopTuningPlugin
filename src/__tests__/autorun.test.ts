@@ -432,3 +432,50 @@ describe("runAutoTune — final verification", () => {
 		expect(result.evaluation).toBeUndefined();
 	});
 });
+
+describe("runAutoTune — stage-status callbacks", () => {
+	it("reports preflight, every term, and verify as running then done on a clean axis run", async () => {
+		const stages: Array<string> = [];
+		const onStage = vi.fn((stage: string, state: string) => stages.push(`${stage}:${state}`));
+		const { effects } = fakeEffects({ onStage });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
+		expect(result.ok).toBe(true);
+		for (const stage of ["preflight", "p", "d", "i", "a", "v", "verify"]) {
+			expect(stages).toContain(`${stage}:running`);
+			expect(stages).toContain(`${stage}:done`);
+		}
+		// Every stage must report "running" before it reports "done".
+		for (const stage of ["preflight", "p", "d", "i", "a", "v", "verify"]) {
+			expect(stages.indexOf(`${stage}:running`)).toBeLessThan(stages.indexOf(`${stage}:done`));
+		}
+	});
+
+	it("marks the failing stage as failed, and never starts a later stage in the same run", async () => {
+		const stages: Array<string> = [];
+		const onStage = vi.fn((stage: string, state: string) => stages.push(`${stage}:${state}`));
+		let preflightDone = false;
+		const captureSignal = vi.fn(async () => {
+			if (!preflightDone) { preflightDone = true; return GOOD_SIGNAL; } // let preflight's probe succeed
+			return null; // everything afterwards (seeding + the P ramp) fails outright
+		});
+		const { effects } = fakeEffects({ onStage, captureSignal });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
+		expect(result.ok).toBe(false);
+		expect(stages).toContain("preflight:done");
+		const failedStages = stages.filter((s) => s.endsWith(":failed"));
+		expect(failedStages.length).toBe(1); // exactly one stage fails, and the run stops there
+		expect(stages).not.toContain("i:running");
+		expect(stages).not.toContain("a:running");
+		expect(stages).not.toContain("v:running");
+		expect(stages).not.toContain("verify:running");
+	});
+
+	it("reports preflight as failed when the driver never starts tracking", async () => {
+		const stages: Array<string> = [];
+		const onStage = vi.fn((stage: string, state: string) => stages.push(`${stage}:${state}`));
+		const { effects } = fakeEffects({ onStage, captureSignal: vi.fn(async () => sig({ stats: { movePeak: 500 } })) });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true, calibrationMoveIds: [] });
+		expect(result.ok).toBe(false);
+		expect(stages).toEqual(["preflight:running", "preflight:failed"]);
+	});
+});

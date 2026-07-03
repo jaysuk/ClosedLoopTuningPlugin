@@ -159,6 +159,12 @@
 								<v-spacer />
 								<span class="text-caption text-medium-emphasis">{{ autoStatus }}</span>
 							</div>
+							<div v-if="autoRunning || tuneSession" class="d-flex flex-wrap ga-1 mt-2">
+								<v-chip v-for="s in STAGE_ORDER" :key="s.id" size="small"
+										:color="stageColor(stageStates[s.id])"
+										:variant="stageStates[s.id] === 'pending' ? 'outlined' : 'flat'"
+										:prepend-icon="stageIcon(stageStates[s.id])">{{ s.label }}</v-chip>
+							</div>
 							<div class="d-flex flex-wrap ga-1 mt-2">
 								<v-chip v-for="t in pidSummary" :key="t.term" size="small"
 										:color="autoRunning && wizardStep.term === t.term ? 'primary' : undefined"
@@ -436,6 +442,7 @@ import CaptureChart from "./CaptureChart.vue";
 import { evaluateTune, gradeColor, severityColor, severityIcon, type Term, type TuneEvaluation } from "../model/evaluate";
 import { CAPTURE_DIR, CONFIG_FILE, DOCS, LS_STATE, PLUGIN_ID } from "../model/constants";
 import { upsertTuneBlock } from "../model/config";
+import { stepJumpDistanceMm, stepJumpFeedMmPerMin } from "../model/scale";
 import {
 	buildCalibrationCommand, buildCaptureCommand, buildModeCommand, buildPidCommand,
 	CALIBRATION_MOVES, CAPTURE_VARIABLES, DEFAULT_MODE_D, ENCODER_TYPES, MODE_LABELS,
@@ -449,7 +456,7 @@ import {
 } from "../model/limits";
 import { WIZARD_STEPS, type Recommendation } from "../model/wizard";
 import { computeTuneSignal, type TuneSignal } from "../model/signal";
-import { runAutoTune as runAutoTuneCore, type TuneEffects } from "../model/autorun";
+import { runAutoTune as runAutoTuneCore, type AutoRunResult, type StageId, type StageState, type TuneEffects } from "../model/autorun";
 import { applying, applyUpdateNow, checking, dismissCurrentUpdate, pendingReload, runUpdateCheck, setUpdateChecksEnabled, updateChecksEnabled, updateState } from "../model/updateCheck";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -529,6 +536,30 @@ const autoRunning = ref(false);
 const autoCancel = ref(false);
 const autoStatus = ref("");
 const autoLog = ref<Array<string>>([]);
+
+// Stage-status timeline: preflight → P → D → I → A → V → verify (P–V repeat every cycle).
+const STAGE_ORDER: Array<{ id: StageId; label: string }> = [
+	{ id: "preflight", label: "Preflight" }, { id: "p", label: "P" }, { id: "d", label: "D" },
+	{ id: "i", label: "I" }, { id: "a", label: "A" }, { id: "v", label: "V" }, { id: "verify", label: "Verify" },
+];
+const stageStates = reactive<Record<StageId, StageState>>({ preflight: "pending", p: "pending", d: "pending", i: "pending", a: "pending", v: "pending", verify: "pending" });
+function resetStageStates(): void { for (const s of STAGE_ORDER) { stageStates[s.id] = "pending"; } }
+function stageColor(state: StageState): string | undefined {
+	switch (state) {
+		case "running": return "primary";
+		case "done": return "success";
+		case "failed": return "error";
+		default: return undefined;
+	}
+}
+function stageIcon(state: StageState): string {
+	switch (state) {
+		case "running": return "mdi-progress-clock";
+		case "done": return "mdi-check-circle";
+		case "failed": return "mdi-close-circle";
+		default: return "mdi-circle-outline";
+	}
+}
 const avDistance = ref(saved.avDistance ?? 50);   // mm — A/V test move length
 const avFeed = ref(saved.avFeed ?? 6000);          // mm/min — A/V test move feedrate
 const cycles = ref(saved.cycles ?? 3);             // how many times to iterate P→D→I
@@ -578,6 +609,12 @@ interface TuneSession {
 	startedAt: string; finishedAt?: string; driver: string | null; mode: LoopMode | null;
 	encoderType: EncoderType; cycles: number; finalPid?: PidConfig; log: Array<string>;
 	captures: Array<SessionCapture>; evaluation?: TuneEvaluation | null;
+	/** Ultimate gain/period found during Ku/Tu seeding, when it succeeded. */
+	ku?: number; tu?: number;
+	/** Calibration moves (M569.6 V-ids) actually run during preflight. */
+	preflightActions?: Array<string>;
+	/** True if the run failed/was cancelled and the pre-run PID snapshot was restored. */
+	restored?: boolean;
 }
 const tuneSession = ref<TuneSession | null>(null);
 function recordSessionCapture(phase: string, value: number | undefined, metrics: unknown): void {
@@ -893,9 +930,7 @@ async function captureStep(): Promise<StepMetrics | null> {
 	const stepVars = varIds(["measuredMotorSteps", "targetMotorSteps", "currentError", "pidPTerm"]);
 	let c: ParsedCapture | null;
 	if (ax?.letter) {
-		const stepsPerMm = Number(ax.stepsPerMm) || 80;
-		const micro = Number(ax.microstepping?.value) || 16;
-		const desired = Math.max(0.1, (micro / stepsPerMm) * 16);   // ~16 full steps ≈ a step jump
+		const desired = stepJumpDistanceMm({ stepsPerMm: Number(ax.stepsPerMm), microstepping: Number(ax.microstepping?.value) });
 		let dist = desired;
 		let sign: 1 | -1 = 1;
 		if (limits) {
@@ -904,9 +939,10 @@ async function captureStep(): Promise<StepMetrics | null> {
 			dist = plan.distance; sign = plan.sign;
 		}
 		const signedDist = sign * dist;
-		const move = `G91 G1 H2 ${ax.letter}${signedDist.toFixed(3)} F18000 G90`;
+		const feed = stepJumpFeedMmPerMin(dist).toFixed(0);
+		const move = `G91 G1 H2 ${ax.letter}${signedDist.toFixed(3)} F${feed} G90`;
 		c = await runCapture({ driver: selectedDriver.value ?? "", samples: samples.value, activate: 1, rate: sampleRate.value, variables: stepVars, manoeuvre: 0, move });
-		try { await machineStore.sendCode(`G91 G1 H2 ${ax.letter}${(-signedDist).toFixed(3)} F18000 G90`, false, false); } catch { /* return move */ }
+		try { await machineStore.sendCode(`G91 G1 H2 ${ax.letter}${(-signedDist).toFixed(3)} F${feed} G90`, false, false); } catch { /* return move */ }
 	} else {
 		c = await runCapture({ driver: selectedDriver.value ?? "", samples: samples.value, activate: 0, rate: sampleRate.value, variables: stepVars, manoeuvre: 64 });
 	}
@@ -993,6 +1029,7 @@ function buildTuneEffects(): TuneEffects {
 			wizardIndex.value = WIZARD_STEPS.findIndex((s) => s.term === term);
 			recordSessionCapture(term, value, metric);
 		},
+		onStage: (stage, state) => { stageStates[stage] = state; },
 		isCancelled: () => autoCancel.value,
 		delay,
 	};
@@ -1017,6 +1054,7 @@ async function runAutoTune(): Promise<void> {
 	autoRunning.value = true;
 	autoCancel.value = false;
 	autoLog.value = [];
+	resetStageStates();
 	viewKeys.value = ["measuredMotorSteps", "targetMotorSteps", "currentError"];
 	const totalCycles = Math.max(1, Math.round(cycles.value || 1));
 	const hasAxis = !!axisLetterForDriver();
@@ -1024,8 +1062,9 @@ async function runAutoTune(): Promise<void> {
 		startedAt: new Date().toISOString(), driver: selectedDriver.value, mode: currentMode.value,
 		encoderType: encoderType.value, cycles: totalCycles, log: [], captures: [],
 	};
+	let result: AutoRunResult | undefined;
 	try {
-		const result = await runAutoTuneCore(buildTuneEffects(), { ...pid }, { cycles: totalCycles, hasAxis, calibrationMoveIds: requiredMoveIds.value });
+		result = await runAutoTuneCore(buildTuneEffects(), { ...pid }, { cycles: totalCycles, hasAxis, calibrationMoveIds: requiredMoveIds.value });
 		Object.assign(pid, result.pid);
 		if (result.ok) {
 			const gradeNote = result.evaluation ? ` Final grade: ${result.evaluation.grade} (${result.evaluation.score}/100).` : "";
@@ -1045,7 +1084,11 @@ async function runAutoTune(): Promise<void> {
 			tuneSession.value.finishedAt = new Date().toISOString();
 			tuneSession.value.finalPid = { ...pid };
 			tuneSession.value.log = [...autoLog.value];
-			tuneSession.value.evaluation = evaluation.value;
+			tuneSession.value.evaluation = result?.evaluation ?? evaluation.value;
+			tuneSession.value.ku = result?.ku;
+			tuneSession.value.tu = result?.tu;
+			tuneSession.value.preflightActions = result?.preflightActions;
+			tuneSession.value.restored = result?.restored;
 		}
 	}
 }

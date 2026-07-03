@@ -63,9 +63,15 @@ export interface TuneEffects {
 	status(line: string): void;
 	/** Notified after every capture that feeds a decision (session recording, wizard-step highlighting). */
 	onAttempt?(term: PidTerm, value: number, metric: TuneSignal | StepMetrics): void;
+	/** Notified on stage transitions (preflight → P → D → I → A → V → verify) — drives a progress UI. */
+	onStage?(stage: StageId, state: StageState): void;
 	isCancelled(): boolean;
 	delay(ms: number): Promise<void>;
 }
+
+/** The stages auto-tune moves through, in order (P–V repeat every cycle). */
+export type StageId = "preflight" | PidTerm | "verify";
+export type StageState = "pending" | "running" | "done" | "failed";
 
 export type SeedRule = "tyreus-luyben" | "zn-classic" | "amigo";
 
@@ -379,7 +385,9 @@ async function runAxisCycle(
 		const startValue = cycle === 1
 			? (isFeedForward ? strategy.start : (seeded[strategy.term] ?? strategy.start))
 			: pid[strategy.term];
+		effects.onStage?.(strategy.term, "running");
 		const result = await runSignalTerm(effects, strategy, pid, medianOf, verifyRetries, startValue);
+		effects.onStage?.(strategy.term, result.ok ? "done" : "failed");
 		attempts.push(...result.attempts);
 		if (!result.ok) { return { ok: false, reason: result.reason, attempts, ku, tu }; }
 		if (result.finalSignal) { lastSignal = result.finalSignal; }
@@ -393,7 +401,9 @@ async function runExtruderCycle(effects: TuneEffects, pid: PidConfig, cycle: num
 	for (const strategy of AUTOTUNE_SEQUENCE) {
 		if (effects.isCancelled()) { return { ok: false, reason: "Cancelled.", attempts }; }
 		const startValue = cycle === 1 ? strategy.start : pid[strategy.term];
+		effects.onStage?.(strategy.term, "running");
 		const result = await runStepTerm(effects, strategy, pid, startValue);
+		effects.onStage?.(strategy.term, result.ok ? "done" : "failed");
 		attempts.push(...result.attempts);
 		if (!result.ok) { return { ok: false, reason: result.reason, attempts }; }
 	}
@@ -547,7 +557,9 @@ export async function runAutoTune(effects: TuneEffects, startPid: PidConfig, opt
 	let ok = true;
 	let reason: string | undefined;
 	try {
+		effects.onStage?.("preflight", "running");
 		const pre = await preflight(effects, opts.hasAxis, opts.calibrationMoveIds ?? []);
+		effects.onStage?.("preflight", pre.ok ? "done" : "failed");
 		preflightActions = pre.actions;
 		if (!pre.ok) {
 			// Preflight's own probe may already have applied a baseline PID to the firmware — fall through
@@ -588,11 +600,14 @@ export async function runAutoTune(effects: TuneEffects, startPid: PidConfig, opt
 	}
 
 	let evaluation: TuneEvaluation | undefined;
+	effects.onStage?.("verify", "running");
 	try {
 		const verification = await runFinalVerification(effects, pid);
 		evaluation = verification.evaluation;
+		effects.onStage?.("verify", "done");
 	} catch (e) {
 		effects.log(`Final verification skipped: ${e instanceof Error ? e.message : String(e)}`);
+		effects.onStage?.("verify", "failed");
 	}
 	return { ok: true, pid, attempts, ku, tu, preflightActions, evaluation };
 }
