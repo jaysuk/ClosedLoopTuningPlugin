@@ -2,17 +2,19 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { StepMetrics } from "../model/analysis";
 import {
-	detectUltimate, nextBackoff, runAutoTune, runSignalTerm, runStepTerm, seedFromUltimate,
-	verifyAccepted, type TuneEffects,
+	detectUltimate, nextBackoff, refineAxisCycle, refinementDelta, refineTerm, runAutoTune, runSignalTerm,
+	runStepTerm, seedFromUltimate, verifyAccepted, type TuneEffects,
 } from "../model/autorun";
-import { SIGNAL_D_STRATEGY, SIGNAL_P_STRATEGY, P_STRATEGY, D_STRATEGY, I_STRATEGY } from "../model/autotune";
+import {
+	AUTOTUNE_SIGNAL_SEQUENCE, P_MAX, SIGNAL_D_STRATEGY, SIGNAL_P_STRATEGY, P_STRATEGY, D_STRATEGY, I_STRATEGY,
+} from "../model/autotune";
 import type { PidConfig } from "../model/m569";
 import type { TuneSignal } from "../model/signal";
 import type { TuneEvaluation, TuneStats } from "../model/evaluate";
 
 function stats(over: Partial<TuneStats> = {}): TuneStats {
 	return {
-		restBias: 0, restNoise: 0.05, restRing: 0, settleOvershoot: 0, cruiseLag: 0,
+		restBias: 0, restNoise: 0.05, restRing: 0, settleOvershoot: 0, cruiseLag: 0, cruiseSpread: 0,
 		accelPeak: 0, movePeak: 5, moveRms: 1, cruiseSamples: 10, restSamples: 10, moved: true,
 		...over,
 	};
@@ -22,7 +24,7 @@ function sig(over: Partial<TuneSignal> & { stats?: Partial<TuneStats> } = {}): T
 	return {
 		stats: stats(statsOver ?? {}),
 		pTermAccelPeak: 50, pTermCruiseMean: 1, pTermSatDuty: 0, postMoveOsc: 0,
-		oscPeriod: null, itae: 0, hasMove: true,
+		oscPeriod: null, oscAmplitude: 0, itae: 0, hasMove: true,
 		...rest,
 	};
 }
@@ -202,14 +204,119 @@ describe("runStepTerm (legacy step-response path)", () => {
 	});
 });
 
+// ---- Bidirectional refinement (the cycle-2+ fix: it must be able to move a value, not just repeat it) ----
+
+describe("refinementDelta", () => {
+	it("starts at 25% for cycle 2 and halves each cycle after", () => {
+		expect(refinementDelta(2)).toBeCloseTo(0.25);
+		expect(refinementDelta(3)).toBeCloseTo(0.125);
+		expect(refinementDelta(4)).toBeCloseTo(0.0625);
+	});
+});
+
+describe("refineTerm", () => {
+	const flatBaseline = sig({ stats: { moveRms: 1.0, restNoise: 0.05, restBias: 0, settleOvershoot: 0, restRing: 0 } });
+
+	it("raises the term when a higher value is a real (noise-clearing) improvement", async () => {
+		const pid = basePid(); pid.p = 100;
+		const captureSignal = vi.fn(async () => (pid.p === 125
+			? sig({ stats: { moveRms: 0.2, restNoise: 0.05, restBias: 0, settleOvershoot: 0, restRing: 0 } })
+			: flatBaseline));
+		const { effects } = fakeEffects({ captureSignal });
+		const result = await refineTerm(effects, "p", pid, flatBaseline, 1, 2, 0.25);
+		expect(result.changed).toBe(true);
+		expect(pid.p).toBe(125);
+		expect(captureSignal).toHaveBeenCalledTimes(2); // one up-probe + one verification capture
+	});
+
+	it("lowers the term when only the lower value is a real improvement", async () => {
+		const pid = basePid(); pid.p = 100;
+		const captureSignal = vi.fn(async () => (pid.p === 75
+			? sig({ stats: { moveRms: 0.2, restNoise: 0.05, restBias: 0, settleOvershoot: 0, restRing: 0 } })
+			: flatBaseline));
+		const { effects } = fakeEffects({ captureSignal });
+		const result = await refineTerm(effects, "p", pid, flatBaseline, 1, 2, 0.25);
+		expect(result.changed).toBe(true);
+		expect(pid.p).toBe(75);
+		expect(captureSignal).toHaveBeenCalledTimes(3); // up-probe (no help) + down-probe + verification
+	});
+
+	it("leaves the term unchanged when neither direction is a real improvement — this is the bug fix: the OLD refinement path could only ever repeat the same value, this one PROVES it (not by accident)", async () => {
+		const pid = basePid(); pid.p = 100;
+		const captureSignal = vi.fn(async () => flatBaseline); // identical reading in every direction
+		const { effects } = fakeEffects({ captureSignal });
+		const result = await refineTerm(effects, "p", pid, flatBaseline, 1, 2, 0.25);
+		expect(result.changed).toBe(false);
+		expect(pid.p).toBe(100);
+		expect(captureSignal).toHaveBeenCalledTimes(2); // up-probe + down-probe, no verification wasted
+	});
+
+	it("reverts to the original value (without failing) when the improvement doesn't survive verification", async () => {
+		const pid = basePid(); pid.p = 100;
+		// The up-probe (P=125) looks better on the very first capture, but every capture from then on —
+		// verification at 125 AND at every backed-off value verifyAccepted tries — is unstable.
+		// Refinement must fall back to the safe original value instead of aborting the whole run.
+		let calls = 0;
+		const captureSignal = vi.fn(async () => {
+			calls++;
+			if (calls === 1) { return sig({ stats: { moveRms: 0.2, restNoise: 0.05 } }); }
+			return sig({ pTermSatDuty: 0.9 });
+		});
+		const { effects } = fakeEffects({ captureSignal });
+		const result = await refineTerm(effects, "p", pid, flatBaseline, 1, 1, 0.25);
+		expect(result.changed).toBe(false);
+		expect(pid.p).toBe(100);
+	});
+
+	it("uses an absolute floor step (not a zero-times-fraction no-op) when refining a term that's currently 0", async () => {
+		const pid = basePid(); pid.d = 0;
+		const seen: Array<number> = [];
+		const captureSignal = vi.fn(async () => { seen.push(pid.d); return flatBaseline; });
+		const { effects } = fakeEffects({ captureSignal });
+		await refineTerm(effects, "d", pid, flatBaseline, 1, 2, 0.25);
+		expect(seen.some((v) => v > 0)).toBe(true); // at least one probe actually moved off 0
+	});
+});
+
+describe("refineAxisCycle", () => {
+	it("visits every term in the Duet-documented order (P → A → V → D → I)", async () => {
+		const pid = basePid();
+		const order: Array<string> = [];
+		const onStage = vi.fn((stage: string) => order.push(stage));
+		const { effects } = fakeEffects({ onStage, captureSignal: vi.fn(async () => GOOD_SIGNAL) });
+		await refineAxisCycle(effects, pid, 2, 1, 2);
+		const perTermOrder = order.filter((_, i) => i % 2 === 0); // onStage fires running,done per term — take one per term
+		expect(perTermOrder).toEqual(AUTOTUNE_SIGNAL_SEQUENCE.map((s) => s.term));
+	});
+
+	it("skips refinement gracefully (without failing) when the baseline capture fails", async () => {
+		const pid = basePid();
+		const { effects, log } = fakeEffects({ captureSignal: vi.fn(async () => null) });
+		const result = await refineAxisCycle(effects, pid, 2, 1, 2);
+		expect(result.ok).toBe(true);
+		expect(result.attempts).toEqual([]);
+		expect(log.some((l) => l.includes("baseline capture failed"))).toBe(true);
+	});
+});
+
 // ---- runAutoTune (end-to-end orchestration) ----
 
 describe("runAutoTune — happy path", () => {
-	it("converges on an axis driver without needing a restore", async () => {
+	it("converges on an axis driver without needing a restore (model-fit default)", async () => {
 		const { effects, log } = fakeEffects();
 		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
 		expect(result.ok).toBe(true);
 		expect(result.restored).toBeFalsy();
+		// GOOD_SIGNAL has a flat accel peak (never nears the rail) — the model fit must degrade to its
+		// best-measured reading, not throw the identification away and re-ramp.
+		expect(log.some((l) => l.includes("using the best measured reading directly"))).toBe(true);
+		expect(log.some((l) => l.includes("Seeding: probing"))).toBe(false); // never re-ramps the same curve
+	});
+
+	it("converges via the classic path when continuous-cycling is selected and nothing oscillates", async () => {
+		const { effects, log } = fakeEffects();
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true, identifyMethod: "continuous-cycling" });
+		expect(result.ok).toBe(true);
 		expect(result.attempts.length).toBeGreaterThan(0);
 		expect(log.some((l) => l.includes("falling back to the conservative ramp"))).toBe(true); // GOOD_SIGNAL never oscillates
 	});
@@ -279,7 +386,7 @@ describe("runAutoTune — Ku/Tu seeding", () => {
 			return sig({ oscPeriod: null, stats: { restRing: 0 } });
 		});
 		const { effects, log } = fakeEffects({ applyPid, captureSignal });
-		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true, identifyMethod: "continuous-cycling" });
 		expect(result.ok).toBe(true);
 		expect(result.ku).toBe(70);
 		expect(result.tu).toBe(0.05);
@@ -295,11 +402,49 @@ describe("runAutoTune — Ku/Tu seeding", () => {
 			return GOOD_SIGNAL;
 		});
 		const { effects, log } = fakeEffects({ captureSignal });
-		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true, identifyMethod: "continuous-cycling" });
 		expect(result.ok).toBe(true); // the rest of the tune still completes on the conservative ramp
 		expect(result.ku).toBeUndefined();
 		expect(log.some((l) => l.includes("went unstable before a clean sustained oscillation was found"))).toBe(true);
 		expect(log.some((l) => l.includes("Falling back to the conservative ramp"))).toBe(true);
+	});
+});
+
+describe("runAutoTune — relay-feedback identification (identifyMethod: 'relay')", () => {
+	it("identifies Ku/Tu via the describing-function formula at a fixed high P, bypassing the ramp search", async () => {
+		let lastAppliedP = 0;
+		const applyPid = vi.fn(async (p: PidConfig) => { lastAppliedP = p.p; });
+		const captureSignal = vi.fn(async () => (lastAppliedP === P_MAX
+			// A clean bounded limit cycle: amplitude 2 steps, period 40 ms.
+			? sig({ oscPeriod: 0.04, oscAmplitude: 2, stats: { movePeak: 5 } })
+			: GOOD_SIGNAL)); // preflight probe and anything else looks stable/flat
+		const { effects, log } = fakeEffects({ applyPid, captureSignal });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true, identifyMethod: "relay" });
+		expect(result.ok).toBe(true);
+		const expectedKu = (4 * 250) / (Math.PI * 2); // P_TERM_RAIL=250
+		expect(result.ku).toBeCloseTo(expectedKu, 5);
+		expect(result.tu).toBe(0.04);
+		expect(log.some((l) => l.includes("Relay feedback: found Ku="))).toBe(true);
+		expect(log.some((l) => l.includes("Seeding: probing P="))).toBe(false); // the ramp search never runs
+	});
+
+	it("falls back to the conservative ramp when the relay probe runs away instead of a bounded limit cycle", async () => {
+		let lastAppliedP = 0;
+		const applyPid = vi.fn(async (p: PidConfig) => { lastAppliedP = p.p; });
+		const captureSignal = vi.fn(async () => (lastAppliedP === P_MAX ? sig({ stats: { movePeak: 500 } }) : GOOD_SIGNAL));
+		const { effects, log } = fakeEffects({ applyPid, captureSignal });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true, identifyMethod: "relay" });
+		expect(result.ok).toBe(true); // still completes via the conservative ramp
+		expect(result.ku).toBeUndefined();
+		expect(log.some((l) => l.includes("Relay feedback:") && l.includes("unbounded error"))).toBe(true);
+	});
+
+	it("falls back to the conservative ramp when no clean oscillation is found at the relay P", async () => {
+		const { effects, log } = fakeEffects({ captureSignal: vi.fn(async () => GOOD_SIGNAL) }); // never oscillates
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true, identifyMethod: "relay" });
+		expect(result.ok).toBe(true);
+		expect(result.ku).toBeUndefined();
+		expect(log.some((l) => l.includes("Relay feedback: no clean sustained oscillation found"))).toBe(true);
 	});
 });
 
@@ -312,7 +457,7 @@ describe("runAutoTune — cycle refinement", () => {
 			return sig({ stats: { moveRms: rms, restNoise: 0.05, restBias: 0.05, settleOvershoot: 0.1, restRing: 0 }, itae: 2 });
 		});
 		const { effects, log } = fakeEffects({ applyPid, captureSignal });
-		const result = await runAutoTune(effects, basePid(), { cycles: 2, hasAxis: true });
+		const result = await runAutoTune(effects, basePid(), { cycles: 2, hasAxis: true, identifyMethod: "continuous-cycling" });
 		expect(result.ok).toBe(true);
 		// The ramp-start line ("P (proportional): P=30 → ...") should only appear once — cycle 2 must
 		// begin from whatever cycle 1 converged to, not restart the ramp from the strategy default.
@@ -385,6 +530,37 @@ describe("runAutoTune — preflight (axis drivers)", () => {
 	});
 });
 
+describe("runAutoTune — failure containment (a late measurement failure keeps earlier verified progress)", () => {
+	it("reproduces the field failure: P and A verify fine, V's capture glitches persistently — the run completes instead of restoring everything", async () => {
+		// P and A behave like GOOD_SIGNAL throughout (verify immediately); V's capture always comes back
+		// null (e.g. a persistently corrupt CSV, or the move never reaching cruise) once V is being probed.
+		const captureSignal = vi.fn(async (): Promise<TuneSignal | null> => GOOD_SIGNAL);
+		const { effects, log } = fakeEffects({
+			captureSignal,
+			onAttempt: vi.fn((term: string) => {
+				if (term === "v") { captureSignal.mockImplementation(async () => null); }
+			}),
+		});
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true, identifyMethod: "continuous-cycling" });
+		expect(result.ok).toBe(true);
+		expect(result.restored).toBeFalsy();
+		expect(result.pid.v).toBe(0); // V never got a value — kept its starting value, not discarded entirely
+		expect(log.some((l) => l.includes("V (velocity feed-forward):") && l.includes("Keeping V=0 and continuing"))).toBe(true);
+	});
+
+	it("still fails and restores when P itself can never be measured (capture is fundamentally broken)", async () => {
+		const snapshot: PidConfig = { p: 42, i: 1, d: 2, v: 3, a: 4, warn: null, err: null };
+		const { effects } = fakeEffects({
+			readPid: vi.fn(async () => snapshot),
+			captureSignal: vi.fn(async () => null),
+		});
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
+		expect(result.ok).toBe(false);
+		expect(result.restored).toBe(true);
+		expect(result.pid).toEqual(snapshot);
+	});
+});
+
 describe("runAutoTune — final verification", () => {
 	it("skips the correction pass when the grade is already good", async () => {
 		const evaluateCapture = vi.fn(async () => evaluation({ grade: "excellent", score: 96 }));
@@ -430,6 +606,55 @@ describe("runAutoTune — final verification", () => {
 		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
 		expect(result.ok).toBe(true);
 		expect(result.evaluation).toBeUndefined();
+	});
+});
+
+describe("runAutoTune — method dispatch", () => {
+	it("method 'refine' skips seeding/ramp entirely and runs a single joint-optimisation pass from the starting values", async () => {
+		const startPid: PidConfig = { p: 77, i: 200, d: 0.05, v: 10, a: 1000, warn: null, err: null };
+		const { effects, log } = fakeEffects({ captureSignal: vi.fn(async () => GOOD_SIGNAL) });
+		const result = await runAutoTune(effects, startPid, { cycles: 5, hasAxis: true, method: "refine" });
+		expect(result.ok).toBe(true);
+		expect(log.some((l) => l.includes("Seeding:"))).toBe(false);
+		expect(log.some((l) => l.includes("──── Cycle 2"))).toBe(false); // forced to a single pass
+		expect(log.some((l) => l.includes("Package optimise:"))).toBe(true);
+	});
+
+	it("method 'package' ramps once (cycle 1), then runs exactly one joint-optimisation pass regardless of the cycles setting", async () => {
+		const { effects, log } = fakeEffects();
+		const result = await runAutoTune(effects, basePid(), { cycles: 6, hasAxis: true, method: "package" });
+		expect(result.ok).toBe(true);
+		expect(log.some((l) => l.includes("──── Cycle 1"))).toBe(true);
+		expect(log.some((l) => l.includes("──── Cycle 2"))).toBe(true);
+		expect(log.some((l) => l.includes("──── Cycle 3"))).toBe(false); // capped at ramp (1) + one package pass (2)
+		expect(log.some((l) => l.includes("Package optimise:"))).toBe(true);
+	});
+
+	it("carries cycle 1's model-fit 'no measurable effect' findings into cycle 2's package pass", async () => {
+		// GOOD_SIGNAL never changes with the applied PID, so model-fit's A/V probes both read "no effect" —
+		// exactly the case a real well-damped axis produces for A. Cycle 2's package pass should be told
+		// this instead of re-discovering it from scratch (see optimize.ts's `insensitiveTerms`).
+		const { effects, log } = fakeEffects({ captureSignal: vi.fn(async () => GOOD_SIGNAL) });
+		const result = await runAutoTune(effects, basePid(), { cycles: 6, hasAxis: true, method: "package", identifyMethod: "model-fit" });
+		expect(result.ok).toBe(true);
+		expect(log.some((l) => l.includes("no measurable effect"))).toBe(true); // cycle 1's own finding
+		expect(log.some((l) => l.includes("starting A, V from a smaller step"))).toBe(true); // cycle 2 reused it
+	});
+
+	it("method 'sequential' (the default) never logs a package-optimise pass", async () => {
+		const { effects, log } = fakeEffects();
+		const result = await runAutoTune(effects, basePid(), { cycles: 2, hasAxis: true });
+		expect(result.ok).toBe(true);
+		expect(log.some((l) => l.includes("Package optimise:"))).toBe(false);
+	});
+
+	it("ignores 'method' entirely on an extruder (no axis) — a persisted axis-driver choice can't change extruder cycle counts", async () => {
+		const { effects, log } = fakeEffects();
+		const result = await runAutoTune(effects, basePid(), { cycles: 4, hasAxis: false, method: "refine" });
+		expect(result.ok).toBe(true);
+		expect(effects.captureStep).toHaveBeenCalled();
+		expect(effects.captureSignal).not.toHaveBeenCalled();
+		expect(log.some((l) => l.includes("Package optimise:"))).toBe(false);
 	});
 });
 

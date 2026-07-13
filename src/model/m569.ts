@@ -109,7 +109,12 @@ export interface CaptureVariable {
 	key: string;
 	/** Column header the firmware writes (and the chart/analysis look up). */
 	header: string;
-	axis: "count" | "steps" | "degrees" | "unitless";
+	/** Groups variables sharing a chart y-axis. "error" is its own axis, not lumped in with "steps" — a
+	 * tracking-residual signal (a few steps at most) shares nothing scale-wise with the raw trapezoid
+	 * position (hundreds of steps), and letting them share an axis either zooms the residual out to
+	 * nothing (when the big trapezoid dominates) or the trapezoid off-screen (when the residual is alone
+	 * and Chart.js auto-fits to its own tiny range). */
+	axis: "count" | "steps" | "error" | "degrees" | "unitless";
 	/** Degrees-type values are 0–4095 in the CSV; scale to 0–360 for display. */
 	scaleToDegrees?: boolean;
 }
@@ -118,7 +123,7 @@ export const CAPTURE_VARIABLES: Array<CaptureVariable> = [
 	{ id: 1, key: "encoderReading", header: "Raw Encoder Reading", axis: "count" },
 	{ id: 2, key: "measuredMotorSteps", header: "Measured Motor Steps", axis: "steps" },
 	{ id: 4, key: "targetMotorSteps", header: "Target Motor Steps", axis: "steps" },
-	{ id: 8, key: "currentError", header: "Current Error", axis: "steps" },
+	{ id: 8, key: "currentError", header: "Current Error", axis: "error" },
 	{ id: 16, key: "pidControlSignal", header: "PID Control Signal", axis: "unitless" },
 	{ id: 32, key: "pidPTerm", header: "PID P Term", axis: "unitless" },
 	{ id: 64, key: "pidITerm", header: "PID I Term", axis: "unitless" },

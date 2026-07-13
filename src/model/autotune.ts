@@ -185,9 +185,18 @@ export const V_MAX = 10000;
 export const AV_PLATEAU = 0.05;       // <5% improvement → stop raising (push further before settling)
 export const V_CRUISE_OK = 3;         // |mean P term| in cruise considered ~zero
 export const P_RMS_PLATEAU = 0.05;    // <5% tracking-error improvement → stop raising P
-export const P_NOISE_FLOOR_K = 3;     // moveRms within this × the encoder noise floor → done
-export const P_NOISE_FLOOR_MIN = 0.15; // …with an absolute floor (steps) when restNoise reads ~0
+/**
+ * moveRms within this × the MEASURED encoder noise floor → done. Deliberately no absolute minimum:
+ * the old `P_NOISE_FLOOR_MIN = 0.15` constant manufactured a fake 0.45-step floor on machines whose
+ * real rest noise was ~0.11, accepting P at half the value the same run's own data supported. With
+ * perfect tracking moveRms bottoms out at ≈1× the rest noise, so 1.5× is "close enough to perfect
+ * that raising P further only buys noise amplification".
+ */
+export const P_NOISE_FLOOR_K = 1.5;
 export const D_RING_WORSE = 2;        // ring cycles added vs the previous attempt → D is amplifying noise
+/** A's accel-peak change (vs A=0) below this fraction of the A=0 peak is indistinguishable from
+ * capture noise — accept A=0 rather than whatever value the ramp happened to be on. */
+export const A_NO_EFFECT_FRACTION = 0.1;
 
 const noMove: AutoDecision = { kind: "fail", reason: "No steady-speed move detected — increase the test move length or speed so the axis reaches cruise." };
 
@@ -229,10 +238,10 @@ export const SIGNAL_P_STRATEGY: SignalStrategy = {
 			return { kind: "accept", value: best.value, note: `Tracking error diverging at P=${last.value} — settled on ${best.value}.` };
 		}
 		if (!last.signal.hasMove) { return noMove; }
-		// Tracking error at the encoder noise floor → raising P further only amplifies noise.
-		const floor = P_NOISE_FLOOR_K * Math.max(last.signal.stats.restNoise, P_NOISE_FLOOR_MIN);
-		if (last.signal.stats.moveRms <= floor) {
-			return { kind: "accept", value: last.value, note: `Tracking error ${last.signal.stats.moveRms.toFixed(2)} step rms — at the noise floor.` };
+		// Tracking error at the (measured) encoder noise floor → raising P further only amplifies noise.
+		const floor = P_NOISE_FLOOR_K * last.signal.stats.restNoise;
+		if (floor > 0 && last.signal.stats.moveRms <= floor) {
+			return { kind: "accept", value: last.value, note: `Tracking error ${last.signal.stats.moveRms.toFixed(2)} step rms — at the noise floor (${floor.toFixed(2)}).` };
 		}
 		// Diminishing returns on tracking error → settle on the best attempt.
 		if (attempts.length >= 2) {
@@ -317,6 +326,14 @@ export const SIGNAL_A_STRATEGY: SignalStrategy = {
 			const pp = prev.signal.pTermAccelPeak;
 			const cp = last.signal.pTermAccelPeak;
 			if (pp > 0 && (pp - cp) / pp < AV_PLATEAU) {
+				// Plateau — but before accepting a non-zero A, check A did anything AT ALL relative to the
+				// A=0 baseline. Accepting 50000 because "69 vs 69 plateaued" is a value with zero supporting
+				// evidence; if the whole ramp never moved the accel peak past noise, the honest answer is 0.
+				const baselinePeak = attempts[0].value === 0 ? attempts[0].signal.pTermAccelPeak : null;
+				const bestPeak = Math.min(pp, cp);
+				if (baselinePeak != null && baselinePeak > 0 && (baselinePeak - bestPeak) / baselinePeak < A_NO_EFFECT_FRACTION) {
+					return { kind: "accept", value: 0, note: `A had no measurable effect on this move (accel peak ${baselinePeak.toFixed(0)} → ${bestPeak.toFixed(0)}) — keeping A=0.` };
+				}
 				const best = pp <= cp ? prev : last;
 				return { kind: "accept", value: best.value, note: `Accel P-term peak plateaued (~${cp.toFixed(0)}).` };
 			}
@@ -330,6 +347,13 @@ export const SIGNAL_A_STRATEGY: SignalStrategy = {
 	},
 };
 
+/** Linear interpolation of the V where cruise-P crosses zero, from two attempts that bracket it. */
+export function interpolateVZero(prevValue: number, prevCruise: number, lastValue: number, lastCruise: number): number {
+	const denom = Math.abs(prevCruise) + Math.abs(lastCruise);
+	if (denom <= 0) { return prevValue; }
+	return round(prevValue + ((lastValue - prevValue) * Math.abs(prevCruise)) / denom);
+}
+
 export const SIGNAL_V_STRATEGY: SignalStrategy = {
 	term: "v",
 	label: "V (velocity feed-forward)",
@@ -339,21 +363,34 @@ export const SIGNAL_V_STRATEGY: SignalStrategy = {
 		const last = attempts[attempts.length - 1];
 		if (signalUnstable(last.signal)) { return backOff(attempts, "V", 0); }
 		if (!last.signal.hasMove) { return noMove; }
-		const cmAbs = Math.abs(last.signal.pTermCruiseMean);
+		const cm = last.signal.pTermCruiseMean;
+		const cmAbs = Math.abs(cm);
 		if (cmAbs <= V_CRUISE_OK) {
-			return { kind: "accept", value: last.value, note: `Steady-speed P-term ~0 (${last.signal.pTermCruiseMean.toFixed(1)}).` };
+			return { kind: "accept", value: last.value, note: `Steady-speed P-term ~0 (${cm.toFixed(1)}).` };
+		}
+		// Sign flip between consecutive attempts = the zero crossing was just bracketed — the optimum is
+		// the interpolated crossing, NOT further up the ramp. Without this the ramp is sign-blind: a real
+		// run watched cruise-P go +13.5 → −9.7 → −46 → −109 → −203 while |cruise-P| kept it multiplying
+		// ×1.6 all the way to V_MAX (the "stupidly big V" bug, in its purest form).
+		if (attempts.length >= 2) {
+			const prev = attempts[attempts.length - 2];
+			const pcm = prev.signal.pTermCruiseMean;
+			if (pcm !== 0 && cm !== 0 && Math.sign(pcm) !== Math.sign(cm)) {
+				const v = interpolateVZero(prev.value, pcm, last.value, cm);
+				return { kind: "accept", value: v, note: `Cruise P-term crossed zero (${pcm.toFixed(1)} at V=${prev.value} → ${cm.toFixed(1)} at V=${last.value}) — interpolated V=${v}.` };
+			}
 		}
 		// Only honour a "plateau" once the cruise lag is already small. V reduces the lag monotonically,
 		// so two equal-but-large noisy readings early on must NOT stop the ramp — keep raising V until
-		// it's near zero or capped.
+		// it's near zero, crosses zero, or is capped.
 		if (attempts.length >= 2 && cmAbs <= V_CRUISE_OK * 4) {
 			const pm = Math.abs(attempts[attempts.length - 2].signal.pTermCruiseMean);
 			if (pm > 0 && (pm - cmAbs) / pm < AV_PLATEAU) {
-				return { kind: "accept", value: bestBy(attempts, (s) => Math.abs(s.pTermCruiseMean)).value, note: `Steady-speed P-term plateaued (~${last.signal.pTermCruiseMean.toFixed(1)}).` };
+				return { kind: "accept", value: bestBy(attempts, (s) => Math.abs(s.pTermCruiseMean)).value, note: `Steady-speed P-term plateaued (~${cm.toFixed(1)}).` };
 			}
 		}
 		const next = round(last.value <= 0 ? 100 : last.value * 1.6);
-		if (next > V_MAX) { return { kind: "accept", value: last.value, note: `Reached the V limit (${V_MAX}).` }; }
+		if (next > V_MAX) { return { kind: "accept", value: bestBy(attempts, (s) => Math.abs(s.pTermCruiseMean)).value, note: `Next step would exceed the V limit (${V_MAX}) — settled on the attempt with the smallest cruise P-term.` }; }
 		if (attempts.length >= this.maxAttempts) {
 			return { kind: "accept", value: bestBy(attempts, (s) => Math.abs(s.pTermCruiseMean)).value, note: "Max attempts reached." };
 		}
@@ -361,7 +398,12 @@ export const SIGNAL_V_STRATEGY: SignalStrategy = {
 	},
 };
 
-/** Signal-based auto-tune sequence for drivers with an axis: P → D → I → A → V. */
+/**
+ * Signal-based auto-tune sequence for drivers with an axis: P → A → V → D → I, matching the Duet 1HCL
+ * tuning guide's order. Feed-forward (A/V) is tuned right after P and before D/I so the damping and
+ * integral terms are judged against the error that's left *after* feed-forward removes what it can —
+ * not against error that A/V will later make disappear out from under them.
+ */
 export const AUTOTUNE_SIGNAL_SEQUENCE: Array<SignalStrategy> = [
-	SIGNAL_P_STRATEGY, SIGNAL_D_STRATEGY, SIGNAL_I_STRATEGY, SIGNAL_A_STRATEGY, SIGNAL_V_STRATEGY,
+	SIGNAL_P_STRATEGY, SIGNAL_A_STRATEGY, SIGNAL_V_STRATEGY, SIGNAL_D_STRATEGY, SIGNAL_I_STRATEGY,
 ];

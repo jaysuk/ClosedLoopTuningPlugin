@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
 	D_STRATEGY, I_STRATEGY, P_STRATEGY, SIGNAL_A_STRATEGY, SIGNAL_D_STRATEGY, SIGNAL_I_STRATEGY,
-	SIGNAL_P_STRATEGY, SIGNAL_V_STRATEGY, describeMetrics, type Attempt, type SignalAttempt,
+	SIGNAL_P_STRATEGY, SIGNAL_V_STRATEGY, describeMetrics, interpolateVZero, type Attempt, type SignalAttempt,
 } from "../model/autotune";
 import type { StepMetrics } from "../model/analysis";
 import type { TuneSignal } from "../model/signal";
@@ -89,7 +89,7 @@ describe("describeMetrics", () => {
 
 function stats(over: Partial<TuneStats>): TuneStats {
 	return {
-		restBias: 0, restNoise: 0.05, restRing: 0, settleOvershoot: 0, cruiseLag: 0,
+		restBias: 0, restNoise: 0.05, restRing: 0, settleOvershoot: 0, cruiseLag: 0, cruiseSpread: 0,
 		accelPeak: 0, movePeak: 5, moveRms: 1, cruiseSamples: 10, restSamples: 10, moved: true,
 		...over,
 	};
@@ -99,7 +99,7 @@ function sig(over: Partial<TuneSignal> & { stats?: Partial<TuneStats> } = {}): T
 	return {
 		stats: stats(statsOver ?? {}),
 		pTermAccelPeak: 0, pTermCruiseMean: 0, pTermSatDuty: 0, postMoveOsc: 0,
-		oscPeriod: null, itae: 0, hasMove: true,
+		oscPeriod: null, oscAmplitude: 0, itae: 0, hasMove: true,
 		...rest,
 	};
 }
@@ -117,10 +117,14 @@ describe("SIGNAL_P_STRATEGY", () => {
 		expect(d.kind).toBe("set");
 		if (d.kind === "set") expect(d.value).toBeGreaterThan(50);
 	});
-	it("accepts once tracking error is at the encoder noise floor", () => {
-		const d = SIGNAL_P_STRATEGY.decide([sat(150, sig({ stats: { moveRms: 0.1, restNoise: 0.05 } }))]);
+	it("accepts once tracking error is at the MEASURED encoder noise floor (1.5× restNoise, no absolute minimum)", () => {
+		const d = SIGNAL_P_STRATEGY.decide([sat(150, sig({ stats: { moveRms: 0.07, restNoise: 0.05 } }))]);
 		expect(d.kind).toBe("accept");
 		if (d.kind === "accept") expect(d.value).toBe(150);
+	});
+	it("does NOT accept on the old fake 0.45 floor: rms 0.36 with restNoise 0.11 keeps ramping (the field bug that stopped P at 137.5)", () => {
+		const d = SIGNAL_P_STRATEGY.decide([sat(137.5, sig({ stats: { moveRms: 0.36, restNoise: 0.11 } }))]);
+		expect(d.kind).toBe("set"); // real floor is 1.5×0.11 = 0.165 — 0.36 is nowhere near it
 	});
 	it("accepts when tracking error plateaus", () => {
 		const d = SIGNAL_P_STRATEGY.decide([
@@ -255,5 +259,50 @@ describe("SIGNAL_V_STRATEGY (velocity feed-forward)", () => {
 		]);
 		expect(d.kind).toBe("accept");
 		if (d.kind === "accept") expect(d.value).toBe(160);
+	});
+	it("regression (field run 2026-07-04): stops at the sign flip and interpolates instead of ramping to V_MAX", () => {
+		// Real readings: cruise-P +13.5 at V=1048.58, then −9.7 at V=1677.73. The sign-blind ramp kept
+		// multiplying ×1.6 to 6872; the right answer is the interpolated crossing ≈ 1415.
+		const d = SIGNAL_V_STRATEGY.decide([
+			sat(1048.58, sig({ pTermCruiseMean: 13.5 })),
+			sat(1677.73, sig({ pTermCruiseMean: -9.7 })),
+		]);
+		expect(d.kind).toBe("accept");
+		if (d.kind === "accept") {
+			expect(d.value).toBeGreaterThan(1350);
+			expect(d.value).toBeLessThan(1480);
+		}
+	});
+	it("interpolateVZero solves the crossing of the field data to ~1415", () => {
+		expect(interpolateVZero(1048.58, 13.5, 1677.73, -9.7)).toBeCloseTo(1415, -1);
+	});
+	it("a sign flip beats the ~0 shortcut only when |cruise-P| is still above V_CRUISE_OK", () => {
+		// Second reading −2 is within V_CRUISE_OK → plain accept of that value, no interpolation needed.
+		const d = SIGNAL_V_STRATEGY.decide([
+			sat(1000, sig({ pTermCruiseMean: 10 })),
+			sat(1600, sig({ pTermCruiseMean: -2 })),
+		]);
+		expect(d.kind).toBe("accept");
+		if (d.kind === "accept") expect(d.value).toBe(1600);
+	});
+});
+
+describe("SIGNAL_A_STRATEGY — no-measurable-effect regression (field run 2026-07-04)", () => {
+	it("accepts 0, not the ramp value, when A changed nothing vs the A=0 baseline (69 vs ~69)", () => {
+		const d = SIGNAL_A_STRATEGY.decide([
+			sat(0, sig({ pTermAccelPeak: 69 })),
+			sat(50000, sig({ pTermAccelPeak: 69 })),
+		]);
+		expect(d.kind).toBe("accept");
+		if (d.kind === "accept") expect(d.value).toBe(0);
+	});
+	it("still accepts a genuinely-working A at the plateau", () => {
+		const d = SIGNAL_A_STRATEGY.decide([
+			sat(0, sig({ pTermAccelPeak: 200 })),
+			sat(50000, sig({ pTermAccelPeak: 100 })),
+			sat(75000, sig({ pTermAccelPeak: 97 })),
+		]);
+		expect(d.kind).toBe("accept");
+		if (d.kind === "accept") expect(d.value).toBeGreaterThan(0);
 	});
 });

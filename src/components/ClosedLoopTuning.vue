@@ -10,7 +10,8 @@
 		</v-alert>
 
 		<v-alert v-if="drivers.length === 0" type="warning" variant="tonal" density="compact" class="mb-3">
-			No closed-loop drivers found. Connect a Duet 3 board with a 1HCL / M23CL configured for an axis or extruder.
+			No closed-loop drivers found. Connect a board with closed-loop support (a Duet 3 1HCL / M23CL, or any
+			other RRF board reporting closed-loop driver telemetry) configured for an axis or extruder.
 		</v-alert>
 
 		<v-alert type="warning" variant="tonal" density="compact" class="mb-3" icon="mdi-axis-arrow">
@@ -52,7 +53,7 @@
 				<v-card flat>
 					<div class="text-body-2 mb-3">
 						Pick the closed-loop driver you want to tune. Tuning moves only this driver, so re-home the axis afterwards.
-						<HelpTip text="The list shows every axis/extruder driver on a board that reports closed-loop support (a 1HCL or M23CL). Only one driver can be tuned at a time." />
+						<HelpTip text="The list shows every axis/extruder driver on a board that reports closed-loop support (a Duet 1HCL / M23CL, or any other RRF board exposing closed-loop driver telemetry). Only one driver can be tuned at a time." />
 					</div>
 					<v-select v-model="selectedDriver" :items="drivers" item-title="name" item-value="value"
 							  density="compact" variant="outlined" hide-details label="Closed-loop driver" style="max-width: 480px" />
@@ -141,10 +142,11 @@
 				<v-card flat>
 					<div class="text-body-2 mb-3">
 						Calibrate the encoder (Step 3), set the motor current to its final value, and uncouple the
-						motor (see the note above). Then run <strong>Auto-tune</strong>: it switches to closed loop and
-						tunes P, D and I from step jumps (repeated for the chosen number of cycles), then A and V from a
-						short move. Manual term-by-term tuning is available below.
-						<HelpTip :href="DOCS.tuning" text="Auto-tune ensures closed loop, then cycles P (rise time) → D (overshoot) → I (steady-state error) from step jumps, then A → V from a G1 move. It captures after every change, converges when the response stops improving, and backs off on oscillation. It does NOT calibrate — do that in Step 3 first." />
+						motor (see the note above). Then run <strong>Auto-tune</strong>: on an axis it tunes
+						P → A → V → D → I (the Duet-documented order) from repeated trapezoid-move captures, refining
+						every term together over the chosen number of cycles. Extruders (no axis) tune P → D → I from
+						step jumps instead — A/V need an axis. Manual term-by-term tuning is available below.
+						<HelpTip :href="DOCS.tuning" text="Auto-tune ensures closed loop, then on an axis cycles P (tracking error) → A (accel feed-forward) → V (velocity feed-forward) → D (overshoot) → I (steady-state error) from a trapezoid move. It captures after every change, converges when the response stops improving, refines every term again each cycle, and backs off on oscillation. It does NOT calibrate — do that in Step 3 first." />
 					</div>
 
 					<!-- Auto-tune -->
@@ -152,12 +154,23 @@
 						<v-card-text>
 							<div class="d-flex align-center flex-wrap ga-2">
 								<v-btn color="primary" :disabled="!selectedDriver || autoRunning || recording" :loading="autoRunning" prepend-icon="mdi-auto-fix" @click="startAutoTune">
-									Auto-tune (P → D → I → A → V)
+									Auto-tune ({{ hasAxisSelected ? "P → A → V → D → I" : "P → D → I" }})
 								</v-btn>
 								<v-btn v-if="autoRunning" color="error" variant="tonal" prepend-icon="mdi-stop" @click="abortAutoTune">Abort</v-btn>
-								<HelpTip :href="DOCS.tuning" text="Fully automatic and bounded. P/D/I use step jumps; A/V use a back-and-forth move along the axis (skipped for extruders). Keep an emergency stop handy the first time." />
+								<HelpTip :href="DOCS.tuning" text="Fully automatic and bounded. On an axis, every term is tuned (and later refined) from the same trapezoid-move capture; extruders (no axis) use step jumps for P/D/I only — A/V are skipped. Keep an emergency stop handy the first time." />
 								<v-spacer />
 								<span class="text-caption text-medium-emphasis">{{ autoStatus }}</span>
+							</div>
+							<div class="d-flex align-center flex-wrap ga-3 mt-2">
+								<span class="text-caption text-medium-emphasis">Tuning method:</span>
+								<v-btn-toggle v-model="tuneMethod" mandatory density="compact" color="primary" divided :disabled="!hasAxisSelected">
+									<v-btn v-for="m in TUNE_METHODS" :key="m.value" :value="m.value" size="small">{{ m.label }}</v-btn>
+								</v-btn-toggle>
+								<span class="text-caption text-medium-emphasis">≈ {{ estimatedMoves }} moves</span>
+								<HelpTip text="Standard tunes each term in Duet's order, then refines every term again each cycle. Thorough adds a joint (all-terms-at-once) optimisation pass judged on the whole capture, not one term's own metric — closer to how the original tuner's author recommends tuning as a complete package, at the cost of more moves. Refine skips straight to that joint pass from whatever's on the driver now. Extruders (no axis) always use the standard P→D→I ramp." />
+							</div>
+							<div v-if="hasAxisSelected && tuneMethod !== 'sequential'" class="text-caption text-medium-emphasis mt-1">
+								{{ tuneMethod === "refine" ? "Cycles is ignored — this runs a single joint-optimisation pass." : "Cycles only affects the initial ramp's refinement; the joint-optimisation pass always runs once." }}
 							</div>
 							<div v-if="autoRunning || tuneSession" class="d-flex flex-wrap ga-1 mt-2">
 								<v-chip v-for="s in STAGE_ORDER" :key="s.id" size="small"
@@ -171,19 +184,45 @@
 										:variant="autoRunning && wizardStep.term === t.term ? 'flat' : 'tonal'">{{ t.term.toUpperCase() }} = {{ t.value }}</v-chip>
 							</div>
 							<div class="d-flex align-center flex-wrap ga-3 mt-2">
-								<v-text-field v-model.number="cycles" type="number" :min="1" :max="10" label="Cycles" density="compact" variant="outlined" hide-details style="max-width: 120px"><template #append-inner><HelpTip text="How many times to iterate the P→D→I tuning. Each pass re-tunes every term with the others in place, so they converge together. 3 is a good default. A/V are tuned once at the end." /></template></v-text-field>
+								<v-text-field v-model.number="cycles" type="number" :min="1" :max="10" label="Cycles" density="compact" variant="outlined" hide-details style="max-width: 120px"><template #append-inner><HelpTip text="How many times to iterate the P→A→V→D→I tuning. Cycle 1 tunes every term from scratch; each cycle after that refines every term again (up or down) against the whole capture. 3 is a good default." /></template></v-text-field>
 								<span class="text-caption text-medium-emphasis">A/V test move:</span>
-								<v-text-field v-model.number="avDistance" type="number" label="Distance (mm)" density="compact" variant="outlined" hide-details style="max-width: 150px"><template #append-inner><HelpTip text="Length of the back-and-forth move used to tune A and V — long enough to reach steady speed. Default 50 mm." /></template></v-text-field>
+								<v-text-field v-model.number="avDistance" type="number" :min="0" label="Distance (mm) — 0 = auto" density="compact" variant="outlined" hide-details style="max-width: 170px"><template #append-inner><HelpTip text="Length of the tuning move, centred on the middle of the axis's travel. 0 (default) uses the longest reasonable move that fits — longer moves give a longer cruise section and tune more reliably. Set a specific value to override." /></template></v-text-field>
 								<v-text-field v-model.number="avFeed" type="number" label="Feed (mm/min)" density="compact" variant="outlined" hide-details style="max-width: 160px"><template #append-inner><HelpTip text="Speed of the A/V test move. Higher exercises the feed-forward terms more. Default 6000 mm/min (100 mm/s)." /></template></v-text-field>
 								<v-text-field v-model.number="marginMm" type="number" :min="0" label="Safety margin (mm)" density="compact" variant="outlined" hide-details style="max-width: 170px"><template #append-inner><HelpTip text="Kept clear of the axis's min/max limits. Tuning moves are auto-clamped inside this margin, and (if needed) the axis is centred in its travel before tuning starts. Only enforced on a homed axis." /></template></v-text-field>
 							</div>
 							<div v-if="axisTravelInfo" class="text-caption text-medium-emphasis mt-1">{{ axisTravelInfo }}</div>
+							<v-expansion-panels class="mt-2" variant="accordion">
+								<v-expansion-panel>
+									<v-expansion-panel-title>Advanced tuning options</v-expansion-panel-title>
+									<v-expansion-panel-text>
+										<div class="d-flex align-center flex-wrap ga-3">
+											<span class="text-caption text-medium-emphasis">Identification method:</span>
+											<v-btn-toggle v-model="identifyMethod" mandatory density="compact" color="primary" divided :disabled="!hasAxisSelected">
+												<v-btn v-for="m in IDENTIFY_METHODS" :key="m.value" :value="m.value" size="small">{{ m.label }}</v-btn>
+											</v-btn-toggle>
+											<HelpTip text="Model fit (default): ramps P toward the actuator's own effort rail (not toward an oscillation — some axes are too well-damped to ever produce one below saturation) and backs off a fixed fraction, then solves A and V directly from two captures each. Continuous cycling (classic Ziegler–Nichols): ramp P until a clean sustained oscillation appears — can fail outright on a well-damped axis. Relay feedback (Åström–Hägglund): jump straight to a fixed high P so the P-term saturates like a bounded on/off relay, then read Ku/Tu off that limit cycle directly." />
+										</div>
+										<div class="d-flex align-center flex-wrap ga-3 mt-3">
+											<v-text-field v-if="identifyMethod === 'model-fit'" v-model.number="modelFitBackoff" type="number" step="0.05" :min="0.3" :max="0.9" label="P backoff fraction" density="compact" variant="outlined" hide-details style="max-width: 170px"><template #append-inner><HelpTip text="Fraction of the effort-rail-onset P used as the final P. Lower is quieter/safer, higher is faster/more aggressive. Default 0.65." /></template></v-text-field>
+											<v-select v-if="identifyMethod !== 'model-fit'" v-model="seedRule" :items="SEED_RULES" item-title="title" item-value="value"
+													  :disabled="!hasAxisSelected" density="compact" variant="outlined" hide-details
+													  label="Ku/Tu seed rule" style="max-width: 280px">
+												<template #append-inner><HelpTip text="Classical rule used to turn the identified Ku/Tu into starting P/I/D at the start of cycle 1 (axis drivers only). Tyreus–Luyben is the conservative default; zn-classic is Ziegler-Nichols' own gain formula." /></template>
+											</v-select>
+											<v-text-field v-if="identifyMethod !== 'model-fit' && seedRule === 'amigo'" v-model.number="seedLambda" type="number" step="0.1" label="λ (aggressiveness)" density="compact" variant="outlined" hide-details style="max-width: 160px"><template #append-inner><HelpTip text="Scales the AMIGO seed rule: >1 pushes the seeded gains hotter/faster, <1 backs them off. 1 = unscaled." /></template></v-text-field>
+											<v-text-field v-model.number="medianOf" type="number" :min="1" :max="5" label="Captures per decision" density="compact" variant="outlined" hide-details style="max-width: 190px"><template #append-inner><HelpTip text="How many captures to median-combine before each decision. Higher rejects one-off glitches better but takes longer to run. 1 is the default; try 3 for a noisy encoder or a Thorough/Refine run." /></template></v-text-field>
+											<v-text-field v-if="tuneMethod !== 'sequential'" v-model.number="captureBudget" type="number" :min="10" :max="200" label="Optimise capture budget" density="compact" variant="outlined" hide-details style="max-width: 200px"><template #append-inner><HelpTip text="Maximum captures the joint (package/refine) optimisation pass may spend before stopping with its best result so far. Default 40." /></template></v-text-field>
+										</div>
+									</v-expansion-panel-text>
+								</v-expansion-panel>
+							</v-expansion-panels>
 							<div v-if="autoLog.length" ref="autoLogEl" class="cl-autolog mt-2">
 								<div v-for="(line, idx) in autoLog" :key="idx">{{ line }}</div>
 							</div>
 							<div v-if="tuneSession && !autoRunning" class="d-flex align-center ga-2 mt-2">
 								<v-btn size="small" variant="tonal" prepend-icon="mdi-download" @click="downloadTuningReport">Download results</v-btn>
-								<HelpTip text="Saves the full auto-tune session — log, final values and every capture — as one JSON file (machine host details scrubbed). Send it over if a result looks wrong and it can be analysed." />
+								<HelpTip text="Saves the auto-tune session — log, final values, options used and every capture's metrics — as one JSON file (machine host details scrubbed). Full raw CSV is kept for notable (unstable) captures and the last capture of each term; check 'include all raw CSVs' to attach every one instead. Send it over if a result looks wrong and it can be analysed." />
+								<v-checkbox v-model="includeAllCsv" label="Include all raw CSVs" density="compact" hide-details />
 								<span class="text-caption text-medium-emphasis">{{ tuneSession.captures.length }} captures</span>
 							</div>
 						</v-card-text>
@@ -456,7 +495,12 @@ import {
 } from "../model/limits";
 import { WIZARD_STEPS, type Recommendation } from "../model/wizard";
 import { computeTuneSignal, type TuneSignal } from "../model/signal";
-import { runAutoTune as runAutoTuneCore, type AutoRunResult, type StageId, type StageState, type TuneEffects } from "../model/autorun";
+import {
+	runAutoTune as runAutoTuneCore,
+	type AutoRunOptions, type AutoRunResult, type IdentifyMethod, type SeedRule, type StageId, type StageState,
+	type TuneEffects, type TuneMethod,
+} from "../model/autorun";
+import { downsampleCapture, shapeCapturesForDownload, slimModelForReport, type ReportCapture } from "../model/report";
 import { applying, applyUpdateNow, checking, dismissCurrentUpdate, pendingReload, runUpdateCheck, setUpdateChecksEnabled, updateChecksEnabled, updateState } from "../model/updateCheck";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -480,8 +524,14 @@ interface SavedState {
 	step?: number; wizardIndex?: number; selectedDriver?: string | null; currentMode?: LoopMode | null;
 	encoderType?: EncoderType; modeD?: Partial<typeof DEFAULT_MODE_D>; pid?: Partial<PidConfig>;
 	samples?: number; sampleRate?: number; moveMode?: "step" | "custom"; customMove?: string;
-	recordKeys?: Array<string>; viewKeys?: Array<string>; avDistance?: number; avFeed?: number; cycles?: number;
+	recordKeys?: Array<string>; viewKeys?: Array<string>; avFeed?: number; cycles?: number;
 	marginMm?: number;
+	/** Tuning move distance, mm; 0/undefined = auto (longest reasonable). New key (not `avDistance`) so
+	 * an existing session's persisted 50 mm default doesn't silently keep overriding the new auto mode. */
+	tuneDistanceMm?: number;
+	tuneMethod?: TuneMethod; identifyMethod?: IdentifyMethod; modelFitBackoff?: number;
+	seedRule?: SeedRule; seedLambda?: number; medianOf?: number; captureBudget?: number;
+	includeAllCsv?: boolean;
 }
 function loadState(): SavedState {
 	try { return JSON.parse(localStorage.getItem(LS_STATE) ?? "{}") as SavedState; } catch { return {}; }
@@ -523,7 +573,10 @@ function persistState(): void {
 				currentMode: currentMode.value, encoderType: encoderType.value, modeD: { ...modeD }, pid: { ...pid },
 				samples: samples.value, sampleRate: sampleRate.value, moveMode: moveMode.value,
 				customMove: customMove.value, recordKeys: recordKeys.value, viewKeys: viewKeys.value,
-				avDistance: avDistance.value, avFeed: avFeed.value, cycles: cycles.value, marginMm: marginMm.value,
+				tuneDistanceMm: avDistance.value, avFeed: avFeed.value, cycles: cycles.value, marginMm: marginMm.value,
+				tuneMethod: tuneMethod.value, identifyMethod: identifyMethod.value, modelFitBackoff: modelFitBackoff.value,
+				seedRule: seedRule.value, seedLambda: seedLambda.value, medianOf: medianOf.value,
+				captureBudget: captureBudget.value, includeAllCsv: includeAllCsv.value,
 			} satisfies SavedState));
 		} catch { /* storage unavailable */ }
 	}, 300);
@@ -537,13 +590,19 @@ const autoCancel = ref(false);
 const autoStatus = ref("");
 const autoLog = ref<Array<string>>([]);
 
-// Stage-status timeline: preflight → P → D → I → A → V → verify (P–V repeat every cycle).
-const STAGE_ORDER: Array<{ id: StageId; label: string }> = [
-	{ id: "preflight", label: "Preflight" }, { id: "p", label: "P" }, { id: "d", label: "D" },
-	{ id: "i", label: "I" }, { id: "a", label: "A" }, { id: "v", label: "V" }, { id: "verify", label: "Verify" },
-];
-const stageStates = reactive<Record<StageId, StageState>>({ preflight: "pending", p: "pending", d: "pending", i: "pending", a: "pending", v: "pending", verify: "pending" });
-function resetStageStates(): void { for (const s of STAGE_ORDER) { stageStates[s.id] = "pending"; } }
+// Stage-status timeline: preflight → P → A → V → D → I → [optimize] → verify (P–I repeat every cycle;
+// "optimize" only fires for the package/refine methods, so it's only shown then).
+const STAGE_ORDER = computed<Array<{ id: StageId; label: string }>>(() => {
+	const order: Array<{ id: StageId; label: string }> = [
+		{ id: "preflight", label: "Preflight" }, { id: "p", label: "P" }, { id: "a", label: "A" },
+		{ id: "v", label: "V" }, { id: "d", label: "D" }, { id: "i", label: "I" },
+	];
+	if (tuneMethod.value !== "sequential") { order.push({ id: "optimize", label: "Optimise" }); }
+	order.push({ id: "verify", label: "Verify" });
+	return order;
+});
+const stageStates = reactive<Record<StageId, StageState>>({ preflight: "pending", p: "pending", d: "pending", i: "pending", a: "pending", v: "pending", optimize: "pending", verify: "pending" });
+function resetStageStates(): void { for (const id of Object.keys(stageStates) as Array<StageId>) { stageStates[id] = "pending"; } }
 function stageColor(state: StageState): string | undefined {
 	switch (state) {
 		case "running": return "primary";
@@ -560,11 +619,47 @@ function stageIcon(state: StageState): string {
 		default: return "mdi-circle-outline";
 	}
 }
-const avDistance = ref(saved.avDistance ?? 50);   // mm — A/V test move length
+const avDistance = ref(saved.tuneDistanceMm ?? 0); // mm — tuning move length; 0 = auto (longest reasonable)
 const avFeed = ref(saved.avFeed ?? 6000);          // mm/min — A/V test move feedrate
-const cycles = ref(saved.cycles ?? 3);             // how many times to iterate P→D→I
+const cycles = ref(saved.cycles ?? 3);             // how many times to iterate P→A→V→D→I
 const marginMm = ref(saved.marginMm ?? DEFAULT_MARGIN_MM); // mm — kept clear of each travel limit
-watch([avDistance, avFeed, cycles, marginMm], persistState);
+
+// Tuning method (axis drivers only — extruders always use "sequential") + its advanced options.
+const TUNE_METHODS: Array<{ value: TuneMethod; label: string; subtitle: string }> = [
+	{ value: "sequential", label: "Standard", subtitle: "Duet order (P→A→V→D→I), then refine every term each cycle." },
+	{ value: "package", label: "Thorough", subtitle: "Standard first pass, then jointly optimise every term together under a capture budget." },
+	{ value: "refine", label: "Refine", subtitle: "Jointly optimise from whatever's on the driver now — no reset, no from-scratch ramp." },
+];
+const tuneMethod = ref<TuneMethod>(saved.tuneMethod ?? "sequential");
+const IDENTIFY_METHODS: Array<{ value: IdentifyMethod; label: string }> = [
+	{ value: "model-fit", label: "Model fit" },
+	{ value: "continuous-cycling", label: "Continuous cycling" },
+	{ value: "relay", label: "Relay feedback" },
+];
+const identifyMethod = ref<IdentifyMethod>(saved.identifyMethod ?? "model-fit");
+const modelFitBackoff = ref(saved.modelFitBackoff ?? 0.65); // fraction of the effort-rail-onset P used as P*
+const SEED_RULES: Array<{ value: SeedRule; title: string }> = [
+	{ value: "tyreus-luyben", title: "Tyreus–Luyben (conservative, default)" },
+	{ value: "zn-classic", title: "Ziegler–Nichols (classic)" },
+	{ value: "amigo", title: "AMIGO-scaled (λ below)" },
+];
+const seedRule = ref<SeedRule>(saved.seedRule ?? "tyreus-luyben");
+const seedLambda = ref(saved.seedLambda ?? 1);       // aggressiveness for the "amigo" seed rule
+const medianOf = ref(saved.medianOf ?? 1);           // captures per decision, median-combined
+const captureBudget = ref(saved.captureBudget ?? 40); // extra captures for the package/refine joint optimiser
+const includeAllCsv = ref(saved.includeAllCsv ?? false); // download every capture's raw CSV, not just the notable/last-per-phase ones
+watch([avDistance, avFeed, cycles, marginMm, tuneMethod, identifyMethod, modelFitBackoff, seedRule, seedLambda, medianOf, captureBudget, includeAllCsv], persistState);
+
+/** Rough move-count estimate shown next to the method select, so the cost of "Thorough" is visible upfront. */
+const estimatedMoves = computed(() => {
+	const perRampCycle = 5 * 6;   // 5 terms × ~6 captures (ramp + verify) for a from-scratch cycle
+	const perRefineCycle = 5 * 3; // 5 terms × ~3 captures (up/down probe + verify) for a refinement cycle
+	switch (tuneMethod.value) {
+		case "refine": return captureBudget.value;
+		case "package": return perRampCycle + captureBudget.value;
+		default: return perRampCycle + Math.max(0, cycles.value - 1) * perRefineCycle;
+	}
+});
 
 const confirmOpen = ref(false);
 const confirmCommand = ref("");
@@ -604,7 +699,12 @@ function goToManualTerm(term: Term): void {
 watch(() => autoLog.value.length, () => { void nextTick(() => { const el = autoLogEl.value; if (el) { el.scrollTop = el.scrollHeight; } }); });
 
 // --- Auto-tune session capture (for the downloadable results report) ---
-interface SessionCapture { phase: string; value?: number; metrics?: unknown; csv: string }
+// A run makes 30-60+ captures; storing the full raw CSV for every one of them made the report several
+// MB. Each capture now always carries a compact downsampled error series + its metrics, and only keeps
+// its full CSV when `shapeCapturesForDownload` decides it's worth it (see report.ts) — the raw text is
+// still HELD in memory for the whole session so "include all raw CSVs" can restore it on demand.
+interface SessionCapture extends ReportCapture { /* seq/phase/value/metrics/series/csv/notable — see report.ts */ }
+interface StageEvent { stage: StageId; state: StageState; at: string }
 interface TuneSession {
 	startedAt: string; finishedAt?: string; driver: string | null; mode: LoopMode | null;
 	encoderType: EncoderType; cycles: number; finalPid?: PidConfig; log: Array<string>;
@@ -615,17 +715,39 @@ interface TuneSession {
 	preflightActions?: Array<string>;
 	/** True if the run failed/was cancelled and the pre-run PID snapshot was restored. */
 	restored?: boolean;
+	/** Tuning method actually used ("sequential" always, for extruders regardless of the UI selection). */
+	method?: TuneMethod;
+	/** The full option set the run was started with — method, order, medianOf, budget, seed rule. */
+	optionsUsed?: AutoRunOptions;
+	/** Stage transitions with timestamps, for reconstructing the run's timeline from the report alone. */
+	stageTimeline: Array<StageEvent>;
+	reportVersion: number;
 }
+const REPORT_VERSION = 2;
 const tuneSession = ref<TuneSession | null>(null);
+/** Instability threshold shared with signal.ts's SAT_DUTY_LIMIT — both TuneSignal and StepMetrics carry this field. */
+const REPORT_NOTABLE_SAT_DUTY = 0.12;
+let sessionSeq = 0;
+/** Uncapped session log (the report's own copy) — `autoLog` stays capped at 40 lines for display only. */
+let sessionLog: Array<string> = [];
 function recordSessionCapture(phase: string, value: number | undefined, metrics: unknown): void {
-	if (tuneSession.value && rawText.value) {
-		tuneSession.value.captures.push({ phase, value, metrics, csv: rawText.value });
-	}
+	if (!tuneSession.value || !rawText.value) { return; }
+	const series = capture.value ? (downsampleCapture(capture.value, sampleRate.value) ?? undefined) : undefined;
+	const m = metrics as { pTermSatDuty?: number } | null;
+	const notable = !!(m && typeof m.pTermSatDuty === "number" && m.pTermSatDuty >= REPORT_NOTABLE_SAT_DUTY);
+	tuneSession.value.captures.push({ seq: sessionSeq++, phase, value, metrics, series, csv: rawText.value, notable });
 }
 function downloadTuningReport(): void {
 	if (!tuneSession.value) { return; }
 	const version = ((machineStore.model as any)?.plugins?.get?.("ClosedLoopTuning")?.version) ?? "unknown";
-	const report = buildReport({ pluginId: PLUGIN_ID, pluginVersion: version, model: machineStore.model, state: tuneSession.value, note: "Closed Loop auto-tune session (log + every capture)" });
+	const axisObj = axisForDriver();
+	const model = slimModelForReport(
+		selectedBoard.value ? { firmwareName: selectedBoard.value.firmwareName, firmwareVersion: selectedBoard.value.firmwareVersion, canAddress: selectedBoard.value.canAddress, closedLoop: selectedBoard.value.closedLoop } : null,
+		(machineStore.model as any).move?.kinematics?.name,
+		axisObj ? { letter: axisObj.letter, min: axisObj.min, max: axisObj.max, stepsPerMm: axisObj.stepsPerMm, microstepping: axisObj.microstepping, homed: axisObj.homed } : null,
+	);
+	const state: TuneSession = { ...tuneSession.value, captures: shapeCapturesForDownload(tuneSession.value.captures, includeAllCsv.value) };
+	const report = buildReport({ pluginId: PLUGIN_ID, pluginVersion: version, model, state, note: "Closed Loop auto-tune session (log + capture summaries; full CSV kept for notable/final captures unless \"include all\" was checked)" });
 	downloadReport(report, `closed-loop-tuning-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
 }
 
@@ -650,19 +772,32 @@ interface DriverEntry { name: string; value: string }
 const drivers = computed<Array<DriverEntry>>(() => {
 	const model = machineStore.model as any;
 	const boards = model.boards ?? [];
-	const hasCl = (boardAddr: string) => boards.some((b: any) => b && b.canAddress === parseInt(boardAddr) && b.closedLoop != null);
+	// Closed-loop support shows up in the object model two different ways (@duet3d/objectmodel):
+	//  - `board.closedLoop` ({ points, runs }) — an aggregate Duet3D's own 1HCL/M23CL firmware populates,
+	//    and the same field this plugin's capture-completion detection watches (see `record()`/`waitForRuns`).
+	//  - `board.drivers[i].closedLoop` ({ currentFraction, positionError }) — generic per-driver closed-
+	//    loop telemetry that ANY RRF board running closed-loop control populates, Duet or third-party.
+	// A third-party closed-loop toolboard may report the second without the first, so a driver counts as
+	// closed-loop-capable if EITHER is present — checking only the board-level aggregate (as before)
+	// hid every non-Duet3D closed-loop driver from the list entirely.
+	const hasCl = (boardAddr: string, driverIndex: number) => {
+		const board = boards.find((b: any) => b && b.canAddress === parseInt(boardAddr));
+		if (!board) { return false; }
+		if (board.closedLoop != null) { return true; }
+		return board.drivers?.[driverIndex]?.closedLoop != null;
+	};
 	const out: Array<DriverEntry> = [];
 	for (const axis of model.move?.axes ?? []) {
 		for (const drv of axis.drivers ?? []) {
 			const id = `${drv.board}.${drv.driver}`;
-			if (hasCl(String(drv.board))) { out.push({ name: `${axis.letter} axis (driver ${id})`, value: id }); }
+			if (hasCl(String(drv.board), drv.driver)) { out.push({ name: `${axis.letter} axis (driver ${id})`, value: id }); }
 		}
 	}
 	(model.move?.extruders ?? []).forEach((ex: any, idx: number) => {
 		const drv = ex?.driver;
 		if (!drv) { return; }
 		const id = `${drv.board}.${drv.driver}`;
-		if (hasCl(String(drv.board))) { out.push({ name: `Extruder ${idx} (driver ${id})`, value: id }); }
+		if (hasCl(String(drv.board), drv.driver)) { out.push({ name: `Extruder ${idx} (driver ${id})`, value: id }); }
 	});
 	return out;
 });
@@ -682,6 +817,8 @@ function axisForDriver(): any {
 function axisLetterForDriver(): string | null {
 	return axisForDriver()?.letter ?? null;
 }
+/** True once a driver with an axis is selected — reactive, so template usage doesn't call a plain function on every render. */
+const hasAxisSelected = computed(() => !!axisForDriver()?.letter);
 
 /** Human-readable summary of the driver's axis travel/position, shown next to the safety margin setting. */
 const axisTravelInfo = computed(() => {
@@ -866,6 +1003,23 @@ async function waitForRuns(startRuns: number, timeoutMs: number): Promise<boolea
 
 const varIds = (keys: Array<string>) => keys.map((k) => CAPTURE_VARIABLES.find((v) => v.key === k)?.id ?? 0);
 
+/** Every recordable variable — used for the auto-generated captures (wizard step, auto-tune's own
+ * decision captures, the step-5 test move) so as much diagnostic overlay data as possible is available
+ * on the shared chart afterward, without the user having to run a separate manual "Advanced capture"
+ * to get it. `viewKeys`/`recordKeys` defaults still start with only a few lines selected — this only
+ * controls what's AVAILABLE to tick on, not what's shown by default. If firmware can't buffer this many
+ * columns at the requested sample count, `runCapture` already surfaces that as a clear "Firmware
+ * rejected the capture" error rather than failing silently. */
+const ALL_CAPTURE_KEYS = CAPTURE_VARIABLES.map((v) => v.key);
+
+/** Seeds a sensible starting chart selection only when there isn't one yet (nothing ticked) — never
+ * overwrites a selection the user already made. Without this, every capture (including each of auto-
+ * tune's own internal decision captures) used to stomp the checkboxes back to a hardcoded default,
+ * resetting whatever the user had just ticked to look at. */
+function ensureViewKeys(defaults: Array<string>): void {
+	if (viewKeys.value.length === 0) { viewKeys.value = defaults; }
+}
+
 /** Run a capture command (built directly, not from the user's manual settings), wait for it to finish, load the CSV. */
 async function runCapture(opts: Parameters<typeof buildCaptureCommand>[0]): Promise<ParsedCapture | null> {
 	const startRuns = selectedBoard.value?.closedLoop?.runs ?? -1;
@@ -891,13 +1045,18 @@ const MIN_STEP_DISTANCE_FRACTION = 0.5; // require at least half the intended st
  * already near the middle of its travel, warns the user and moves it there first via a normal
  * (kinematics-respecting) G1 move, so the tuning move has room on both sides. No-op for extruders or
  * axes the object model hasn't reported a position for yet.
+ *
+ * `centerToMid: false` skips the move-to-mid leg entirely (still enforcing the homed check) — for a
+ * caller that's about to reposition to its own precisely-planned, already-safety-clamped start position
+ * regardless (see `captureRaw`), routing through mid first is just an extra physical round trip.
  */
-async function ensureAxisReady(limits: AxisLimits | null): Promise<boolean> {
+async function ensureAxisReady(limits: AxisLimits | null, opts: { centerToMid?: boolean } = {}): Promise<boolean> {
 	if (!limits) { return true; }
 	if (!limits.homed) {
 		uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", `${limits.letter} is not homed — home it first so the plugin knows its position relative to the frame.`);
 		return false;
 	}
+	if (opts.centerToMid === false) { return true; }
 	const mid = midpoint(limits);
 	if (Math.abs(mid - limits.position) < CENTER_TOLERANCE_MM) { return true; }
 	const move = `G90 G1 ${limits.letter}${mid.toFixed(3)} F${CENTERING_FEED_MM_MIN}`;
@@ -927,7 +1086,7 @@ async function captureStep(): Promise<StepMetrics | null> {
 	const ax = axisForDriver();
 	if (!(await ensureAxisReady(getAxisLimits(ax)))) { return null; }
 	const limits = getAxisLimits(axisForDriver()); // re-read: ensureAxisReady may have moved the axis
-	const stepVars = varIds(["measuredMotorSteps", "targetMotorSteps", "currentError", "pidPTerm"]);
+	const stepVars = varIds(ALL_CAPTURE_KEYS);
 	let c: ParsedCapture | null;
 	if (ax?.letter) {
 		const desired = stepJumpDistanceMm({ stepsPerMm: Number(ax.stepsPerMm), microstepping: Number(ax.microstepping?.value) });
@@ -955,41 +1114,76 @@ async function captureStep(): Promise<StepMetrics | null> {
  * Single trapezoid-move capture for the unified P/D/I/A/V tuning signal. One G1 H2 move sized (via
  * `planCaptureProfile`) so the capture window holds both a real accel/cruise/decel section AND a
  * meaningful at-rest tail — the same capture serves every term's decision instead of a separate
- * "step" move and "A/V" move judged by different (and, for step, wrong) metrics. Captures the outward
- * move, then returns the axis to start. Distance/direction stay within the configured safety margin.
+ * "step" move and "A/V" move judged by different (and, for step, wrong) metrics.
+ *
+ * The move is CENTRED on the axis's midpoint (not just started from it): `planCaptureProfile` derives
+ * `startPosition` (mid − d/2) from the axis's min/max alone, so this pre-positions straight there in
+ * one hop (no intermediate stop at mid) before the H2 move — using the full clear travel instead of
+ * half of it (see limits.ts). Distance
+ * defaults to "auto" (0 = longest reasonable move, up to `AUTO_MOVE_CAP_MM`), which also derives the
+ * sample rate from the move's own duration; the returned `rateHz` is what was actually used, for the
+ * caller to pass to analysis so it matches what the firmware was told to capture at.
  */
+interface RawCaptureResult {
+	capture: ParsedCapture;
+	rateHz: number;
+}
+
 /**
  * The unified trapezoid-move capture, shared by `captureSignal` (tuning decisions → TuneSignal) and
  * `evaluateCapture` (final-verification grading → TuneEvaluation) so both analyse the exact same kind
  * of move instead of duplicating the move-planning/execution logic.
  */
-async function captureRaw(): Promise<ParsedCapture | null> {
+async function captureRaw(): Promise<RawCaptureResult | null> {
 	const axisObj = axisForDriver();
 	const axis = axisObj?.letter ?? null;
 	if (!axis) { uiStore.makeNotification(LogLevel.warning, "Closed Loop Tuning", "Signal-based tuning needs the driver's axis — skipped."); return null; }
-	if (!(await ensureAxisReady(getAxisLimits(axisObj)))) { return null; }
-	const limits = getAxisLimits(axisForDriver()); // re-read: ensureAxisReady may have moved the axis
+	// No move-to-mid here: planCaptureProfile below computes startPosition from the axis's min/max alone
+	// (never from current position), so centering to mid first would just be an extra round trip before
+	// the explicit reposition a few lines down. Only the homed check applies.
+	if (!(await ensureAxisReady(getAxisLimits(axisObj), { centerToMid: false }))) { return null; }
+	let limits = getAxisLimits(axisForDriver());
 	const profile = planCaptureProfile(limits, avFeed.value, samples.value, sampleRate.value, marginMm.value, { maxDistanceMm: avDistance.value });
 	if ("error" in profile) { log(`Tuning capture: ${profile.error}`); uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", profile.error); return null; }
+
+	// Centre the MOVE on the midpoint, not just the axis: pre-position to the plan's own start (mid −
+	// d/2) via a normal, soft-limit-respecting G1 before the H2 tuning move — this is what unlocks the
+	// full clear travel instead of only the half reachable by moving one-way from the midpoint.
+	if (limits && Math.abs(profile.startPosition - limits.position) > CENTER_TOLERANCE_MM) {
+		const move = `G90 G1 ${axis}${profile.startPosition.toFixed(3)} F${CENTERING_FEED_MM_MIN}`;
+		log(`Positioning ${axis} to ${profile.startPosition.toFixed(1)} mm for a ${profile.distance.toFixed(0)} mm centred tuning move.`);
+		await send(move);
+		await send("M400");
+		await delay(400);
+		limits = getAxisLimits(axisForDriver());
+	}
+
 	const signedDist = profile.sign * profile.distance;
-	viewKeys.value = ["measuredMotorSteps", "targetMotorSteps", "pidPTerm"];
-	const c = await runCapture({ driver: selectedDriver.value ?? "", samples: samples.value, activate: 1, rate: sampleRate.value, variables: varIds(["targetMotorSteps", "pidPTerm", "measuredMotorSteps"]), manoeuvre: 0, move: `G91 G1 H2 ${axis}${signedDist.toFixed(3)} F${avFeed.value} G90` });
+	ensureViewKeys(["measuredMotorSteps", "targetMotorSteps", "pidPTerm"]);
+	const c = await runCapture({
+		driver: selectedDriver.value ?? "", samples: samples.value, activate: 1, rate: profile.sampleRateHz,
+		variables: varIds(ALL_CAPTURE_KEYS), manoeuvre: 0,
+		move: `G91 G1 H2 ${axis}${signedDist.toFixed(3)} F${avFeed.value} G90`,
+	});
 	try { await machineStore.sendCode(`G91 G1 H2 ${axis}${(-signedDist).toFixed(3)} F${avFeed.value} G90`, false, false); } catch { /* ignore return-move error */ }
-	return c;
+	return c ? { capture: c, rateHz: profile.sampleRateHz } : null;
 }
 
 async function captureSignal(): Promise<TuneSignal | null> {
-	const c = await captureRaw();
-	return c ? computeTuneSignal(c, sampleRate.value) : null;
+	const result = await captureRaw();
+	return result ? computeTuneSignal(result.capture, result.rateHz) : null;
 }
 
 /** Final-verification grading: a fresh capture judged the same way the Step-5 evaluation panel does. */
 async function evaluateCapture(): Promise<TuneEvaluation | null> {
-	const c = await captureRaw();
-	return c ? evaluateTune(c, sampleRate.value) : null;
+	const result = await captureRaw();
+	return result ? evaluateTune(result.capture, result.rateHz) : null;
 }
 
-function log(line: string): void { autoLog.value = [...autoLog.value, line].slice(-40); }
+function log(line: string): void {
+	sessionLog.push(line); // uncapped — this is what the downloadable report uses
+	autoLog.value = [...autoLog.value, line]; // uncapped — display keeps the full run so it can be copied out
+}
 
 /**
  * Read the driver's current PID back from the firmware (a fresh snapshot, independent of the `pid`
@@ -1029,21 +1223,30 @@ function buildTuneEffects(): TuneEffects {
 			wizardIndex.value = WIZARD_STEPS.findIndex((s) => s.term === term);
 			recordSessionCapture(term, value, metric);
 		},
-		onStage: (stage, state) => { stageStates[stage] = state; },
+		onStage: (stage, state) => {
+			stageStates[stage] = state;
+			if (tuneSession.value) { tuneSession.value.stageTimeline.push({ stage, state, at: new Date().toISOString() }); }
+		},
 		isCancelled: () => autoCancel.value,
 		delay,
 	};
 }
 
+const METHOD_CONSENT_TEXT: Record<TuneMethod, string> = {
+	sequential: "tuning P → A → V → D → I from the same trapezoid move each time (starting with a brief search for a good starting point), then refining every term again each cycle",
+	package: "tuning P → A → V → D → I once to get a good starting point, then jointly optimising every term together against a single whole-loop score",
+	refine: "jointly optimising every term together, starting from the PID values already on the driver — no reset, no from-scratch ramp",
+};
+
 function startAutoTune(): void {
 	if (!selectedDriver.value) { return; }
-	const hasAxis = !!axisLetterForDriver();
+	const hasAxis = hasAxisSelected.value;
 	const msg = hasAxis
 		? "Auto-tune will run everything below without asking again — make sure the axis is clear and you've calibrated (Step 3) and homed it:\n"
 			+ "• Switch to closed/assisted loop.\n"
 			+ "• Check the driver is tracking a move; if not, run calibration automatically (this can include a full rotation of the motor) and check again.\n"
 			+ "• Move the axis to the middle of its travel if it isn't already there.\n"
-			+ "• Repeatedly move it back and forth, tuning P, D, I, A and V from the same trapezoid move each time (starting with a brief search for a good starting point), keeping every move inside the configured safety margin.\n"
+			+ `• Repeatedly move it back and forth, ${METHOD_CONSENT_TEXT[tuneMethod.value]}, keeping every move inside the configured safety margin.\n`
 			+ "• Grade the result and, if needed, make one bounded correction pass.\n"
 			+ "Review the evaluation afterwards, then save to config.g yourself."
 		: "Auto-tune will switch to closed loop, then repeatedly move the driver with step jumps to tune P/D/I (A/V need an axis and will be skipped). Make sure you've calibrated (Step 3) first.";
@@ -1054,17 +1257,26 @@ async function runAutoTune(): Promise<void> {
 	autoRunning.value = true;
 	autoCancel.value = false;
 	autoLog.value = [];
+	sessionLog = [];
+	sessionSeq = 0;
 	resetStageStates();
-	viewKeys.value = ["measuredMotorSteps", "targetMotorSteps", "currentError"];
+	ensureViewKeys(["measuredMotorSteps", "targetMotorSteps", "currentError"]);
 	const totalCycles = Math.max(1, Math.round(cycles.value || 1));
-	const hasAxis = !!axisLetterForDriver();
+	const hasAxis = hasAxisSelected.value;
+	const runOptions: AutoRunOptions = {
+		cycles: totalCycles, hasAxis, calibrationMoveIds: requiredMoveIds.value,
+		method: tuneMethod.value, identifyMethod: identifyMethod.value, modelFitBackoff: modelFitBackoff.value,
+		seedRule: seedRule.value, seedLambda: seedLambda.value, medianOf: medianOf.value, captureBudget: captureBudget.value,
+	};
 	tuneSession.value = {
 		startedAt: new Date().toISOString(), driver: selectedDriver.value, mode: currentMode.value,
 		encoderType: encoderType.value, cycles: totalCycles, log: [], captures: [],
+		method: hasAxis ? tuneMethod.value : "sequential", optionsUsed: runOptions,
+		stageTimeline: [], reportVersion: REPORT_VERSION,
 	};
 	let result: AutoRunResult | undefined;
 	try {
-		result = await runAutoTuneCore(buildTuneEffects(), { ...pid }, { cycles: totalCycles, hasAxis, calibrationMoveIds: requiredMoveIds.value });
+		result = await runAutoTuneCore(buildTuneEffects(), { ...pid }, runOptions);
 		Object.assign(pid, result.pid);
 		if (result.ok) {
 			const gradeNote = result.evaluation ? ` Final grade: ${result.evaluation.grade} (${result.evaluation.score}/100).` : "";
@@ -1083,7 +1295,7 @@ async function runAutoTune(): Promise<void> {
 		if (tuneSession.value) {
 			tuneSession.value.finishedAt = new Date().toISOString();
 			tuneSession.value.finalPid = { ...pid };
-			tuneSession.value.log = [...autoLog.value];
+			tuneSession.value.log = [...sessionLog];
 			tuneSession.value.evaluation = result?.evaluation ?? evaluation.value;
 			tuneSession.value.ku = result?.ku;
 			tuneSession.value.tu = result?.tu;
@@ -1098,8 +1310,8 @@ function abortAutoTune(): void { autoCancel.value = true; autoStatus.value = "St
 // --- Test & save ---
 async function runTestMove(): Promise<void> {
 	moveMode.value = "custom";
-	recordKeys.value = ["measuredMotorSteps", "targetMotorSteps", "currentError"];
-	viewKeys.value = ["currentError"];
+	recordKeys.value = ALL_CAPTURE_KEYS;
+	ensureViewKeys(["measuredMotorSteps", "targetMotorSteps", "currentError"]);
 	await record();
 }
 const configBlock = computed(() => {

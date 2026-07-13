@@ -8,7 +8,11 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { parseCapture } from "../model/csv";
-import { computeTuneSignal, medianSignal, oscillationPeriod, signalDiverging, signalUnstable, type TuneSignal } from "../model/signal";
+import {
+	computeTuneSignal, medianSignal, oscillationAmplitude, oscillationPeriod, signalCost, signalDiverging,
+	signalUnstable, significantlyBetter, significantlyBetterForTerm, termAwareCost, withinNoise,
+	type TuneSignal,
+} from "../model/signal";
 
 const FIXTURE_DIR = path.join(__dirname, "fixtures");
 function load(name: string) {
@@ -19,6 +23,32 @@ function signalOf(name: string): TuneSignal {
 	if (!s) { throw new Error(`${name}: computeTuneSignal returned null`); }
 	return s;
 }
+
+describe("computeTuneSignal — capture validation", () => {
+	it("returns null for a capture with too few samples (a truncated/corrupt CSV)", () => {
+		const header = "Sample,Timestamp,Measured Motor Steps,Target Motor Steps,PID P Term\n";
+		const rows = Array.from({ length: 10 }, (_, i) => `${i},${i},${i * 0.1},${i * 0.1},0`).join("\n");
+		const capture = parseCapture(header + rows);
+		expect(computeTuneSignal(capture, 2000)).toBeNull();
+	});
+
+	it("returns null when a garbled row NaNs out a core stat (a race with the firmware still writing the file)", () => {
+		// This reproduces the field failure: a capture that looked like "rms 0.00, bias NaN" instead of
+		// a real (if bad) measurement — every stat that sums over the data silently propagates the NaN.
+		const header = "Sample,Timestamp,Measured Motor Steps,Target Motor Steps,PID P Term\n";
+		const goodRows = Array.from({ length: 100 }, (_, i) => `${i},${i * 0.5},${i * 0.1},${i * 0.1},0`);
+		goodRows[50] = "50,25,not-a-number,25.0,0"; // one garbled row
+		const capture = parseCapture(header + goodRows.join("\n"));
+		expect(computeTuneSignal(capture, 2000)).toBeNull();
+	});
+
+	it("still accepts a real, fully-numeric capture at the sample-count floor", () => {
+		const header = "Sample,Timestamp,Measured Motor Steps,Target Motor Steps,PID P Term\n";
+		const rows = Array.from({ length: 60 }, (_, i) => `${i},${i * 0.5},${i * 0.1},${i * 0.1},0`);
+		const capture = parseCapture(header + rows.join("\n"));
+		expect(computeTuneSignal(capture, 2000)).not.toBeNull();
+	});
+});
 
 describe("computeTuneSignal — stable captures", () => {
 	it.each([
@@ -79,6 +109,38 @@ describe("signalDiverging", () => {
 	});
 });
 
+describe("computeTuneSignal — autocorrelation fallback for oscPeriod", () => {
+	it("finds a period the zero-crossing gate misses on a small, fast-decaying at-rest oscillation", () => {
+		const n = 300;
+		const rateHz = 2000;
+		const period = 30; // samples
+		const decayPerCycle = 0.55;
+		const header = "Sample,Timestamp,Measured Motor Steps,Target Motor Steps,PID P Term\n";
+		const rows: Array<string> = [];
+		for (let i = 0; i < n; i++) {
+			const cycles = i / period;
+			const amp = 1.2 * Math.pow(decayPerCycle, cycles); // decays fast enough to duck under a fixed gate
+			const measured = 100 + amp * Math.sin((2 * Math.PI * i) / period);
+			rows.push(`${i},${(i / rateHz) * 1000},${measured.toFixed(4)},100,0`);
+		}
+		const capture = parseCapture(header + rows.join("\n"));
+		const s = computeTuneSignal(capture, rateHz);
+		expect(s).not.toBeNull();
+		expect(s!.oscPeriod).not.toBeNull();
+		const periodSeconds = period / rateHz;
+		expect(s!.oscPeriod!).toBeGreaterThan(periodSeconds * 0.7);
+		expect(s!.oscPeriod!).toBeLessThan(periodSeconds * 1.3);
+
+		// Confirm this genuinely exercises the fallback: the primary zero-crossing method, given the same
+		// (generous) threshold computeTuneSignal itself would use, must NOT find a period on this capture.
+		const time = Array.from({ length: n }, (_, i) => i / rateHz);
+		const measured = capture.columns["Measured Motor Steps"];
+		const error = measured.map((m) => m - 100);
+		const primary = oscillationPeriod(error, time, 0, n, Math.max(0.3, 3 * s!.stats.restNoise));
+		expect(primary).toBeNull();
+	});
+});
+
 describe("oscillationPeriod", () => {
 	it("returns null when there aren't enough gated crossings", () => {
 		const flat = new Array(50).fill(0);
@@ -95,6 +157,114 @@ describe("oscillationPeriod", () => {
 		expect(measured).not.toBeNull();
 		expect(measured!).toBeGreaterThan(period * 0.8);
 		expect(measured!).toBeLessThan(period * 1.2);
+	});
+});
+
+describe("signalCost", () => {
+	it("is Infinity for an unstable capture", () => {
+		expect(signalCost(signalOf("move250-runaway.csv"))).toBe(Infinity);
+		expect(signalCost(signalOf("hold-limit-cycle.csv"))).toBe(Infinity);
+	});
+
+	it("ranks the best stable capture lower than an earlier, noisier stable one", () => {
+		const best = signalCost(signalOf("move250-stable-best.csv"));
+		const early = signalCost(signalOf("move250-stable-early.csv"));
+		expect(best).toBeLessThan(early);
+	});
+
+	it("ranks a clean capture lower than one on the edge of instability", () => {
+		const best = signalCost(signalOf("move250-stable-best.csv"));
+		const onset = signalCost(signalOf("move250-instability-onset.csv"));
+		expect(best).toBeLessThan(onset);
+	});
+});
+
+describe("significantlyBetter / withinNoise", () => {
+	it("says an unstable capture is never significantly better", () => {
+		const stable = signalOf("move250-stable-best.csv");
+		const unstable = signalOf("move250-runaway.csv");
+		expect(significantlyBetter(stable, unstable)).toBe(false);
+	});
+
+	it("says a stable capture IS significantly better than an unstable one", () => {
+		const stable = signalOf("move250-stable-best.csv");
+		const unstable = signalOf("move250-runaway.csv");
+		expect(significantlyBetter(unstable, stable)).toBe(true);
+	});
+
+	it("treats two captures of the same gains (tiny numeric jitter) as within noise", () => {
+		const a = signalOf("move250-stable-best.csv");
+		const b = signalOf("move250-stable-best.csv"); // identical capture, zero real difference
+		expect(withinNoise(a, b)).toBe(true);
+		expect(significantlyBetter(a, b)).toBe(false);
+	});
+
+	it("does not call a tiny cost delta significant even when one side is technically lower", () => {
+		const base: TuneSignal = sigLike(signalOf("move250-stable-best.csv"), { restNoise: 0.2 });
+		const tiny: TuneSignal = { ...base, stats: { ...base.stats, moveRms: base.stats.moveRms + 0.001 } };
+		expect(significantlyBetter(base, tiny)).toBe(false);
+	});
+});
+
+function sigLike(s: TuneSignal, statsOver: Partial<TuneSignal["stats"]>): TuneSignal {
+	return { ...s, stats: { ...s.stats, ...statsOver } };
+}
+
+describe("termAwareCost / significantlyBetterForTerm", () => {
+	const base = signalOf("move250-stable-best.csv");
+
+	it("adds a penalty for V's own target (|pTermCruiseMean|) on top of the whole-loop cost", () => {
+		const good = { ...base, pTermCruiseMean: 1 };
+		const bad = { ...base, pTermCruiseMean: 200 };
+		expect(termAwareCost("v", bad)).toBeGreaterThan(termAwareCost("v", good));
+		// The plain whole-loop cost is identical for both (pTermCruiseMean isn't part of it) — the
+		// difference must come entirely from the term-aware augmentation.
+		expect(signalCost(bad)).toBeCloseTo(signalCost(good), 6);
+	});
+
+	it("adds a penalty for A's own target (pTermAccelPeak) on top of the whole-loop cost", () => {
+		const good = { ...base, pTermAccelPeak: 5 };
+		const bad = { ...base, pTermAccelPeak: 220 };
+		expect(termAwareCost("a", bad)).toBeGreaterThan(termAwareCost("a", good));
+	});
+
+	it("leaves other terms' cost untouched by pTermCruiseMean/pTermAccelPeak", () => {
+		const s1 = { ...base, pTermCruiseMean: 1, pTermAccelPeak: 1 };
+		const s2 = { ...base, pTermCruiseMean: 200, pTermAccelPeak: 220 };
+		expect(termAwareCost("p", s1)).toBeCloseTo(termAwareCost("p", s2), 6);
+		expect(termAwareCost("d", s1)).toBeCloseTo(termAwareCost("d", s2), 6);
+	});
+
+	it("regression: refuses to call a V change 'better' when it only nudges generic cost within noise while V's own target gets far worse (the runaway-V bug)", () => {
+		// This reproduces the field failure: raising V drove pTermCruiseMean from -50 (reasonable) out
+		// to +900 (V massively overshot) while moveRms/cruiseLag barely moved — plain signalCost alone
+		// would have called this "not significantly different" or even a tiny improvement, letting V
+		// drift indefinitely since nothing ever penalised it.
+		const prev = { ...base, pTermCruiseMean: -50, stats: { ...base.stats, moveRms: 0.5, cruiseLag: 0.3 } };
+		const cur = { ...base, pTermCruiseMean: 900, stats: { ...base.stats, moveRms: 0.49, cruiseLag: 0.29 } };
+		expect(significantlyBetter(prev, cur)).toBe(false); // already not "significant" by the plateau/noise threshold
+		expect(significantlyBetterForTerm("v", prev, cur)).toBe(false); // and now unambiguously rejected on V's own target
+	});
+
+	it("still accepts a genuine V improvement that brings pTermCruiseMean toward zero", () => {
+		const prev = { ...base, pTermCruiseMean: -120, stats: { ...base.stats, moveRms: 0.6 } };
+		const cur = { ...base, pTermCruiseMean: -5, stats: { ...base.stats, moveRms: 0.5 } };
+		expect(significantlyBetterForTerm("v", prev, cur)).toBe(true);
+	});
+});
+
+describe("oscillationAmplitude", () => {
+	it("returns the peak absolute value in the window", () => {
+		expect(oscillationAmplitude([1, -3, 2, -0.5], 0, 4)).toBe(3);
+	});
+	it("ignores samples outside [start, end)", () => {
+		expect(oscillationAmplitude([100, 1, -2, 1, 100], 1, 4)).toBe(2);
+	});
+	it("returns 0 for an empty/flat window", () => {
+		expect(oscillationAmplitude([0, 0, 0], 0, 3)).toBe(0);
+	});
+	it("skips non-finite samples", () => {
+		expect(oscillationAmplitude([NaN, 5, Infinity], 0, 2)).toBe(5);
 	});
 });
 

@@ -38,6 +38,9 @@ export interface TuneStats {
 	settleOvershoot: number;
 	/** Mean signed error during the steady-speed section (velocity lag). */
 	cruiseLag: number;
+	/** Std-dev of error during the steady-speed section — a symmetric wander (e.g. a mismatched V
+	 * oscillating around the target) averages toward zero in `cruiseLag` alone but still shows up here. */
+	cruiseSpread: number;
 	/** Peak |error| during acceleration / deceleration. */
 	accelPeak: number;
 	/** Peak |error| over the whole moving portion. */
@@ -74,6 +77,15 @@ const ACCEL_FAIR = 3.0;
 export const OVERSHOOT_GOOD = 1.0;
 const OVERSHOOT_FAIR = 2.5;
 export const RING_WARN = 4;       // significant oscillation cycles after stop
+/**
+ * Cruise WANDER (std-dev of cruise error) beyond this many rest-noise σ is a real tracking problem, not
+ * encoder fuzz — deliberately noise-SCALED with no fixed absolute floor (a fake constant floor is
+ * exactly what made `P_NOISE_FLOOR_MIN` wrong elsewhere in this codebase). A symmetric oscillation
+ * (e.g. a mismatched V hunting around the target) averages toward zero in `cruiseLag` alone, so this
+ * catches what that mean-based check structurally can't.
+ */
+export const CRUISE_SPREAD_K = 3;
+const CRUISE_SPREAD_WARN_K = 6; // 2× the info-tier multiplier
 
 function mean(a: Array<number>): number { return a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0; }
 function std(a: Array<number>): number {
@@ -100,7 +112,7 @@ function ringCount(err: Array<number>, threshold: number): number {
 }
 
 const empty: TuneStats = {
-	restBias: 0, restNoise: 0, restRing: 0, settleOvershoot: 0, cruiseLag: 0,
+	restBias: 0, restNoise: 0, restRing: 0, settleOvershoot: 0, cruiseLag: 0, cruiseSpread: 0,
 	accelPeak: 0, movePeak: 0, moveRms: 0, cruiseSamples: 0, restSamples: 0, moved: false,
 };
 
@@ -145,6 +157,7 @@ export function tuneStats(capture: ParsedCapture, sampleRateHz: number): TuneSta
 		restRing: ringCount(restErr, Math.max(0.3, 3 * restNoise)),
 		settleOvershoot,
 		cruiseLag: mean(cruiseErr),
+		cruiseSpread: std(cruiseErr),
 		accelPeak: peak(accelErr),
 		movePeak: peak(moveErr),
 		moveRms: rms(moveErr),
@@ -191,6 +204,15 @@ export function evaluateTune(capture: ParsedCapture, sampleRateHz: number): Tune
 		if (c > CRUISE_FAIR) { add({ severity: "warn", title: "Lags at steady speed", detail: `Trails the target by ${s.cruiseLag.toFixed(2)} step while cruising.`, fix: "Raise V (velocity feed-forward)", term: "v", direction: "up" }); }
 		else if (c > CRUISE_GOOD) { add({ severity: "info", title: "Small cruise lag", detail: `Trails by ${s.cruiseLag.toFixed(2)} step at speed.`, fix: "Raise V (velocity feed-forward) slightly", term: "v", direction: "up" }); }
 		else { add({ severity: "good", title: "Tracks at speed", detail: `Holds within ${c.toFixed(2)} step during steady-speed motion.` }); }
+
+		// 2b. Steady-speed WANDER — a separate signal from the mean lag above. A symmetric oscillation
+		// (e.g. a mismatched V hunting around the target) averages toward zero in `cruiseLag`, so a badly
+		// wandering tune could otherwise still score full marks on the check above.
+		const spreadInfoFloor = CRUISE_SPREAD_K * s.restNoise;
+		const spreadWarnFloor = CRUISE_SPREAD_WARN_K * s.restNoise;
+		if (s.cruiseSpread > spreadWarnFloor) { add({ severity: "warn", title: "Cruise error wanders", detail: `Swings ±${s.cruiseSpread.toFixed(2)} step around its own mean while cruising — even though that averages out, it's a real feed-forward mismatch, not noise.`, fix: "Raise V (velocity feed-forward)", term: "v", direction: "up" }); }
+		else if (s.cruiseSpread > spreadInfoFloor) { add({ severity: "info", title: "Slight cruise wander", detail: `±${s.cruiseSpread.toFixed(2)} step spread while cruising.`, fix: "A touch more V (velocity feed-forward)", term: "v", direction: "up" }); }
+		else { add({ severity: "good", title: "Steady at speed", detail: `±${s.cruiseSpread.toFixed(2)} step spread while cruising — within the encoder's own noise.` }); }
 	}
 
 	// 3. Acceleration / deceleration spikes (acceleration feed-forward).

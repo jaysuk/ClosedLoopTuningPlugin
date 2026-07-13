@@ -17,8 +17,17 @@
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { Chart, registerables } from "chart.js";
 
+import { P_TERM_RAIL } from "../model/analysis";
 import { CAPTURE_VARIABLES } from "../model/m569";
 import { column, timeAxisSeconds, type ParsedCapture } from "../model/csv";
+
+/** The PID term/control-signal capture variables share a known real scale (± the effort rail) — unlike
+ * the other "unitless" variables (coil current, motor current fraction), whose true range isn't known
+ * here. Anchoring the right axis to this range when only these are plotted stops Chart.js's per-axis
+ * auto-fit from zooming tight around a calm signal's own small noise band and making it look alarming —
+ * a P-term genuinely near zero should visually read as "near zero out of ±250", not fill the chart. */
+const PID_TERM_KEYS = new Set(["pidControlSignal", "pidPTerm", "pidITerm", "pidDTerm", "pidVTerm", "pidATerm"]);
+const PID_TERM_AXIS_PAD = 1.1;
 
 Chart.register(...registerables);
 
@@ -36,7 +45,9 @@ let chart: Chart | null = null;
 const PALETTE = ["#e60049", "#0bb4ff", "#50e991", "#e6d800", "#9b19f5", "#ffa300", "#dc0ab4", "#b3d4ff", "#00bfa0", "#fd7f6f", "#7eb0d5", "#b2e061", "#bd7ebe", "#8bd3c7", "#ebdc78", "#beb9db"];
 
 function axisIdFor(axis: string): string {
-	return axis === "steps" || axis === "count" ? "yLeft" : "yRight";
+	if (axis === "steps" || axis === "count") { return "yLeft"; }
+	if (axis === "error") { return "yError"; }
+	return "yRight";
 }
 
 function datasetsFor(capture: ParsedCapture, time: Array<number>, dashed: boolean) {
@@ -63,6 +74,15 @@ function datasetsFor(capture: ParsedCapture, time: Array<number>, dashed: boolea
 	return sets;
 }
 
+/** True when every variable currently sharing the yRight axis is a PID term/control-signal variable —
+ * the only ones with a known real scale to anchor the axis to. */
+function rightAxisIsPidTerms(): boolean {
+	const rightAxisVars = props.selectedKeys
+		.map((k) => CAPTURE_VARIABLES.find((cv) => cv.key === k))
+		.filter((v): v is NonNullable<typeof v> => !!v && axisIdFor(v.axis) === "yRight");
+	return rightAxisVars.length > 0 && rightAxisVars.every((v) => PID_TERM_KEYS.has(v.key));
+}
+
 function rebuild(): void {
 	if (!chart || !props.capture) { return; }
 	const time = timeAxisSeconds(props.capture, props.sampleRate);
@@ -72,6 +92,14 @@ function rebuild(): void {
 		datasets = datasets.concat(datasetsFor(props.overlay, otime, true));
 	}
 	chart.data.datasets = datasets;
+	const yRight = chart.options.scales!.yRight!;
+	if (rightAxisIsPidTerms()) {
+		yRight.suggestedMin = -P_TERM_RAIL * PID_TERM_AXIS_PAD;
+		yRight.suggestedMax = P_TERM_RAIL * PID_TERM_AXIS_PAD;
+	} else {
+		delete yRight.suggestedMin;
+		delete yRight.suggestedMax;
+	}
 	chart.update("none");
 }
 
@@ -102,6 +130,9 @@ onMounted(() => {
 				x: { type: "linear", title: { display: true, text: "Time (s)" } },
 				yLeft: { type: "linear", position: "left", title: { display: true, text: "Steps / counts" } },
 				yRight: { type: "linear", position: "right", grid: { drawOnChartArea: false }, title: { display: true, text: "Unitless / degrees" } },
+				// Its own axis, not sharing yLeft with the raw trapezoid position — see the CaptureVariable
+				// "error" axis comment in m569.ts for why sharing distorts both signals.
+				yError: { type: "linear", position: "right", grid: { drawOnChartArea: false }, title: { display: true, text: "Error (steps)" } },
 			},
 			plugins: { legend: { position: "bottom" } },
 		},
