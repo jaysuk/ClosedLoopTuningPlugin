@@ -1,7 +1,7 @@
 {
   "name": "closed-loop-tuning",
   "version": "2.2.0",
-  "description": "Tune and visualise the Duet closed-loop driver (1HCL / M23CL): mode + calibration control, guided PID tuning, automatic step-response analysis — a Duet Web Control 3.7 plugin.",
+  "description": "Tune and visualise a Duet closed-loop driver: mode + calibration control, guided PID tuning, automatic step-response analysis — a Duet Web Control 3.7 plugin.",
   "private": true,
   "license": "GPL-3.0-or-later",
   "homepage": "https://github.com/jaysuk/ClosedLoopTuningPlugin",
@@ -16,14 +16,14 @@
   },
   "dependencies": {
     "chart.js": "^4.4.6",
-    "dwc-plugin-runtime": "github:jaysuk/dwc-plugin-runtime#v0.8.1"
+    "dwc-plugin-runtime": "github:jaysuk/dwc-plugin-runtime#v0.8.4"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.2.4",
     "@vitest/coverage-v8": "^4.1.8",
     "@vue/test-utils": "^2.4.6",
     "dwc-plugin-test-kit": "github:jaysuk/dwc-plugin-test-kit#v0.2.4",
-    "happy-dom": "^15.11.7",
+    "happy-dom": "^20.11.1",
     "vitest": "^4.1.8",
     "vue": "^3.5.30",
     "vuetify": "^4.1.0"

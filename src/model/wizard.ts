@@ -1,5 +1,5 @@
 /**
- * Guided tuning wizard logic, distilled from the Duet 1HCL tuning guide. Pure + unit-tested — the UI
+ * Guided tuning wizard logic, distilled from the Duet closed-loop tuning guide. Pure + unit-tested — the UI
  * walks these steps, runs a capture between each, feeds the analysis metrics into `recommend()`, and
  * shows the advice. Duet removed the fully-automatic tuner, so this assists rather than fully automates:
  * each step measures the step response and recommends increasing/decreasing/accepting the term.

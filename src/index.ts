@@ -2,7 +2,7 @@
  * Closed Loop Tuning — entry point (DWC 3.7).
  *
  * Registers a standalone DWC page (Plugins → Closed Loop Tuning) for tuning and visualising Duet
- * closed-loop drivers (1HCL / M23CL): loop-mode + calibration control, a guided PID tuning wizard with
+ * closed-loop drivers: loop-mode + calibration control, a guided PID tuning wizard with
  * automatic step-response analysis, and an improved data-capture chart. Wires in the shared runtime
  * (self-update hub + error capture) and tears down app-lifetime resources on `dwcPluginUnloaded`.
  */

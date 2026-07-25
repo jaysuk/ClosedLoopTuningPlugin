@@ -35,7 +35,7 @@ const out = `
 4. Reload DWC, then open **Plugins → Closed Loop Tuning**.
 
 > 🔧 Built against ${dwcBuiltAgainst}. Use a DuetWebControl build at or near this version.
-> ⚙️ Requires a Duet 3 board with a closed-loop driver (Expansion 1HCL / M23CL). Tuning moves a single driver — make sure the axis is in a safe position before recording.
+> ⚙️ Requires a Duet 3 board with closed-loop driver support (a Duet3D Expansion 1HCL / M23CL, or any other RRF board reporting closed-loop driver telemetry). Tuning moves a single driver — make sure the axis is in a safe position before recording.
 
 <!-- dwc-plugin-update ${JSON.stringify({ version: pkgVersion, dwcVersion: requiredDwc, asset: `ClosedLoopTuning-${pkgVersion}.zip` })} -->
 `;

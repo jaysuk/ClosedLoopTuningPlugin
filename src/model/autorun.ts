@@ -36,7 +36,7 @@
  * Every side effect (sending G-code, capturing, waiting, logging) is injected via `TuneEffects`, so this
  * module has no DWC/Vue import and is fully deterministic to test.
  */
-import { P_TERM_RAIL, type StepMetrics } from "./analysis";
+import { P_TERM_RAIL } from "./analysis";
 import {
 	AUTOTUNE_SEQUENCE, AUTOTUNE_SIGNAL_SEQUENCE, describeMetrics, interpolateVZero, P_MAX,
 	type Attempt, type SignalAttempt, type SignalStrategy, type TermStrategy,
@@ -49,8 +49,8 @@ import {
 	describeSignal, RUNAWAY_STEPS, significantlyBetterForTerm, signalUnstable, type TuneSignal,
 } from "./signal";
 import {
-	captureMedian, clampTerm, nextBackoff, SEED_START, SETTLE_DELAY_MS, TERM_MAX, verifyAccepted, ZERO_START,
-	type AutoRunAttempt, type StageId, type StageState, type TuneEffects,
+	captureMedian, clampTerm, nextBackoff, SEED_START, SETTLE_DELAY_MS, verifyAccepted, ZERO_START,
+	type AutoRunAttempt, type TuneEffects,
 } from "./tuneShared";
 import type { PidTerm } from "./wizard";
 

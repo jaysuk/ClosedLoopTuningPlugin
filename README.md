@@ -1,6 +1,6 @@
 # Closed Loop Tuning Plugin (DWC 3.7 rework)
 
-Tune and visualise a Duet closed-loop driver — the [Expansion 1HCL](https://docs.duet3d.com/Duet3D_hardware/Duet_3_family/Duet_3_Expansion_1HCL) or [Motor23CL](https://docs.duet3d.com/en/Duet3D_hardware/Duet_3_family/Duet_3_Motor_23CL) — from Duet Web Control.
+Tune and visualise a Duet closed-loop driver — a Duet3D board such as the [Expansion 1HCL](https://docs.duet3d.com/Duet3D_hardware/Duet_3_family/Duet_3_Expansion_1HCL) or [Motor23CL](https://docs.duet3d.com/en/Duet3D_hardware/Duet_3_family/Duet_3_Motor_23CL), or any other RRF board reporting closed-loop driver support — from Duet Web Control.
 
 > This repository is a **fork** of [Duet3D/ClosedLoopTuningPlugin](https://github.com/Duet3D/ClosedLoopTuningPlugin),
 > ported to **DuetWebControl 3.7** (Vue 3 / Vuetify 4 / Pinia) and reworked to make tuning easier.

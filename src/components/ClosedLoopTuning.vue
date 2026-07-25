@@ -27,7 +27,7 @@
 			<v-icon class="mr-2">mdi-chart-bell-curve-cumulative</v-icon>
 			<span class="text-subtitle-1">Closed Loop Tuning</span>
 			<HelpTip class="ml-1" :href="DOCS.tuning"
-					 text="Follow the steps below in order: pick the driver, switch to closed/assisted mode, calibrate the encoder, tune the PID terms one at a time using the step response, then test and save. Click for the full Duet 1HCL tuning guide." />
+					 text="Follow the steps below in order: pick the driver, switch to closed/assisted mode, calibrate the encoder, tune the PID terms one at a time using the step response, then test and save. Click for the full closed-loop tuning guide." />
 			<v-spacer />
 			<v-chip v-if="selectedDriver" size="small" variant="tonal" class="mr-2">Driver {{ selectedDriver }}</v-chip>
 			<v-chip v-if="currentMode" size="small" :color="currentMode === 'open' ? 'grey' : 'success'" variant="flat">{{ MODE_LABELS[currentMode] }}</v-chip>
@@ -41,7 +41,7 @@
 		<AboutDialog v-model="aboutOpen" plugin-id="ClosedLoopTuning" title="Closed Loop Tuning"
 					 :description="aboutDescription" :model="machineStore.model"
 					 repo="https://github.com/jaysuk/ClosedLoopTuningPlugin"
-					 :docs-url="DOCS.tuning" docs-label="Duet 1HCL tuning guide"
+					 :docs-url="DOCS.tuning" docs-label="Duet closed-loop tuning guide"
 					 :update-available="updateState?.updateAvailable ?? false" :latest-version="updateState?.latestVersion"
 					 :checking="checking" :applying="applying" :pending-reload="pendingReload" :auto-check="autoCheck"
 					 :extra-actions="aboutExtraActions"
@@ -53,7 +53,7 @@
 				<v-card flat>
 					<div class="text-body-2 mb-3">
 						Pick the closed-loop driver you want to tune. Tuning moves only this driver, so re-home the axis afterwards.
-						<HelpTip text="The list shows every axis/extruder driver on a board that reports closed-loop support (a Duet 1HCL / M23CL, or any other RRF board exposing closed-loop driver telemetry). Only one driver can be tuned at a time." />
+						<HelpTip text="The list shows every axis/extruder driver on a board that reports closed-loop support — a Duet3D closed-loop board (1HCL / M23CL) or any other RRF board exposing closed-loop driver telemetry. Only one driver can be tuned at a time." />
 					</div>
 					<v-select v-model="selectedDriver" :items="drivers" item-title="name" item-value="value"
 							  density="compact" variant="outlined" hide-details label="Closed-loop driver" style="max-width: 480px" />
@@ -752,7 +752,7 @@ function downloadTuningReport(): void {
 }
 
 // About dialog (standardised runtime AboutDialog) wiring.
-const aboutDescription = "Tunes Duet 3 closed-loop drivers (1HCL / M23CL): loop mode, encoder calibration, and automatic PID + feed-forward tuning with capture analysis.";
+const aboutDescription = "Tunes Duet 3 closed-loop drivers: loop mode, encoder calibration, and automatic PID + feed-forward tuning with capture analysis.";
 const autoCheck = ref(updateChecksEnabled());
 const aboutExtraActions = computed<Array<AboutExtraAction>>(() => [
 	{ label: tuneSession.value ? "Download tuning report" : "Download tuning report (run auto-tune first)", icon: "mdi-download", color: "primary", disabled: !tuneSession.value, onClick: downloadTuningReport },
@@ -813,10 +813,6 @@ function axisForDriver(): any {
 	if (!selectedDriver.value) { return null; }
 	return (machineStore.model as any).move?.axes?.find((a: any) => (a.drivers ?? []).some((d: any) => `${d.board}.${d.driver}` === selectedDriver.value)) ?? null;
 }
-/** Axis letter the selected driver belongs to (null for extruders / unknown — A/V can't be auto-tuned then). */
-function axisLetterForDriver(): string | null {
-	return axisForDriver()?.letter ?? null;
-}
 /** True once a driver with an axis is selected — reactive, so template usage doesn't call a plain function on every render. */
 const hasAxisSelected = computed(() => !!axisForDriver()?.letter);
 
@@ -850,7 +846,7 @@ const calibrationMoves = computed<Array<CalibrationMove>>(() =>
 const encoderGuidance = computed(() => {
 	switch (encoderType.value) {
 		case 2: return "Quadrature shaft encoder: run Polarity detection & zeroing (V1) after every power-on — put it in your homing file.";
-		case 3: return "Duet3D magnetic encoder: run Magnetic encoder calibration (V2) once. It's stored in the 1HCL flash and survives power cycles.";
+		case 3: return "Duet3D magnetic encoder: run Magnetic encoder calibration (V2) once. It's stored in the board's flash and survives power cycles.";
 		case 1: return "Linear composite encoder: run Magnetic encoder calibration (V2) then Polarity & zeroing (V1) once. Stored in flash.";
 		default: return "No encoder selected. Set the encoder type in config.g with M569.1 T (T1/T2/T3) and pick it here.";
 	}

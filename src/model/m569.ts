@@ -7,10 +7,10 @@
  *   M569.6 V<n>  — calibration / tuning manoeuvres
  *
  * M569 D-values (confirmed from the RRF M569 dictionary): D0=constant off time, D1=random off time,
- * D2=spreadCycle, D3=stealthChop, D4=Closed Loop, D5=Assisted open loop (D4/D5 only on Duet 3 closed
- * loop controllers — 1HCL / Motor23CL). There is no dedicated "open loop" mode for a 1HCL: leaving
- * closed/assisted just means returning to the normal stepper driver mode, whose RRF 3.4+ default is
- * spreadCycle (D2). The UI still shows the literal command before sending and lets the D-values be
+ * D2=spreadCycle, D3=stealthChop, D4=Closed Loop, D5=Assisted open loop (D4/D5 only on closed-loop-
+ * capable drivers, e.g. Duet3D's 1HCL / Motor23CL). There is no dedicated "open loop" mode for a
+ * closed-loop driver: leaving closed/assisted just means returning to the normal stepper driver mode,
+ * whose RRF 3.4+ default is spreadCycle (D2). The UI still shows the literal command before sending and lets the D-values be
  * overridden, so a per-machine config quirk never sends a wrong mode blind.
  */
 
@@ -61,10 +61,10 @@ export interface CalibrationMove {
 	encoders: Array<EncoderType>;
 }
 
-/** M569.6 manoeuvres. V1/V2 are confirmed in the 3.7 dictionary; V3/V4 per the 1HCL tuning wiki. */
+/** M569.6 manoeuvres. V1/V2 are confirmed in the 3.7 dictionary; V3/V4 per the closed-loop tuning wiki. */
 export const CALIBRATION_MOVES: Array<CalibrationMove> = [
 	{ id: 1, name: "Polarity detection & zeroing", description: "Detects coil orientation / wiring and zeroes the encoder. Quadrature shaft encoders need this after every power-on.", encoders: [1, 2] },
-	{ id: 2, name: "Magnetic encoder calibration", description: "Calibrates the encoder to the motor and stores it in the 1HCL flash. Run once per motor/encoder/board combination.", encoders: [1, 3] },
+	{ id: 2, name: "Magnetic encoder calibration", description: "Calibrates the encoder to the motor and stores it in the board's flash. Run once per motor/encoder/board combination.", encoders: [1, 3] },
 	{ id: 3, name: "Magnetic calibration check", description: "Checks the stored magnetic calibration and reports the residual error.", encoders: [1, 3] },
 	{ id: 4, name: "Clear encoder calibration", description: "Clears the stored calibration (run if the motor/encoder/board changed).", encoders: [1, 3] },
 ];

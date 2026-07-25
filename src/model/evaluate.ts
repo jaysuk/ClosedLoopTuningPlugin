@@ -65,7 +65,7 @@ export interface TuneEvaluation {
 	stats: TuneStats;
 }
 
-// Thresholds in motor steps. Tuned to the Duet 1HCL wiki's "good" guidance (error a small fraction of
+// Thresholds in motor steps. Tuned to the Duet closed-loop wiki's "good" guidance (error a small fraction of
 // a step at rest) while staying tolerant of the high-frequency encoder fuzz that's always present.
 // Exported: the auto-tune strategies accept/reject against the same bar the evaluator grades with.
 export const REST_GOOD = 0.25;

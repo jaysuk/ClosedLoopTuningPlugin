@@ -399,8 +399,8 @@ export const SIGNAL_V_STRATEGY: SignalStrategy = {
 };
 
 /**
- * Signal-based auto-tune sequence for drivers with an axis: P → A → V → D → I, matching the Duet 1HCL
- * tuning guide's order. Feed-forward (A/V) is tuned right after P and before D/I so the damping and
+ * Signal-based auto-tune sequence for drivers with an axis: P → A → V → D → I, matching the Duet
+ * closed-loop tuning guide's order. Feed-forward (A/V) is tuned right after P and before D/I so the damping and
  * integral terms are judged against the error that's left *after* feed-forward removes what it can —
  * not against error that A/V will later make disappear out from under them.
  */
