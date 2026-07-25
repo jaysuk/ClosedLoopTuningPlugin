@@ -17,7 +17,7 @@ function stats(over: Partial<TuneStats> = {}): TuneStats {
 		...over,
 	};
 }
-function sig(over: Partial<TuneSignal> & { stats?: Partial<TuneStats> } = {}): TuneSignal {
+function sig(over: Partial<Omit<TuneSignal, "stats">> & { stats?: Partial<TuneStats> } = {}): TuneSignal {
 	const { stats: statsOver, ...rest } = over;
 	return {
 		stats: stats(statsOver ?? {}),

@@ -8,7 +8,7 @@ const D = WIZARD_STEPS.find((s) => s.id === "d")!;
 const I = WIZARD_STEPS.find((s) => s.id === "i")!;
 
 function metrics(over: Partial<StepMetrics>): StepMetrics {
-	return { stepSize: 4, riseTime: 0.01, overshootPct: 0, settlingTime: 0.02, steadyStateError: 0, peakError: 0.1, rmsError: 0.05, oscillations: 0, hasStep: true, ...over };
+	return { stepSize: 4, riseTime: 0.01, overshootPct: 0, settlingTime: 0.02, steadyStateError: 0, peakError: 0.1, rmsError: 0.05, oscillations: 0, hasStep: true, pTermSatDuty: 0, ...over };
 }
 
 describe("wizard ordering", () => {
