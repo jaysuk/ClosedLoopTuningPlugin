@@ -491,8 +491,9 @@ import { parseCapture, type ParsedCapture } from "../model/csv";
 import { analyzeCapture, type StepMetrics } from "../model/analysis";
 import {
 	CENTER_TOLERANCE_MM, CENTERING_FEED_MM_MIN, DEFAULT_MARGIN_MM,
-	getAxisLimits, midpoint, planCaptureProfile, planSymmetricMove, type AxisLimits,
+	getAxisLimits, midpoint, planCaptureProfile, planCoupledSymmetricMove, type CoupledAxisLimits,
 } from "../model/limits";
+import { resolveMotionCoupling } from "../model/kinematics";
 import { WIZARD_STEPS, type Recommendation } from "../model/wizard";
 import { computeTuneSignal, type TuneSignal } from "../model/signal";
 import {
@@ -813,8 +814,52 @@ function axisForDriver(): any {
 	if (!selectedDriver.value) { return null; }
 	return (machineStore.model as any).move?.axes?.find((a: any) => (a.drivers ?? []).some((d: any) => `${d.board}.${d.driver}` === selectedDriver.value)) ?? null;
 }
+/** Index of the selected driver's axis into move.axes[] — the column kinematics.ts needs to resolve
+ * which OTHER axes a G1 H2 move on this driver's own motor also displaces (see coupledAxesForDriver). */
+function axisIndexForDriver(): number | null {
+	if (!selectedDriver.value) { return null; }
+	const axes = (machineStore.model as any).move?.axes ?? [];
+	const idx = axes.findIndex((a: any) => (a.drivers ?? []).some((d: any) => `${d.board}.${d.driver}` === selectedDriver.value));
+	return idx >= 0 ? idx : null;
+}
 /** True once a driver with an axis is selected — reactive, so template usage doesn't call a plain function on every render. */
 const hasAxisSelected = computed(() => !!axisForDriver()?.letter);
+
+let loggedCouplingFor: string | null = null;
+
+/**
+ * Every axis a G1 H2 move on the selected driver actually displaces, with travel limits AND the
+ * kinematics-derived perUnit (see kinematics.ts) — `[]` for extruders (no axis to couple). Returns an
+ * error (never a silent Cartesian guess) when the kinematics can't be resolved, a coupled axis's limits
+ * aren't available, or a coupled axis isn't homed — an unhomed coupled axis means its position is
+ * unknown, so the move can't be proven safe even if the TUNED axis itself is homed.
+ */
+function coupledAxesForDriver(): Array<CoupledAxisLimits> | { error: string } {
+	const axisObj = axisForDriver();
+	if (!axisObj) { return []; }
+	const index = axisIndexForDriver();
+	if (index === null) { return { error: "Could not resolve the selected driver's axis index." }; }
+	const axes = (machineStore.model as any).move?.axes ?? [];
+	const kinematics = (machineStore.model as any).move?.kinematics;
+	const coupling = resolveMotionCoupling(kinematics, axes, index);
+	if ("error" in coupling) { return coupling; }
+	const out: Array<CoupledAxisLimits> = [];
+	for (const effect of coupling.effects) {
+		const limits = getAxisLimits(axes[effect.index]);
+		if (!limits) { return { error: `${effect.letter}: axis limits/position not available.` }; }
+		if (!limits.homed) {
+			return { error: `${effect.letter} is not homed — home it first. This axis is coupled to ${coupling.letter}'s motor `
+				+ `(${coupling.kinematicsName} kinematics), so its position must be known before tuning ${coupling.letter}.` };
+		}
+		out.push({ ...limits, perUnit: effect.perUnit });
+	}
+	if (coupling.effects.length > 1 && loggedCouplingFor !== selectedDriver.value) {
+		loggedCouplingFor = selectedDriver.value;
+		const parts = coupling.effects.map((e) => `${e.letter} by ${e.perUnit >= 0 ? "+" : ""}${e.perUnit.toFixed(3)} mm`).join(" and ");
+		log(`Kinematics: ${coupling.kinematicsName} — tuning ${coupling.letter} moves ${parts} per mm of motor travel.`);
+	}
+	return out;
+}
 
 /** Human-readable summary of the driver's axis travel/position, shown next to the safety margin setting. */
 const axisTravelInfo = computed(() => {
@@ -904,8 +949,10 @@ async function record(): Promise<void> {
 		return;
 	}
 	// Centre first if needed — this doesn't bounds-check a custom move's distance (it's arbitrary
-	// G-code), only makes sure it's starting from the middle of the axis's travel.
-	if (!(await ensureAxisReady(getAxisLimits(axisForDriver())))) { return; }
+	// G-code), only makes sure every axis this driver's motor can move is starting from its own midpoint.
+	const coupledForRecord = coupledAxesForDriver();
+	if ("error" in coupledForRecord) { uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", coupledForRecord.error); return; }
+	if (!(await ensureAxisReady(coupledForRecord))) { return; }
 	runsAtStart = selectedBoard.value?.closedLoop?.runs ?? -1;
 	recording.value = true;
 	try {
@@ -1035,34 +1082,33 @@ const MIN_STEP_DISTANCE_FRACTION = 0.5; // require at least half the intended st
 
 /**
  * Gate before any axis-moving capture. Tuning moves use G1's H2 (individual motor) mode, which drives
- * the motor directly and bypasses RRF's kinematics — so M208 soft limits never apply to them. This is
- * the only thing keeping a tuning move off the frame now that tuning happens on the loaded axis.
- * Requires the axis to be homed (otherwise its position relative to the frame is unknown); if it isn't
- * already near the middle of its travel, warns the user and moves it there first via a normal
- * (kinematics-respecting) G1 move, so the tuning move has room on both sides. No-op for extruders or
- * axes the object model hasn't reported a position for yet.
+ * one axis's own motor directly and bypasses RRF's kinematics — so M208 soft limits never apply to
+ * them. On coupled kinematics (CoreXY etc.) that single motor can displace MORE than one Cartesian axis
+ * (see kinematics.ts) — `axes` must already be the full coupled set from `coupledAxesForDriver()`,
+ * every one of them homed (that function's own job), or this can't prove the move is safe.
  *
- * `centerToMid: false` skips the move-to-mid leg entirely (still enforcing the homed check) — for a
- * caller that's about to reposition to its own precisely-planned, already-safety-clamped start position
- * regardless (see `captureRaw`), routing through mid first is just an extra physical round trip.
+ * If any coupled axis isn't already near the middle of its own travel, warns the user and moves ALL of
+ * them there together via one normal (kinematics-respecting) multi-axis G1 move, so the tuning move has
+ * room on every side it can actually reach. No-op when `axes` is empty (extruder — no axis to couple).
+ *
+ * `centerToMid: false` skips the move-to-mid leg entirely — for a caller that's about to reposition to
+ * its own precisely-planned, already-safety-clamped start positions regardless (see `captureRaw`),
+ * routing through the midpoint first is just an extra physical round trip.
  */
-async function ensureAxisReady(limits: AxisLimits | null, opts: { centerToMid?: boolean } = {}): Promise<boolean> {
-	if (!limits) { return true; }
-	if (!limits.homed) {
-		uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", `${limits.letter} is not homed — home it first so the plugin knows its position relative to the frame.`);
-		return false;
-	}
+async function ensureAxisReady(axes: Array<CoupledAxisLimits>, opts: { centerToMid?: boolean } = {}): Promise<boolean> {
+	if (axes.length === 0) { return true; }
 	if (opts.centerToMid === false) { return true; }
-	const mid = midpoint(limits);
-	if (Math.abs(mid - limits.position) < CENTER_TOLERANCE_MM) { return true; }
-	const move = `G90 G1 ${limits.letter}${mid.toFixed(3)} F${CENTERING_FEED_MM_MIN}`;
+	const targets = axes.filter((a) => Math.abs(midpoint(a) - a.position) >= CENTER_TOLERANCE_MM);
+	if (targets.length === 0) { return true; }
+	const letters = targets.map((a) => a.letter).join(", ");
+	const move = `G90 G1 ${targets.map((a) => `${a.letter}${midpoint(a).toFixed(3)}`).join(" ")} F${CENTERING_FEED_MM_MIN}`;
 	if (autoRunning.value) {
 		// Auto-tune's upfront consent dialog already covers centering moves — no per-move prompt mid-run.
-		log(`Centering ${limits.letter} to ${mid.toFixed(1)} mm (was ${limits.position.toFixed(1)} mm) — consented to upfront.`);
+		log(`Centering ${letters} to ${targets.length > 1 ? "their" : "its"} travel midpoint — consented to upfront.`);
 	} else {
-		const message = `Before tuning, ${limits.letter} will move to the middle of its travel `
-			+ `(${mid.toFixed(1)} mm — currently ${limits.position.toFixed(1)} mm) so it has room to move safely `
-			+ `in both directions. Make sure the axis is clear, then proceed.`;
+		const message = `Before tuning, ${letters} will move to the middle of ${targets.length > 1 ? "their" : "its"} travel `
+			+ `so there's room to move safely in every direction this driver's motor affects. `
+			+ `Make sure the axes are clear, then proceed.`;
 		if (!(await confirmAsync(message, move))) { return false; }
 	}
 	await send(move);
@@ -1080,16 +1126,19 @@ async function ensureAxisReady(limits: AxisLimits | null, opts: { centerToMid?: 
  */
 async function captureStep(): Promise<StepMetrics | null> {
 	const ax = axisForDriver();
-	if (!(await ensureAxisReady(getAxisLimits(ax)))) { return null; }
-	const limits = getAxisLimits(axisForDriver()); // re-read: ensureAxisReady may have moved the axis
+	const coupled = coupledAxesForDriver();
+	if ("error" in coupled) { log(`Step capture: ${coupled.error}`); uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", coupled.error); return null; }
+	if (!(await ensureAxisReady(coupled))) { return null; }
+	const freshCoupled = coupledAxesForDriver(); // re-read: ensureAxisReady may have moved the axes
+	if ("error" in freshCoupled) { log(`Step capture: ${freshCoupled.error}`); uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", freshCoupled.error); return null; }
 	const stepVars = varIds(ALL_CAPTURE_KEYS);
 	let c: ParsedCapture | null;
 	if (ax?.letter) {
 		const desired = stepJumpDistanceMm({ stepsPerMm: Number(ax.stepsPerMm), microstepping: Number(ax.microstepping?.value) });
 		let dist = desired;
 		let sign: 1 | -1 = 1;
-		if (limits) {
-			const plan = planSymmetricMove(limits, desired, marginMm.value, desired * MIN_STEP_DISTANCE_FRACTION);
+		if (freshCoupled.length > 0) {
+			const plan = planCoupledSymmetricMove(freshCoupled, desired, marginMm.value, desired * MIN_STEP_DISTANCE_FRACTION);
 			if ("error" in plan) { log(`Step capture: ${plan.error}`); uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", plan.error); return null; }
 			dist = plan.distance; sign = plan.sign;
 		}
@@ -1112,13 +1161,14 @@ async function captureStep(): Promise<StepMetrics | null> {
  * meaningful at-rest tail — the same capture serves every term's decision instead of a separate
  * "step" move and "A/V" move judged by different (and, for step, wrong) metrics.
  *
- * The move is CENTRED on the axis's midpoint (not just started from it): `planCaptureProfile` derives
- * `startPosition` (mid − d/2) from the axis's min/max alone, so this pre-positions straight there in
- * one hop (no intermediate stop at mid) before the H2 move — using the full clear travel instead of
- * half of it (see limits.ts). Distance
- * defaults to "auto" (0 = longest reasonable move, up to `AUTO_MOVE_CAP_MM`), which also derives the
- * sample rate from the move's own duration; the returned `rateHz` is what was actually used, for the
- * caller to pass to analysis so it matches what the firmware was told to capture at.
+ * The move is CENTRED on every coupled axis's own midpoint (not just started from it): `planCaptureProfile`
+ * derives each `startPositions` entry (mid − perUnit·d/2) from that axis's own min/max alone, so this
+ * pre-positions straight there in one hop (no intermediate stop at mid) before the H2 move — using the
+ * full clear travel on every axis the tuned motor actually displaces (see limits.ts / kinematics.ts),
+ * not just the nominal one. Distance defaults to "auto" (0 = longest reasonable motor-space move, up to
+ * `AUTO_MOVE_CAP_MM`), which also derives the sample rate from the move's own duration; the returned
+ * `rateHz` is what was actually used, for the caller to pass to analysis so it matches what the
+ * firmware was told to capture at.
  */
 interface RawCaptureResult {
 	capture: ParsedCapture;
@@ -1134,24 +1184,34 @@ async function captureRaw(): Promise<RawCaptureResult | null> {
 	const axisObj = axisForDriver();
 	const axis = axisObj?.letter ?? null;
 	if (!axis) { uiStore.makeNotification(LogLevel.warning, "Closed Loop Tuning", "Signal-based tuning needs the driver's axis — skipped."); return null; }
-	// No move-to-mid here: planCaptureProfile below computes startPosition from the axis's min/max alone
-	// (never from current position), so centering to mid first would just be an extra round trip before
-	// the explicit reposition a few lines down. Only the homed check applies.
-	if (!(await ensureAxisReady(getAxisLimits(axisObj), { centerToMid: false }))) { return null; }
-	let limits = getAxisLimits(axisForDriver());
-	const profile = planCaptureProfile(limits, avFeed.value, samples.value, sampleRate.value, marginMm.value, { maxDistanceMm: avDistance.value });
+	const coupled = coupledAxesForDriver();
+	if ("error" in coupled) { log(`Tuning capture: ${coupled.error}`); uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", coupled.error); return null; }
+	// No move-to-mid here: planCaptureProfile below computes each start position from every coupled
+	// axis's own min/max alone (never from current position), so centering to mid first would just be
+	// an extra round trip before the explicit reposition a few lines down. Only the homed check applies.
+	if (!(await ensureAxisReady(coupled, { centerToMid: false }))) { return null; }
+	const freshCoupled = coupledAxesForDriver();
+	if ("error" in freshCoupled) { log(`Tuning capture: ${freshCoupled.error}`); uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", freshCoupled.error); return null; }
+	const profile = planCaptureProfile(freshCoupled, avFeed.value, samples.value, sampleRate.value, marginMm.value, { maxDistanceMm: avDistance.value });
 	if ("error" in profile) { log(`Tuning capture: ${profile.error}`); uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", profile.error); return null; }
 
-	// Centre the MOVE on the midpoint, not just the axis: pre-position to the plan's own start (mid −
-	// d/2) via a normal, soft-limit-respecting G1 before the H2 tuning move — this is what unlocks the
-	// full clear travel instead of only the half reachable by moving one-way from the midpoint.
-	if (limits && Math.abs(profile.startPosition - limits.position) > CENTER_TOLERANCE_MM) {
-		const move = `G90 G1 ${axis}${profile.startPosition.toFixed(3)} F${CENTERING_FEED_MM_MIN}`;
-		log(`Positioning ${axis} to ${profile.startPosition.toFixed(1)} mm for a ${profile.distance.toFixed(0)} mm centred tuning move.`);
+	// Centre the MOVE on every coupled axis's own midpoint, not just the nominal one: pre-position ALL
+	// of them via one normal, soft-limit-respecting multi-axis G1 before the H2 tuning move — this is
+	// what unlocks the full clear travel on every axis the tuned motor actually displaces, instead of
+	// only the half reachable by moving one-way from the midpoint (or, on coupled kinematics, checking
+	// only the nominal axis while another one the same motor moves goes completely unchecked).
+	const needsReposition = profile.startPositions.some((sp) => {
+		const current = freshCoupled.find((a) => a.letter === sp.letter);
+		return !current || Math.abs(sp.position - current.position) > CENTER_TOLERANCE_MM;
+	});
+	if (needsReposition) {
+		const letters = profile.startPositions.map((sp) => sp.letter).join(", ");
+		const move = `G90 G1 ${profile.startPositions.map((sp) => `${sp.letter}${sp.position.toFixed(3)}`).join(" ")} F${CENTERING_FEED_MM_MIN}`;
+		const limitNote = profile.limitedBy ? `, limited by ${profile.limitedBy}` : "";
+		log(`Positioning ${letters} for a ${profile.distance.toFixed(0)} mm centred tuning move${limitNote}.`);
 		await send(move);
 		await send("M400");
 		await delay(400);
-		limits = getAxisLimits(axisForDriver());
 	}
 
 	const signedDist = profile.sign * profile.distance;
@@ -1255,6 +1315,9 @@ async function runAutoTune(): Promise<void> {
 	autoLog.value = [];
 	sessionLog = [];
 	sessionSeq = 0;
+	// The coupling line is logged once per driver; this run just cleared the log it was written to, so
+	// re-arm it or the 2nd+ run on a driver produces a report with no kinematics context at all.
+	loggedCouplingFor = null;
 	resetStageStates();
 	ensureViewKeys(["measuredMotorSteps", "targetMotorSteps", "currentError"]);
 	const totalCycles = Math.max(1, Math.round(cycles.value || 1));
