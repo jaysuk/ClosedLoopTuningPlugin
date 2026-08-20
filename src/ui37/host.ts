@@ -9,6 +9,7 @@ import { useMachineStore } from "@/stores/machine";
 import { LogLevel, useUiStore } from "@/stores/ui";
 import i18n from "@/i18n";
 
+import { ASSET_PATTERN_37 } from "../core/assetPatterns";
 import type { FileListEntry, HostAdapter, NotifyLevel } from "../core/host";
 
 const LEVELS: Record<NotifyLevel, LogLevel> = {
@@ -43,10 +44,7 @@ export function createHost(): HostAdapter {
 		getFileList: (dir) => (machine() as unknown as MachineExtras).getFileList(dir),
 		installPlugin: (filename, blob, start) => (machine() as unknown as MachineExtras).installPlugin(filename, blob, start),
 
-		// The 3.7 package is the plain "<name>-<version>.zip"; the negative lookaheads keep it from
-		// matching the 3.6 sibling asset, or a debug -srcmap.zip, in the same release — either would
-		// otherwise win `find()`'s first-match-wins asset selection ahead of the real package.
-		assetPattern: /^(?!.*-(dwc36|srcmap)\.zip$).*\.zip$/i,
+		assetPattern: ASSET_PATTERN_37,
 
 		notify: (level, title, message) => { useUiStore().makeNotification(LEVELS[level], title, message); },
 		t: (key, args) => i18n.global.t(`plugins.closedLoopTuning.${key}`, args ?? {}),

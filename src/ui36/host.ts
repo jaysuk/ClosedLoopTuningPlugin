@@ -11,6 +11,7 @@ import store from "@/store";
 import { makeNotification } from "@/utils/notifications";
 import { LogType } from "@/utils/logging";
 
+import { ASSET_PATTERN_36 } from "../core/assetPatterns";
 import type { HostAdapter, NotifyLevel } from "../core/host";
 
 const LEVELS: Record<NotifyLevel, LogType> = {
@@ -48,9 +49,7 @@ export function createHost(): HostAdapter {
 			await store.dispatch("machine/installPlugin", { zipFilename: filename, zipBlob: blob, zipFile, start });
 		},
 
-		// Only ever offer the DWC 3.6 package — installing the Vue 3 one here would at best be
-		// rejected by DWC's own dwcVersion check, at worst leave a broken plugin installed.
-		assetPattern: /-dwc36\.zip$/i,
+		assetPattern: ASSET_PATTERN_36,
 
 		notify: (level, title, message) => { makeNotification(LEVELS[level], title, message); },
 		// vue-i18n 8 exposes `t` directly on the instance (vue-i18n 11 nests it under `.global`).

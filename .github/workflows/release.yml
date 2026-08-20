@@ -123,7 +123,10 @@ jobs:
         run: |
           node scripts/stage-dwc36.mjs "$RUNNER_TEMP/clt-dwc36"
           (cd ../DuetWebControl36 && npm run build-plugin-pkg -- "$RUNNER_TEMP/clt-dwc36")
-          ZIP=$(ls ../DuetWebControl36/dist/ClosedLoopTuning-*.zip | head -1)
+          # Exclude -srcmap.zip explicitly: it sorts BEFORE the real package ("-" < "."), so a bare
+          # `head -1` would publish a sourcemap archive as the 3.6 plugin the day DWC 3.6 starts
+          # emitting one (3.7's builder already does). Same class of bug build.bat once shipped.
+          ZIP=$(ls ../DuetWebControl36/dist/ClosedLoopTuning-*.zip 2>/dev/null | grep -v -- '-srcmap\.zip$' | head -1)
           if [ -z "$ZIP" ]; then echo "::error::DWC 3.6 build produced no ZIP"; exit 1; fi
           mv "$ZIP" "./$(basename "${ZIP%.zip}")-dwc36.zip"
           ls -la ClosedLoopTuning-*.zip
