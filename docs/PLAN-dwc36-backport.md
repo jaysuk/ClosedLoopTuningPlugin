@@ -1,8 +1,11 @@
 # Plan: dual DWC 3.6 / 3.7 support for Closed Loop Tuning
 
-**Status:** Phases 0–2 done (host seam, directory restructure, build/release machinery — all verified,
-no behaviour change on 3.7). Phase 3 (the actual DWC 3.6 UI) not started; needs the scope decision in
-§9 before it does.
+**Status:** Phases 0–3 done. Full UI parity chosen for Phase 3 (§9) — every 3.7 panel (manual tuning,
+advanced capture, chart overlay controls) has a Vuetify 2 equivalent, not the reduced set. `build36.bat`
+produces an installable ZIP that compiles cleanly against a real DWC 3.6 checkout (`dwcVersion: "3.6"`
+resolved correctly). **Not yet done:** a live smoke test on an actual DWC 3.6 instance/board — the build
+succeeding proves the SFCs compile, not that every Vuetify 2 prop/slot renders and behaves as intended
+at runtime. Do that (and the CoreXY `G1 H2 Y10` physical check, §8) before shipping a 3.6 release.
 **Reference implementation:** `jaysuk/resonance-lab` (local: `c:\Users\live\Documents\Github\resonance-lab`)
 already does exactly this. **Read it before writing code** — this plan describes how to apply its
 pattern here, not how to invent one.
