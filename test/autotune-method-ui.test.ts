@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { clickByText, mountInDwc, resetDwc } from "dwc-plugin-test-kit";
 
-import ClosedLoopTuning from "../src/components/ClosedLoopTuning.vue";
+import ClosedLoopTuning from "../src/ui37/ClosedLoopTuning.vue";
 
 describe("ClosedLoopTuning — auto-tune method UI (Phase 4)", () => {
 	beforeEach(() => resetDwc());

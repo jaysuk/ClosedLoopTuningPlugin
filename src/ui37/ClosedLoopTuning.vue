@@ -474,7 +474,7 @@ import { computed, nextTick, reactive, ref, watch } from "vue";
 
 import { HelpTip, buildReport, downloadReport, AboutDialog, type AboutExtraAction } from "dwc-plugin-runtime";
 
-import { createHost } from "../ui37/host";
+import { createHost } from "./host";
 import CaptureChart from "./CaptureChart.vue";
 import { evaluateTune, gradeColor, severityColor, severityIcon, type Term, type TuneEvaluation } from "../model/evaluate";
 import { CAPTURE_DIR, CONFIG_FILE, DOCS, LS_STATE, PLUGIN_ID } from "../model/constants";
@@ -500,7 +500,7 @@ import {
 	type TuneEffects, type TuneMethod,
 } from "../model/autorun";
 import { downsampleCapture, shapeCapturesForDownload, slimModelForReport, type ReportCapture } from "../model/report";
-import { applying, applyUpdateNow, checking, dismissCurrentUpdate, pendingReload, runUpdateCheck, setUpdateChecksEnabled, updateChecksEnabled, updateState } from "../model/updateCheck";
+import { applying, applyUpdateNow, checking, dismissCurrentUpdate, pendingReload, runUpdateCheck, setUpdateChecksEnabled, updateChecksEnabled, updateState } from "../updateCheck";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 

@@ -15,12 +15,12 @@ import { applyUpdate, checkForUpdate, type UpdateResult } from "dwc-plugin-runti
 import { announceUpdate, clearAnnouncedUpdate, isUpdateHostActive, registerUpdateChecker } from "dwc-plugin-runtime/updateHub";
 import { ref } from "vue";
 
-import type { HostAdapter } from "../core/host";
-import { PLUGIN_MANIFEST_ID } from "./constants";
+import type { HostAdapter } from "./core/host";
+import { PLUGIN_MANIFEST_ID } from "./model/constants";
 
 /**
  * Set once at plugin load by whichever entry point is running (ui37/index.ts or ui36/index.ts). This
- * module runs before any component mounts, so it cannot reach a store directly — see ../core/host.
+ * module runs before any component mounts, so it cannot reach a store directly — see ./core/host.
  */
 let host: HostAdapter | null = null;
 export function setUpdateHost(h: HostAdapter): void { host = h; }
