@@ -39,7 +39,7 @@
 		</div>
 
 		<AboutDialog v-model="aboutOpen" plugin-id="ClosedLoopTuning" title="Closed Loop Tuning"
-					 :description="aboutDescription" :model="machineStore.model"
+					 :description="aboutDescription" :model="host.model()"
 					 repo="https://github.com/jaysuk/ClosedLoopTuningPlugin"
 					 :docs-url="DOCS.tuning" docs-label="Duet closed-loop tuning guide"
 					 :update-available="updateState?.updateAvailable ?? false" :latest-version="updateState?.latestVersion"
@@ -472,11 +472,9 @@
 <script setup lang="ts">
 import { computed, nextTick, reactive, ref, watch } from "vue";
 
-import { useMachineStore } from "@/stores/machine";
-import { LogLevel, useUiStore } from "@/stores/ui";
-
 import { HelpTip, buildReport, downloadReport, AboutDialog, type AboutExtraAction } from "dwc-plugin-runtime";
 
+import { createHost } from "../ui37/host";
 import CaptureChart from "./CaptureChart.vue";
 import { evaluateTune, gradeColor, severityColor, severityIcon, type Term, type TuneEvaluation } from "../model/evaluate";
 import { CAPTURE_DIR, CONFIG_FILE, DOCS, LS_STATE, PLUGIN_ID } from "../model/constants";
@@ -506,8 +504,7 @@ import { applying, applyUpdateNow, checking, dismissCurrentUpdate, pendingReload
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-const machineStore = useMachineStore();
-const uiStore = useUiStore();
+const host = createHost();
 
 const captureVariables = CAPTURE_VARIABLES;
 const encoderTypes = ENCODER_TYPES;
@@ -740,11 +737,11 @@ function recordSessionCapture(phase: string, value: number | undefined, metrics:
 }
 function downloadTuningReport(): void {
 	if (!tuneSession.value) { return; }
-	const version = ((machineStore.model as any)?.plugins?.get?.("ClosedLoopTuning")?.version) ?? "unknown";
+	const version = ((host.model() as any)?.plugins?.get?.("ClosedLoopTuning")?.version) ?? "unknown";
 	const axisObj = axisForDriver();
 	const model = slimModelForReport(
 		selectedBoard.value ? { firmwareName: selectedBoard.value.firmwareName, firmwareVersion: selectedBoard.value.firmwareVersion, canAddress: selectedBoard.value.canAddress, closedLoop: selectedBoard.value.closedLoop } : null,
-		(machineStore.model as any).move?.kinematics?.name,
+		(host.model() as any).move?.kinematics?.name,
 		axisObj ? { letter: axisObj.letter, min: axisObj.min, max: axisObj.max, stepsPerMm: axisObj.stepsPerMm, microstepping: axisObj.microstepping, homed: axisObj.homed } : null,
 	);
 	const state: TuneSession = { ...tuneSession.value, captures: shapeCapturesForDownload(tuneSession.value.captures, includeAllCsv.value) };
@@ -771,7 +768,7 @@ function reloadPage(): void { window.location.reload(); }
 // --- Drivers from the object model ---
 interface DriverEntry { name: string; value: string }
 const drivers = computed<Array<DriverEntry>>(() => {
-	const model = machineStore.model as any;
+	const model = host.model() as any;
 	const boards = model.boards ?? [];
 	// Closed-loop support shows up in the object model two different ways (@duet3d/objectmodel):
 	//  - `board.closedLoop` ({ points, runs }) — an aggregate Duet3D's own 1HCL/M23CL firmware populates,
@@ -806,19 +803,19 @@ const drivers = computed<Array<DriverEntry>>(() => {
 const selectedBoard = computed<any>(() => {
 	if (!selectedDriver.value) { return null; }
 	const addr = parseInt(selectedDriver.value.split(".")[0]);
-	return (machineStore.model as any).boards?.find((b: any) => b && b.canAddress === addr) ?? null;
+	return (host.model() as any).boards?.find((b: any) => b && b.canAddress === addr) ?? null;
 });
 
 /** The axis object the selected driver belongs to (null for extruders / unknown). */
 function axisForDriver(): any {
 	if (!selectedDriver.value) { return null; }
-	return (machineStore.model as any).move?.axes?.find((a: any) => (a.drivers ?? []).some((d: any) => `${d.board}.${d.driver}` === selectedDriver.value)) ?? null;
+	return (host.model() as any).move?.axes?.find((a: any) => (a.drivers ?? []).some((d: any) => `${d.board}.${d.driver}` === selectedDriver.value)) ?? null;
 }
 /** Index of the selected driver's axis into move.axes[] — the column kinematics.ts needs to resolve
  * which OTHER axes a G1 H2 move on this driver's own motor also displaces (see coupledAxesForDriver). */
 function axisIndexForDriver(): number | null {
 	if (!selectedDriver.value) { return null; }
-	const axes = (machineStore.model as any).move?.axes ?? [];
+	const axes = (host.model() as any).move?.axes ?? [];
 	const idx = axes.findIndex((a: any) => (a.drivers ?? []).some((d: any) => `${d.board}.${d.driver}` === selectedDriver.value));
 	return idx >= 0 ? idx : null;
 }
@@ -839,8 +836,8 @@ function coupledAxesForDriver(): Array<CoupledAxisLimits> | { error: string } {
 	if (!axisObj) { return []; }
 	const index = axisIndexForDriver();
 	if (index === null) { return { error: "Could not resolve the selected driver's axis index." }; }
-	const axes = (machineStore.model as any).move?.axes ?? [];
-	const kinematics = (machineStore.model as any).move?.kinematics;
+	const axes = (host.model() as any).move?.axes ?? [];
+	const kinematics = (host.model() as any).move?.kinematics;
 	const coupling = resolveMotionCoupling(kinematics, axes, index);
 	if ("error" in coupling) { return coupling; }
 	const out: Array<CoupledAxisLimits> = [];
@@ -905,7 +902,7 @@ function runCalibration(c: CalibrationMove): void {
 async function runCalibrationSilent(moveId: number): Promise<string> {
 	if (!selectedDriver.value) { return "No driver selected."; }
 	try {
-		return await machineStore.sendCode(buildCalibrationCommand(selectedDriver.value, moveId), false, false);
+		return await host.sendCode(buildCalibrationCommand(selectedDriver.value, moveId), { log: false });
 	} catch (e) { console.warn("[ClosedLoopTuning] runCalibrationSilent failed", e); return `Error: ${e instanceof Error ? e.message : String(e)}`; }
 }
 
@@ -914,7 +911,7 @@ const pidPreview = computed(() => selectedDriver.value ? buildPidCommand(selecte
 async function loadPid(): Promise<void> {
 	if (!selectedDriver.value) { return; }
 	try {
-		const reply = await machineStore.sendCode(`M569.1 P${selectedDriver.value}`, false, false);
+		const reply = await host.sendCode(`M569.1 P${selectedDriver.value}`, { log: false });
 		Object.assign(pid, parsePidReply(reply));
 	} catch (e) { console.warn("[ClosedLoopTuning] loadPid failed", e); }
 }
@@ -945,20 +942,20 @@ let runsAtStart = -1;
 async function record(): Promise<void> {
 	if (!canRecord.value) { return; }
 	if (moveMode.value === "custom" && !customMove.value) {
-		uiStore.makeNotification(LogLevel.warning, "Closed Loop Tuning", "Enter a move before recording.");
+		host.notify("warning", "Closed Loop Tuning", "Enter a move before recording.");
 		return;
 	}
 	// Centre first if needed — this doesn't bounds-check a custom move's distance (it's arbitrary
 	// G-code), only makes sure every axis this driver's motor can move is starting from its own midpoint.
 	const coupledForRecord = coupledAxesForDriver();
-	if ("error" in coupledForRecord) { uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", coupledForRecord.error); return; }
+	if ("error" in coupledForRecord) { host.notify("error", "Closed Loop Tuning", coupledForRecord.error); return; }
 	if (!(await ensureAxisReady(coupledForRecord))) { return; }
 	runsAtStart = selectedBoard.value?.closedLoop?.runs ?? -1;
 	recording.value = true;
 	try {
-		const reply = await machineStore.sendCode(buildCaptureCommand(captureOptions()), false, false);
+		const reply = await host.sendCode(buildCaptureCommand(captureOptions()), { log: false });
 		if (reply && reply.startsWith("Error:")) {
-			uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", reply);
+			host.notify("error", "Closed Loop Tuning", reply);
 			recording.value = false;
 		}
 	} catch (e) {
@@ -976,11 +973,11 @@ watch(() => selectedBoard.value?.closedLoop?.runs, async (runs) => {
 /** Load the newest capture CSV into the chart; returns the parsed capture (no analysis). */
 async function loadLatestCsv(): Promise<ParsedCapture | null> {
 	try {
-		const list = await machineStore.getFileList(CAPTURE_DIR);
+		const list = await host.getFileList(CAPTURE_DIR);
 		const files = list.filter((f: any) => !f.isDirectory && f.name.endsWith(".csv"))
 			.sort((a: any, b: any) => (b.lastModified ?? 0) - (a.lastModified ?? 0));
 		if (files.length === 0) { return null; }
-		const text = await (machineStore as any).download({ filename: `${CAPTURE_DIR}/${files[0].name}`, type: "text" }, false, false, false) as string;
+		const text = await host.download(`${CAPTURE_DIR}/${files[0].name}`);
 		rawText.value = text;
 		capture.value = parseCapture(text);
 		return capture.value;
@@ -1066,9 +1063,9 @@ function ensureViewKeys(defaults: Array<string>): void {
 /** Run a capture command (built directly, not from the user's manual settings), wait for it to finish, load the CSV. */
 async function runCapture(opts: Parameters<typeof buildCaptureCommand>[0]): Promise<ParsedCapture | null> {
 	const startRuns = selectedBoard.value?.closedLoop?.runs ?? -1;
-	const reply = await machineStore.sendCode(buildCaptureCommand(opts), false, false);
+	const reply = await host.sendCode(buildCaptureCommand(opts), { log: false });
 	if (reply && reply.startsWith("Error:")) {
-		uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", reply);
+		host.notify("error", "Closed Loop Tuning", reply);
 		log(`Firmware rejected the capture: ${reply}`);
 		return null;
 	}
@@ -1127,10 +1124,10 @@ async function ensureAxisReady(axes: Array<CoupledAxisLimits>, opts: { centerToM
 async function captureStep(): Promise<StepMetrics | null> {
 	const ax = axisForDriver();
 	const coupled = coupledAxesForDriver();
-	if ("error" in coupled) { log(`Step capture: ${coupled.error}`); uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", coupled.error); return null; }
+	if ("error" in coupled) { log(`Step capture: ${coupled.error}`); host.notify("error", "Closed Loop Tuning", coupled.error); return null; }
 	if (!(await ensureAxisReady(coupled))) { return null; }
 	const freshCoupled = coupledAxesForDriver(); // re-read: ensureAxisReady may have moved the axes
-	if ("error" in freshCoupled) { log(`Step capture: ${freshCoupled.error}`); uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", freshCoupled.error); return null; }
+	if ("error" in freshCoupled) { log(`Step capture: ${freshCoupled.error}`); host.notify("error", "Closed Loop Tuning", freshCoupled.error); return null; }
 	const stepVars = varIds(ALL_CAPTURE_KEYS);
 	let c: ParsedCapture | null;
 	if (ax?.letter) {
@@ -1139,14 +1136,14 @@ async function captureStep(): Promise<StepMetrics | null> {
 		let sign: 1 | -1 = 1;
 		if (freshCoupled.length > 0) {
 			const plan = planCoupledSymmetricMove(freshCoupled, desired, marginMm.value, desired * MIN_STEP_DISTANCE_FRACTION);
-			if ("error" in plan) { log(`Step capture: ${plan.error}`); uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", plan.error); return null; }
+			if ("error" in plan) { log(`Step capture: ${plan.error}`); host.notify("error", "Closed Loop Tuning", plan.error); return null; }
 			dist = plan.distance; sign = plan.sign;
 		}
 		const signedDist = sign * dist;
 		const feed = stepJumpFeedMmPerMin(dist).toFixed(0);
 		const move = `G91 G1 H2 ${ax.letter}${signedDist.toFixed(3)} F${feed} G90`;
 		c = await runCapture({ driver: selectedDriver.value ?? "", samples: samples.value, activate: 1, rate: sampleRate.value, variables: stepVars, manoeuvre: 0, move });
-		try { await machineStore.sendCode(`G91 G1 H2 ${ax.letter}${(-signedDist).toFixed(3)} F${feed} G90`, false, false); } catch { /* return move */ }
+		try { await host.sendCode(`G91 G1 H2 ${ax.letter}${(-signedDist).toFixed(3)} F${feed} G90`, { log: false }); } catch { /* return move */ }
 	} else {
 		c = await runCapture({ driver: selectedDriver.value ?? "", samples: samples.value, activate: 0, rate: sampleRate.value, variables: stepVars, manoeuvre: 64 });
 	}
@@ -1183,17 +1180,17 @@ interface RawCaptureResult {
 async function captureRaw(): Promise<RawCaptureResult | null> {
 	const axisObj = axisForDriver();
 	const axis = axisObj?.letter ?? null;
-	if (!axis) { uiStore.makeNotification(LogLevel.warning, "Closed Loop Tuning", "Signal-based tuning needs the driver's axis — skipped."); return null; }
+	if (!axis) { host.notify("warning", "Closed Loop Tuning", "Signal-based tuning needs the driver's axis — skipped."); return null; }
 	const coupled = coupledAxesForDriver();
-	if ("error" in coupled) { log(`Tuning capture: ${coupled.error}`); uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", coupled.error); return null; }
+	if ("error" in coupled) { log(`Tuning capture: ${coupled.error}`); host.notify("error", "Closed Loop Tuning", coupled.error); return null; }
 	// No move-to-mid here: planCaptureProfile below computes each start position from every coupled
 	// axis's own min/max alone (never from current position), so centering to mid first would just be
 	// an extra round trip before the explicit reposition a few lines down. Only the homed check applies.
 	if (!(await ensureAxisReady(coupled, { centerToMid: false }))) { return null; }
 	const freshCoupled = coupledAxesForDriver();
-	if ("error" in freshCoupled) { log(`Tuning capture: ${freshCoupled.error}`); uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", freshCoupled.error); return null; }
+	if ("error" in freshCoupled) { log(`Tuning capture: ${freshCoupled.error}`); host.notify("error", "Closed Loop Tuning", freshCoupled.error); return null; }
 	const profile = planCaptureProfile(freshCoupled, avFeed.value, samples.value, sampleRate.value, marginMm.value, { maxDistanceMm: avDistance.value });
-	if ("error" in profile) { log(`Tuning capture: ${profile.error}`); uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", profile.error); return null; }
+	if ("error" in profile) { log(`Tuning capture: ${profile.error}`); host.notify("error", "Closed Loop Tuning", profile.error); return null; }
 
 	// Centre the MOVE on every coupled axis's own midpoint, not just the nominal one: pre-position ALL
 	// of them via one normal, soft-limit-respecting multi-axis G1 before the H2 tuning move — this is
@@ -1221,7 +1218,7 @@ async function captureRaw(): Promise<RawCaptureResult | null> {
 		variables: varIds(ALL_CAPTURE_KEYS), manoeuvre: 0,
 		move: `G91 G1 H2 ${axis}${signedDist.toFixed(3)} F${avFeed.value} G90`,
 	});
-	try { await machineStore.sendCode(`G91 G1 H2 ${axis}${(-signedDist).toFixed(3)} F${avFeed.value} G90`, false, false); } catch { /* ignore return-move error */ }
+	try { await host.sendCode(`G91 G1 H2 ${axis}${(-signedDist).toFixed(3)} F${avFeed.value} G90`, { log: false }); } catch { /* ignore return-move error */ }
 	return c ? { capture: c, rateHz: profile.sampleRateHz } : null;
 }
 
@@ -1248,7 +1245,7 @@ function log(line: string): void {
 async function readPidSnapshot(): Promise<PidConfig | null> {
 	if (!selectedDriver.value) { return null; }
 	try {
-		const reply = await machineStore.sendCode(`M569.1 P${selectedDriver.value}`, false, false);
+		const reply = await host.sendCode(`M569.1 P${selectedDriver.value}`, { log: false });
 		return parsePidReply(reply);
 	} catch (e) { console.warn("[ClosedLoopTuning] readPidSnapshot failed", e); return null; }
 }
@@ -1340,7 +1337,7 @@ async function runAutoTune(): Promise<void> {
 		if (result.ok) {
 			const gradeNote = result.evaluation ? ` Final grade: ${result.evaluation.grade} (${result.evaluation.score}/100).` : "";
 			autoStatus.value = `Auto-tune complete — P=${pid.p} D=${pid.d} I=${pid.i} A=${pid.a} V=${pid.v}.${gradeNote}`;
-			uiStore.makeNotification(LogLevel.success, "Closed Loop Tuning", autoStatus.value + " Review the evaluation, then save to config.g.");
+			host.notify("success", "Closed Loop Tuning", autoStatus.value + " Review the evaluation, then save to config.g.");
 		} else {
 			autoStatus.value = result.restored
 				? `Auto-tune stopped (${result.reason ?? "see log"}) — PID restored to its values from before this run.`
@@ -1392,9 +1389,9 @@ const configBlock = computed(() => {
 async function copyConfig(): Promise<void> {
 	try {
 		await navigator.clipboard.writeText(configBlock.value);
-		uiStore.makeNotification(LogLevel.success, "Closed Loop Tuning", "config.g block copied to clipboard.");
+		host.notify("success", "Closed Loop Tuning", "config.g block copied to clipboard.");
 	} catch {
-		uiStore.makeNotification(LogLevel.warning, "Closed Loop Tuning", "Couldn't access the clipboard — select and copy the block manually.");
+		host.notify("warning", "Closed Loop Tuning", "Couldn't access the clipboard — select and copy the block manually.");
 	}
 }
 
@@ -1409,7 +1406,7 @@ async function confirmSaveToConfigG(): Promise<void> {
 async function saveToConfigG(): Promise<void> {
 	if (!selectedDriver.value) { return; }
 	try {
-		const currentText = await (machineStore as any).download({ filename: CONFIG_FILE, type: "text" }, false, false, false) as string;
+		const currentText = await host.download(CONFIG_FILE);
 		const result = upsertTuneBlock(currentText, {
 			driver: selectedDriver.value,
 			pid,
@@ -1418,17 +1415,17 @@ async function saveToConfigG(): Promise<void> {
 			calibrationMoveIds: requiredMoveIds.value,
 		});
 		if (!result.changed) {
-			uiStore.makeNotification(LogLevel.info, "Closed Loop Tuning", "config.g already has these values — nothing to write.");
+			host.notify("info", "Closed Loop Tuning", "config.g already has these values — nothing to write.");
 			return;
 		}
 		// Belt-and-suspenders backup of our own, on top of whatever DWC does automatically for config.g uploads.
 		const backupName = `${CONFIG_FILE}.clt-${new Date().toISOString().replace(/[:.]/g, "-")}.bak`;
-		await (machineStore as any).upload({ filename: backupName, content: currentText }, false, false, false);
-		await (machineStore as any).upload({ filename: CONFIG_FILE, content: result.text }, false, true, true);
-		uiStore.makeNotification(LogLevel.success, "Closed Loop Tuning", `config.g ${result.replaced ? "updated" : "written"} (backup: ${backupName.split("/").pop()}). Restart the board to apply it.`);
+		await host.upload(backupName, currentText);
+		await host.upload(CONFIG_FILE, result.text, { showSuccess: true, showError: true });
+		host.notify("success", "Closed Loop Tuning", `config.g ${result.replaced ? "updated" : "written"} (backup: ${backupName.split("/").pop()}). Restart the board to apply it.`);
 	} catch (e) {
 		console.warn("[ClosedLoopTuning] saveToConfigG failed", e);
-		uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", `Couldn't write config.g: ${e instanceof Error ? e.message : String(e)}`);
+		host.notify("error", "Closed Loop Tuning", `Couldn't write config.g: ${e instanceof Error ? e.message : String(e)}`);
 	}
 }
 
@@ -1468,9 +1465,9 @@ function confirmCancel(): void {
 }
 async function send(code: string): Promise<void> {
 	try {
-		const reply = await machineStore.sendCode(code, false, true);
+		const reply = await host.sendCode(code);
 		if (reply && reply.startsWith("Error:")) {
-			uiStore.makeNotification(LogLevel.error, "Closed Loop Tuning", reply);
+			host.notify("error", "Closed Loop Tuning", reply);
 		}
 	} catch (e) { console.warn("[ClosedLoopTuning] send failed", code, e); }
 }

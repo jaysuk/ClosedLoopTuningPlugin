@@ -3,16 +3,27 @@
  * dwc-plugin-runtime. On load it checks this fork's GitHub Releases and announces a newer build into
  * the hub (a host like Flexible Layouts shows it in the unified popup); otherwise it falls back to a
  * one-off notification and the About tab shows an in-context banner with one-click apply.
+ *
+ * Shared by both DWC generations (see ../core/host.ts) — reaches DWC only through the `HostAdapter`
+ * set by whichever entry point is running, never through a store directly. That's what lets this same
+ * file compile and run against both the Pinia (3.7) and Vuex (3.6) builds.
  */
+// Deep subpath imports, not the package barrel: the barrel also re-exports AboutDialog/HelpTip/
+// PluginWidgetConfigForm, which call Vue 3's `resolveComponent` — absent in Vue 2.7, so pulling the
+// barrel into this shared module would break the DWC 3.6 build. These modules import no Vue at all.
+import { applyUpdate, checkForUpdate, type UpdateResult } from "dwc-plugin-runtime/updates";
+import { announceUpdate, clearAnnouncedUpdate, isUpdateHostActive, registerUpdateChecker } from "dwc-plugin-runtime/updateHub";
 import { ref } from "vue";
 
-import { announceUpdate, applyUpdate, checkForUpdate, clearAnnouncedUpdate, isUpdateHostActive, registerUpdateChecker, type UpdateResult } from "dwc-plugin-runtime";
-
-import i18n from "@/i18n";
-import { useMachineStore } from "@/stores/machine";
-import { LogLevel, useUiStore } from "@/stores/ui";
-
+import type { HostAdapter } from "../core/host";
 import { PLUGIN_MANIFEST_ID } from "./constants";
+
+/**
+ * Set once at plugin load by whichever entry point is running (ui37/index.ts or ui36/index.ts). This
+ * module runs before any component mounts, so it cannot reach a store directly — see ../core/host.
+ */
+let host: HostAdapter | null = null;
+export function setUpdateHost(h: HostAdapter): void { host = h; }
 
 const OWNER = "jaysuk";
 const REPO = "ClosedLoopTuningPlugin";
@@ -28,8 +39,10 @@ export const applying = ref(false);
 export const pendingReload = ref(false);
 export const dismissedVersion = ref<string | null>(safeGet(LS_DISMISSED));
 
-const t = (key: string, named?: Record<string, unknown>) =>
-	i18n.global.t(`plugins.closedLoopTuning.updates.${key}`, named ?? {});
+// Namespaced under "updates." — the plugin's own top-level title (used for the update-hub banner
+// below) is a SEPARATE key, read directly via host.t("title") rather than through this helper.
+const t = (key: string, named?: Record<string, unknown>) => host?.t(`updates.${key}`, named) ?? "";
+const pluginTitle = () => host?.t("title") ?? "Closed Loop Tuning";
 
 function safeGet(key: string): string | null {
 	try { return localStorage.getItem(key); } catch { return null; }
@@ -39,7 +52,7 @@ function safeSet(key: string, value: string): void {
 }
 
 function currentVersion(): string {
-	const plugins = (useMachineStore().model as { plugins?: Map<string, { version?: string }> }).plugins;
+	const plugins = (host?.model() as { plugins?: Map<string, { version?: string }> } | undefined)?.plugins;
 	return plugins?.get(PLUGIN_MANIFEST_ID)?.version ?? "0.0.0";
 }
 
@@ -51,10 +64,11 @@ export function setUpdateChecksEnabled(on: boolean): void {
 	if (!on) clearAnnouncedUpdate(PLUGIN_MANIFEST_ID);
 }
 
+/** Announce (or clear) this plugin's update in the shared cross-plugin hub, based on the last check. */
 function syncHub(): void {
 	const s = updateState.value;
 	if (s?.updateAvailable && dismissedVersion.value !== s.latestVersion) {
-		announceUpdate(PLUGIN_MANIFEST_ID, i18n.global.t("plugins.closedLoopTuning.title"), s);
+		announceUpdate(PLUGIN_MANIFEST_ID, pluginTitle(), s);
 	} else {
 		clearAnnouncedUpdate(PLUGIN_MANIFEST_ID);
 	}
@@ -71,14 +85,19 @@ export async function runUpdateCheck(opts: { force?: boolean; notify?: boolean }
 	}
 	checking.value = true;
 	try {
-		const result = await checkForUpdate({ owner: OWNER, repo: REPO, currentVersion: currentVersion() });
+		const result = await checkForUpdate({
+			owner: OWNER, repo: REPO, currentVersion: currentVersion(),
+			// A release ships one ZIP per DWC generation; without this the checker takes whichever
+			// *.zip GitHub lists first and could offer a 3.6 user the Vue 3 package.
+			...(host?.assetPattern ? { assetPattern: host.assetPattern } : {}),
+		});
 		updateState.value = result;
 		safeSet(LS_LAST, String(Date.now()));
 		if (opts.notify && result.updateAvailable && dismissedVersion.value !== result.latestVersion && !isUpdateHostActive()) {
 			const message = result.scenario === "dwcUpdate"
 				? t("notifyDwc", { version: result.latestVersion, dwc: result.requiredDwc })
 				: t("notifyPlugin", { version: result.latestVersion });
-			useUiStore().makeNotification(LogLevel.info, t("title"), message);
+			host?.notify("info", t("title"), message);
 		}
 		syncHub();
 		return result;
@@ -102,10 +121,8 @@ export function dismissCurrentUpdate(): void {
 
 export async function applyUpdateNow(): Promise<void> {
 	const result = updateState.value;
-	const machine = useMachineStore();
-	const ui = useUiStore();
 	if (!result?.assetUrl || !result.assetName) {
-		ui.makeNotification(LogLevel.warning, t("title"), t("applyFailed"));
+		host?.notify("warning", t("title"), t("applyFailed"));
 		return;
 	}
 	applying.value = true;
@@ -113,18 +130,14 @@ export async function applyUpdateNow(): Promise<void> {
 		await applyUpdate({
 			assetUrl: result.assetUrl,
 			assetName: result.assetName,
-			installPlugin: async (filename, blob, start) => {
-				await (machine as unknown as {
-					installPlugin: (f: string, b: Blob, s: boolean) => Promise<unknown>;
-				}).installPlugin(filename, blob, start);
-			},
+			installPlugin: (filename, blob, start) => host!.installPlugin(filename, blob, start),
 		});
 		pendingReload.value = true;
 		clearAnnouncedUpdate(PLUGIN_MANIFEST_ID);
-		ui.makeNotification(LogLevel.success, t("title"), t("installedReload", { version: result.latestVersion }));
+		host?.notify("success", t("title"), t("installedReload", { version: result.latestVersion }));
 	} catch (e) {
 		console.warn("[ClosedLoopTuning] update failed:", e);
-		ui.makeNotification(LogLevel.warning, t("title"), t("corsBlocked"));
+		host?.notify("warning", t("title"), t("corsBlocked"));
 		window.location.href = result.assetUrl;
 	} finally {
 		applying.value = false;

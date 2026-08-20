@@ -12,10 +12,15 @@ import { clearAnnouncedUpdate, installErrorCapture } from "dwc-plugin-runtime";
 
 import ClosedLoopTuning from "./components/ClosedLoopTuning.vue";
 import { PLUGIN_ID, PLUGIN_MANIFEST_ID, ROUTE_PATH } from "./model/constants";
-import { runUpdateCheck } from "./model/updateCheck";
+import { runUpdateCheck, setUpdateHost } from "./model/updateCheck";
+import { createHost } from "./ui37/host";
 import en from "./i18n/en.json";
 
 registerPluginMessages(PLUGIN_ID, { en });
+
+// updateCheck.ts is shared with the (future) DWC 3.6 build, so it reaches DWC only through the same
+// host adapter the page itself uses, never through Pinia directly.
+setUpdateHost(createHost());
 
 registerRoute(ClosedLoopTuning, {
 	Plugins: {
