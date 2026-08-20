@@ -1,6 +1,8 @@
 # Plan: dual DWC 3.6 / 3.7 support for Closed Loop Tuning
 
-**Status:** planned, not started.
+**Status:** Phases 0–2 done (host seam, directory restructure, build/release machinery — all verified,
+no behaviour change on 3.7). Phase 3 (the actual DWC 3.6 UI) not started; needs the scope decision in
+§9 before it does.
 **Reference implementation:** `jaysuk/resonance-lab` (local: `c:\Users\live\Documents\Github\resonance-lab`)
 already does exactly this. **Read it before writing code** — this plan describes how to apply its
 pattern here, not how to invent one.
