@@ -172,8 +172,19 @@ means *nothing*. This is why ResonanceLab ships its own `scripts/typecheck.mjs`.
 `verify-build` (which runs DWC's own strict `typeCheckPlugin`) and CI.
 
 ### 7.2 `ui36/` gets no type checking at all
-It is excluded from the Vue 3 typecheck by `dwcTypecheckIgnore`, and 3.6 can't type-check it. The
-webpack build and manual testing are the only safety nets. Budget for that.
+It is excluded from the Vue 3 typecheck by `dwcTypecheckIgnore`, and 3.6 can't type-check it.
+
+Partly mitigated since: **`npm run check-ui36`** (`DWC36_DIR=<3.6 checkout>`) compiles every `ui36`
+SFC with DWC 3.6's own Vue 2.7 compiler in ~1s, catching malformed markup, unclosed tags, bad
+interpolation expressions and `<script setup>` Vue 2.7 can't compile. Run it on every `ui36` edit.
+
+It does **not** catch wrong Vuetify 2 prop/slot *names* — Vuetify 4's `density`/`#append-inner`
+surviving a translation is valid markup, so only a running component reveals it. That still needs
+`build36.bat` plus eyes on a real DWC 3.6. Budget for that.
+
+Also note the bulk of the logic is no longer duplicated: `src/core/useClosedLoopTuning.ts` holds it
+once for both generations, and IS covered by the Vue 3 typecheck — so only the ~600 template lines in
+`ui36` are unchecked, not ~1500 lines of tuning and safety logic.
 
 ### 7.3 chart.js version clash — vendoring is mandatory
 Plugin needs chart.js 4; DWC 3.6 ships 2.9 (`chart.js/auto` doesn't even exist there). Installing v4
@@ -211,8 +222,10 @@ self-update). 3.7 parses internally.
 
 ## 8. Verification checklist
 
-- [ ] `npm test` — all 320 tests still pass (model layer untouched throughout)
+- [ ] `npm test` — all tests still pass (model layer untouched throughout)
 - [ ] `DWC_DIR=<3.7> npm run typecheck` **and** `npm run verify-build` — clean
+- [ ] `DWC36_DIR=<3.6> npm run check-ui36` — every 3.6 SFC compiles under Vue 2.7 (see §7.2; fast,
+      but proves compilation only, never Vuetify 2 prop/slot correctness)
 - [ ] `build36.bat` produces `ClosedLoopTuning-<ver>-dwc36.zip`
 - [ ] Both ZIPs install: 3.7 package on a 3.7 DWC, 3.6 package on a 3.6 DWC
 - [ ] 3.6 package **refuses** to install on 3.7 and vice-versa (`dwcVersion: auto-major` handles this)
