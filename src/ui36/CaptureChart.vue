@@ -13,7 +13,7 @@
 			<v-btn text small :disabled="!capture" @click="exportCsv"><v-icon left small>mdi-download</v-icon>Export CSV</v-btn>
 		</v-card-title>
 		<v-card-text>
-			<div v-if="!capture" class="text-medium-emphasis text-center py-12">Record or select a capture to plot it here.</div>
+			<div v-if="!capture" class="text--secondary text-center py-12">Record or select a capture to plot it here.</div>
 			<div v-show="capture" class="chart-wrap"><canvas ref="canvas"></canvas></div>
 		</v-card-text>
 	</v-card>

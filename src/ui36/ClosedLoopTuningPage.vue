@@ -175,8 +175,11 @@
 							<HelpTip :href="DOCS.tuning" text="Auto-tune ensures closed loop, then on an axis cycles P (tracking error) → A (accel feed-forward) → V (velocity feed-forward) → D (overshoot) → I (steady-state error) from a trapezoid move. It captures after every change, converges when the response stops improving, refines every term again each cycle, and backs off on oscillation. It does NOT calibrate — do that in Step 3 first." />
 						</div>
 
-						<!-- Auto-tune -->
-						<v-card outlined class="mb-3" :color="autoRunning ? 'primary' : undefined">
+						<!-- Auto-tune. NB: highlight the running state with a border class, NOT `color`.
+							 Vuetify 2's VSheet (VCard's base) passes `color` to setBackgroundColor, so
+							 `outlined color="primary"` FILLS the card solid blue — whereas Vuetify 4's
+							 `variant="outlined" color="primary"` only tints the border and text. -->
+						<v-card outlined class="mb-3" :class="{ 'cl-card-running': autoRunning }">
 							<v-card-text>
 								<div class="d-flex align-center flex-wrap">
 									<v-btn color="primary" class="mr-2 mb-2" :disabled="!selectedDriver || autoRunning || recording" :loading="autoRunning" @click="startAutoTune">
@@ -578,6 +581,12 @@ watch(() => autoLog.value.length, () => {
 :deep(.cl-active-term fieldset) {
 	border: 2px solid var(--v-primary-base, #1976d2) !important;
 	border-radius: 4px;
+}
+/* Vuetify 4's `variant="outlined" color="primary"` tints only the border/text; Vuetify 2's `color`
+   would fill the card instead (see the note on the auto-tune card), so do the highlight in CSS. */
+.cl-card-running {
+	border-color: var(--v-primary-base, #1976d2) !important;
+	border-width: 2px;
 }
 .cl-eval-list :deep(.v-list-item) {
 	min-height: 0;
