@@ -404,8 +404,14 @@ async function runAxisCycle(
 	// A/V model-fit found to have no measurable effect — carried into a later package/optimise pass
 	// (see CycleResult.insensitiveTerms) so it can seed a smaller step instead of re-discovering this.
 	let cycleInsensitiveTerms: Array<PidTerm> = [];
+	// Zero the local state (keeps the live PID display consistent while identification runs) but do
+	// NOT write it to the driver: every identify branch below (model-fit/continuous-cycling/relay)
+	// sends its own complete first applyPid() — P at its own starting value, I/D/V/A zeroed — before
+	// any capture happens. A write here was unconditionally overwritten one line later with nothing
+	// measured in between, so it was dead work that also briefly commanded the driver to a stale P
+	// (whatever this run started at) right after the preflight probe's return move — the exact,
+	// already-fragile seam a firmware race was traced to (see docs: M400-before-applyPid fix).
 	pid.i = 0; pid.d = 0; pid.a = 0; pid.v = 0;
-	await effects.applyPid(pid);
 
 	if (identifyMethod === "model-fit") {
 		const { fit, pRampAttempts } = await runModelFitIdentification(effects, pid, medianOf, verifyRetries, modelFitBackoff);

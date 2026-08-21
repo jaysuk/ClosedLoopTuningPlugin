@@ -483,8 +483,16 @@ export function useClosedLoopTuning(host: HostAdapter) {
 	async function applyPid(): Promise<void> {
 		if (!selectedDriver.value) { return; }
 		applyingPid.value = true;
-		try { await send(buildPidCommand(selectedDriver.value, pid)); }
-		finally { applyingPid.value = false; }
+		try {
+			// Wait for any in-flight move on this driver to physically finish before reconfiguring its
+			// closed-loop parameters. M569.1 previously fired straight after a capture's return move
+			// (which is sent {log:false} and not itself awaited to completion) with no synchronisation
+			// at all — every auto-tune attempt, dozens of times a run. Quiet: this runs at the same
+			// frequency as the capture-loop's own moves, and the M569.1 line right after already
+			// reports the change. Best-effort — a transient failure here shouldn't block the write below.
+			try { await host.sendCode("M400", { log: false }); } catch { /* still apply the PID */ }
+			await send(buildPidCommand(selectedDriver.value, pid));
+		} finally { applyingPid.value = false; }
 	}
 
 	// --- Recording ---
