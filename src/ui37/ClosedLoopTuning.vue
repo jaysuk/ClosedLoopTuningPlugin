@@ -315,6 +315,10 @@
 								</div>
 								<v-btn size="small" color="info" :disabled="!canRecord || recording || autoRunning" :loading="recording" @click="record()"><v-icon class="mr-1">mdi-record</v-icon> Record</v-btn>
 								<div v-if="selectedDriver" class="text-caption text-medium-emphasis mt-1"><code>{{ capturePreview }}</code></div>
+								<div class="d-flex align-center mt-2">
+									<v-checkbox v-model="deleteCapturesAfterRead" label="Delete capture CSVs from the board after reading them" density="compact" hide-details />
+									<HelpTip class="ml-1" text="Applies to every capture this plugin makes, not just this panel — including auto-tune, which can leave dozens of CSVs in 0:/sys/closed-loop over a run. Only ever deletes the exact file the plugin itself just wrote and already read; never touches anything else in that folder." />
+								</div>
 							</v-expansion-panel-text>
 						</v-expansion-panel>
 					</v-expansion-panels>
@@ -503,7 +507,7 @@ const {
 	stageStates, tuneSession, includeAllCsv, downloadTuningReport,
 	samples, sampleRate, moveMode, customMove, recordKeys, canRecord, capturePreview, record,
 	recording, capture, overlayCapture, rawText, viewKeys, availableViewVars, pinOverlay,
-	metrics, evaluation, goToManualTerm,
+	metrics, evaluation, goToManualTerm, deleteCapturesAfterRead,
 	runTestMove, configBlock, copyConfig, openSaveToConfigG,
 	configWriteConfirmOpen, savingConfig, confirmSaveToConfigG,
 	confirmOpen, confirmCommand, confirmMessage, confirmProceed, confirmCancel,

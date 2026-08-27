@@ -23,6 +23,7 @@ const LEVELS: Record<NotifyLevel, LogLevel> = {
 type MachineExtras = {
 	getFileList(dir: string): Promise<Array<FileListEntry>>;
 	installPlugin(filename: string, blob: Blob, start: boolean): Promise<void>;
+	delete(filename: string, recursive?: boolean): Promise<void>;
 };
 
 /**
@@ -43,6 +44,7 @@ export function createHost(): HostAdapter {
 		download: async (path) => String(await machine().download({ filename: path, type: "text" }, false, false, false) ?? ""),
 		getFileList: (dir) => (machine() as unknown as MachineExtras).getFileList(dir),
 		installPlugin: (filename, blob, start) => (machine() as unknown as MachineExtras).installPlugin(filename, blob, start),
+		deleteFile: (path) => (machine() as unknown as MachineExtras).delete(path),
 
 		assetPattern: ASSET_PATTERN_37,
 

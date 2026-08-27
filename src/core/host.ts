@@ -52,6 +52,12 @@ export interface HostAdapter {
 	download(path: string): Promise<string>;
 	/** List a directory, used to find the newest capture CSV. */
 	getFileList(dir: string): Promise<Array<FileListEntry>>;
+	/**
+	 * Delete a file by full path. Used only for capture CSVs this plugin itself created and has
+	 * already read — see the "delete captures after read" setting. Named `deleteFile`, not `delete`:
+	 * the latter is legal as a property name but shadows the `delete` operator at every call site.
+	 */
+	deleteFile(path: string): Promise<void>;
 	/** Install a plugin ZIP through DWC's own installer — the one-click self-update path. */
 	installPlugin(filename: string, blob: Blob, start: boolean): Promise<void>;
 

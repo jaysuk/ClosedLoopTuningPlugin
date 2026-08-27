@@ -40,6 +40,7 @@ export function createHost(): HostAdapter {
 			filename: path, type: "text", showProgress: false, showSuccess: false, showError: false,
 		}) ?? ""),
 		getFileList: (dir) => store.dispatch("machine/getFileList", dir),
+		deleteFile: async (path) => { await store.dispatch("machine/delete", path); },
 		// 3.6's action wants the parsed archive as well as the blob (it reads plugin.json out of it to
 		// check the DWC version), where 3.7 parses internally. JSZip is one of DWC 3.6's own
 		// dependencies, and is imported lazily so it only costs anything on an actual self-update.

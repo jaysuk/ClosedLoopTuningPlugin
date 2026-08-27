@@ -68,6 +68,21 @@ export interface AboutExtraAction {
 }
 
 /**
+ * Delete a capture CSV the plugin itself just created, if the "delete after read" setting is on.
+ * Best-effort: swallows a failed delete (logs a warning) rather than letting it break the tuning run —
+ * a stale file left on the SD card is a much smaller problem than aborting mid-run over it. Extracted
+ * as its own top-level function (rather than inlined in loadLatestCsv below) so this can be unit
+ * tested without a full capture-cycle mock — see docs/PLAN-standstill-effort.md §6.
+ */
+export async function maybeDeleteCapture(
+	host: Pick<HostAdapter, "deleteFile">, path: string, enabled: boolean,
+	warn: (...args: Array<unknown>) => void = console.warn,
+): Promise<void> {
+	if (!enabled) { return; }
+	try { await host.deleteFile(path); } catch (e) { warn("[ClosedLoopTuning] failed to delete capture after read", path, e); }
+}
+
+/**
  * @param host how to reach this DuetWebControl — `ui37/host.ts` (Pinia) or `ui36/host.ts` (Vuex).
  *             Must be created inside component setup on 3.7, where Pinia requires an active instance.
  */
@@ -98,6 +113,10 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		tuneMethod?: TuneMethod; identifyMethod?: IdentifyMethod; modelFitBackoff?: number;
 		seedRule?: SeedRule; seedLambda?: number; medianOf?: number; captureBudget?: number;
 		includeAllCsv?: boolean;
+		/** Delete each capture CSV from 0:/sys/closed-loop right after it's been read into memory — see
+		 *  deleteTrackedCapture(). Off by default: deleting files off the user's SD card unprompted is
+		 *  the kind of thing that should be opted into. */
+		deleteCapturesAfterRead?: boolean;
 	}
 	function loadState(): SavedState {
 		try { return JSON.parse(localStorage.getItem(LS_STATE) ?? "{}") as SavedState; } catch { return {}; }
@@ -128,6 +147,10 @@ export function useClosedLoopTuning(host: HostAdapter) {
 	const wizardIndex = ref(saved.wizardIndex ?? 0);
 	const recommendation = ref<Recommendation | null>(null);
 
+	// Applies to every capture the plugin itself triggers, auto-tune or manual "Record" alike — both
+	// go through loadLatestCsv() below. Off by default (see SavedState.deleteCapturesAfterRead).
+	const deleteCapturesAfterRead = ref(saved.deleteCapturesAfterRead ?? false);
+
 	// Save the lightweight selections (not the captured CSV) whenever they change, debounced.
 	let saveTimer: ReturnType<typeof setTimeout> | undefined;
 	function persistState(): void {
@@ -143,11 +166,12 @@ export function useClosedLoopTuning(host: HostAdapter) {
 					tuneMethod: tuneMethod.value, identifyMethod: identifyMethod.value, modelFitBackoff: modelFitBackoff.value,
 					seedRule: seedRule.value, seedLambda: seedLambda.value, medianOf: medianOf.value,
 					captureBudget: captureBudget.value, includeAllCsv: includeAllCsv.value,
+					deleteCapturesAfterRead: deleteCapturesAfterRead.value,
 				} satisfies SavedState));
 			} catch { /* storage unavailable */ }
 		}, 300);
 	}
-	watch([step, wizardIndex, selectedDriver, currentMode, encoderType, modeD, pid, samples, sampleRate, moveMode, customMove, recordKeys, viewKeys],
+	watch([step, wizardIndex, selectedDriver, currentMode, encoderType, modeD, pid, samples, sampleRate, moveMode, customMove, recordKeys, viewKeys, deleteCapturesAfterRead],
 		persistState, { deep: true });
 
 	// --- Auto-tune ---
@@ -546,9 +570,17 @@ export function useClosedLoopTuning(host: HostAdapter) {
 			const files = list.filter((f: any) => !f.isDirectory && f.name.endsWith(".csv"))
 				.sort((a: any, b: any) => (b.lastModified ?? 0) - (a.lastModified ?? 0));
 			if (files.length === 0) { return null; }
-			const text = await host.download(`${CAPTURE_DIR}/${files[0].name}`);
+			const path = `${CAPTURE_DIR}/${files[0].name}`;
+			const text = await host.download(path);
 			rawText.value = text;
 			capture.value = parseCapture(text);
+			// Every call site reaches loadLatestCsv() strictly because the plugin's own M569.5 command
+			// just ran and the board's closed-loop run counter confirmably incremented (see runCapture's
+			// waitForRuns and record()'s watch on closedLoop.runs) — "the newest file" IS "the file this
+			// capture just wrote", the same identification the rest of this function already relies on
+			// for correctness. So there's nothing to track beyond the name already resolved above; this
+			// can never delete a file the plugin didn't just create.
+			await maybeDeleteCapture(host, path, deleteCapturesAfterRead.value);
 			return capture.value;
 		} catch (e) { console.warn("[ClosedLoopTuning] loadLatestCsv failed", e); return null; }
 	}
@@ -1082,7 +1114,7 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		// Manual capture & the shared chart.
 		samples, sampleRate, moveMode, customMove, recordKeys, canRecord, capturePreview, record,
 		recording, capture, overlayCapture, rawText, viewKeys, availableViewVars, pinOverlay,
-		metrics, evaluation, goToManualTerm,
+		metrics, evaluation, goToManualTerm, deleteCapturesAfterRead,
 
 		// Test & save.
 		runTestMove, configBlock, copyConfig, openSaveToConfigG,
