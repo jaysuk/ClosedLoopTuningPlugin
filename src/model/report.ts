@@ -9,7 +9,7 @@
  * series, `shapeCapturesForDownload` decides which captures keep their full CSV, and `slimModelForReport`
  * embeds only the board/axis/kinematics fields analysis actually uses instead of the whole model.
  */
-import { buildSeries } from "./analysis";
+import { buildSeries, REST_EFFORT_RIPPLE_LIMIT } from "./analysis";
 import type { ParsedCapture } from "./csv";
 
 export interface DownsampledSeries {
@@ -56,8 +56,29 @@ export interface ReportCapture {
 	metrics?: unknown;
 	series?: DownsampledSeries;
 	csv?: string;
-	/** Saturating/unstable capture (from the metric's own pTermSatDuty) — always kept in full. */
+	/** Saturating/unstable (pTermSatDuty) OR standstill-dithering (restEffort) capture — always kept
+	 *  in full. Set by the caller via isNotableCapture below. */
 	notable?: boolean;
+}
+
+/** Instability threshold shared with signal.ts's SAT_DUTY_LIMIT — TuneSignal/StepMetrics both carry
+ *  this field. */
+export const REPORT_NOTABLE_SAT_DUTY = 0.12;
+
+/**
+ * Whether a capture's metrics are worth keeping the full raw CSV for in a downloaded report — either
+ * it was saturating/unstable (pTermSatDuty), or it shows a standstill control-effort dither the
+ * position-error stats alone can't see (restEffort — see docs/PLAN-standstill-effort.md; a dithering
+ * capture is exactly the evidence a future D-term calibration needs, and it's otherwise invisible in
+ * the downsampled report series). `metrics` is whatever the tuning orchestrator's onAttempt passed
+ * (a TuneSignal or StepMetrics), read structurally rather than importing either type — this module's
+ * own dependencies stay limited to what report-shaping itself needs.
+ */
+export function isNotableCapture(metrics: unknown): boolean {
+	const m = metrics as { pTermSatDuty?: number; restEffort?: { restTailValid: boolean; pTermRestRipple: number } } | null | undefined;
+	if (!m) { return false; }
+	if (typeof m.pTermSatDuty === "number" && m.pTermSatDuty >= REPORT_NOTABLE_SAT_DUTY) { return true; }
+	return !!(m.restEffort?.restTailValid && m.restEffort.pTermRestRipple > REST_EFFORT_RIPPLE_LIMIT);
 }
 
 /**

@@ -195,16 +195,28 @@ export const COST_WEIGHT_BIAS = 1.0;
 export const COST_WEIGHT_LAG = 0.5;
 export const COST_WEIGHT_RING = 0.25;
 export const COST_RING_FREE = 1; // ring cycles below this are ordinary settling, not penalised
+/** Standstill control-effort dither (restEffort.pTermRestRipple, normalised to the 250 P-term rail so
+ *  it's a fraction like the other terms below). Package/refine judges every term through THIS cost
+ *  alone — unlike the sequential ramp strategies, it had no P-term/effort data in it at all, so it
+ *  could jointly optimise straight past a small encoder-scale limit cycle that never moves restBias
+ *  enough to matter and never rails. Sized to break ties and penalise dither, not dominate tracking:
+ *  contributes ~0.20 for a real dithering capture, ~0.02 for a real settled one — same order as the
+ *  restBias term above (1.0 × ~0.11 on those same two captures). See docs/PLAN-standstill-effort.md. */
+export const COST_WEIGHT_REST_EFFORT = 1.5;
 
 /** Whole-capture cost — lower is better; Infinity for any attempt the stability veto rejects. */
 export function signalCost(s: TuneSignal): number {
 	if (signalUnstable(s)) { return Infinity; }
-	const { stats } = s;
+	const { stats, restEffort } = s;
+	// restTailValid false (too-short tail, or the integrator was still converging) means the ripple
+	// number isn't trustworthy — contribute nothing rather than penalise an attempt that can't be judged.
+	const effortCost = restEffort.restTailValid ? restEffort.pTermRestRipple / P_TERM_RAIL : 0;
 	return stats.moveRms
 		+ COST_WEIGHT_OVERSHOOT * stats.settleOvershoot
 		+ COST_WEIGHT_BIAS * Math.abs(stats.restBias)
 		+ COST_WEIGHT_LAG * Math.abs(stats.cruiseLag)
-		+ COST_WEIGHT_RING * Math.max(0, stats.restRing - COST_RING_FREE);
+		+ COST_WEIGHT_RING * Math.max(0, stats.restRing - COST_RING_FREE)
+		+ COST_WEIGHT_REST_EFFORT * effortCost;
 }
 
 export const COST_RELATIVE_PLATEAU = 0.05;  // minimum fractional improvement to count as real
@@ -330,5 +342,9 @@ export function describeSignal(s: TuneSignal): string {
 	if (s.pTermSatDuty > 0.01) { parts.push(`sat ${(s.pTermSatDuty * 100).toFixed(0)}%`); }
 	if (s.postMoveOsc > 0) { parts.push(`${s.postMoveOsc} hunt`); }
 	if (s.stats.restRing > 0) { parts.push(`${s.stats.restRing} ring`); }
+	// Standstill P-term ripple (see analysis.ts computeRestEffort) — only shown when measured, so a
+	// too-short/still-converging capture (restTailValid: false) doesn't clutter the log with a number
+	// that isn't trustworthy.
+	if (s.restEffort.restTailValid && s.restEffort.pTermRestRipple > 0) { parts.push(`rest-ripple ${s.restEffort.pTermRestRipple.toFixed(1)}`); }
 	return parts.join(", ");
 }

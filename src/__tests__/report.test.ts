@@ -2,9 +2,11 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
+import { computeRestEffort } from "../model/analysis";
 import { parseCapture } from "../model/csv";
+import { computeTuneSignal } from "../model/signal";
 import {
-	downsampleCapture, shapeCapturesForDownload, slimModelForReport, type ReportCapture,
+	downsampleCapture, isNotableCapture, shapeCapturesForDownload, slimModelForReport, type ReportCapture,
 } from "../model/report";
 
 const FIXTURE_DIR = path.join(__dirname, "fixtures");
@@ -91,6 +93,67 @@ describe("shapeCapturesForDownload", () => {
 		const captures = [cap({ seq: 0, phase: "p" }), cap({ seq: 1, phase: "p" })];
 		shapeCapturesForDownload(captures, false);
 		expect(captures[0].csv).toBe("raw-csv-data");
+	});
+
+	// docs/PLAN-standstill-effort.md §5.1: ReportCapture.metrics is typed `unknown` and holds the
+	// whole TuneSignal/StepMetrics object verbatim — confirms restEffort (added to both in an earlier
+	// phase) survives untouched, since report.ts never reads or reshapes .metrics, only .csv.
+	it("carries a capture's restEffort metrics through the shaping step untouched", () => {
+		const dither = computeTuneSignal(load("hold-dither-i0.csv"), 2000);
+		expect(dither).not.toBeNull();
+		const captures: Array<ReportCapture> = [cap({ seq: 0, phase: "i", metrics: dither })];
+		const [shaped] = shapeCapturesForDownload(captures, false);
+		const metrics = shaped.metrics as typeof dither;
+		expect(metrics!.restEffort).toEqual(dither!.restEffort);
+		expect(metrics!.restEffort.pTermRestRipple).toBeCloseTo(33.6, 5);
+	});
+
+	it("also carries restEffort computed directly (the extruder/StepMetrics path)", () => {
+		const re = computeRestEffort(load("hold-settled-i23.csv"), 2000);
+		const captures: Array<ReportCapture> = [cap({ seq: 0, phase: "i", metrics: { restEffort: re } })];
+		const [shaped] = shapeCapturesForDownload(captures, false);
+		expect((shaped.metrics as { restEffort: typeof re }).restEffort).toEqual(re);
+	});
+});
+
+describe("isNotableCapture", () => {
+	it("a real dithering capture is notable — kept in full even mid-sequence", () => {
+		const dither = computeTuneSignal(load("hold-dither-i0.csv"), 2000);
+		expect(isNotableCapture(dither)).toBe(true);
+	});
+
+	it("a real settled capture is NOT notable", () => {
+		const settled = computeTuneSignal(load("hold-settled-i23.csv"), 2000);
+		expect(isNotableCapture(settled)).toBe(false);
+	});
+
+	it("an invalid rest-effort tail never makes a capture notable, however large the raw ripple number", () => {
+		const settled = computeTuneSignal(load("hold-settled-i23.csv"), 2000)!;
+		const invalid = { ...settled, restEffort: { ...settled.restEffort, restTailValid: false, pTermRestRipple: 999 } };
+		expect(isNotableCapture(invalid)).toBe(false);
+	});
+
+	it("still catches a saturating/unstable capture via pTermSatDuty, independent of restEffort", () => {
+		expect(isNotableCapture({ pTermSatDuty: 0.5 })).toBe(true);
+	});
+
+	it("handles null/undefined/shapeless metrics without throwing", () => {
+		expect(isNotableCapture(null)).toBe(false);
+		expect(isNotableCapture(undefined)).toBe(false);
+		expect(isNotableCapture({})).toBe(false);
+	});
+
+	it("end to end: a notable dithering capture keeps its raw CSV even mid-sequence, via the real composable wiring", () => {
+		const dither = computeTuneSignal(load("hold-dither-i0.csv"), 2000);
+		const captures: Array<ReportCapture> = [
+			{ seq: 0, phase: "i", value: 0, metrics: dither, csv: "raw-csv-data", notable: isNotableCapture(dither) },
+			{ seq: 1, phase: "i", value: 1000, csv: "raw-csv-data", notable: false },
+			{ seq: 2, phase: "i", value: 1500, csv: "raw-csv-data", notable: false }, // now the true last-of-phase
+		];
+		const shaped = shapeCapturesForDownload(captures, false);
+		expect(shaped[0].csv).toBe("raw-csv-data"); // notable, kept even though not last of its phase
+		expect(shaped[1].csv).toBeUndefined(); // neither notable nor last — dropped
+		expect(shaped[2].csv).toBe("raw-csv-data"); // last of the phase
 	});
 });
 

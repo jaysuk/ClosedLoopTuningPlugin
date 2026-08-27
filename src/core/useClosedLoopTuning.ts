@@ -48,7 +48,7 @@ import {
 	type AutoRunOptions, type AutoRunResult, type IdentifyMethod, type SeedRule, type StageId, type StageState,
 	type TuneEffects, type TuneMethod,
 } from "../model/autorun";
-import { downsampleCapture, shapeCapturesForDownload, slimModelForReport, type ReportCapture } from "../model/report";
+import { downsampleCapture, isNotableCapture, shapeCapturesForDownload, slimModelForReport, type ReportCapture } from "../model/report";
 import { applying, applyUpdateNow, checking, dismissCurrentUpdate, pendingReload, runUpdateCheck, setUpdateChecksEnabled, updateChecksEnabled, updateState } from "../updateCheck";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -288,17 +288,13 @@ export function useClosedLoopTuning(host: HostAdapter) {
 	}
 	const REPORT_VERSION = 2;
 	const tuneSession = ref<TuneSession | null>(null);
-	/** Instability threshold shared with signal.ts's SAT_DUTY_LIMIT — both TuneSignal and StepMetrics carry this field. */
-	const REPORT_NOTABLE_SAT_DUTY = 0.12;
 	let sessionSeq = 0;
 	/** Uncapped session log (the report's own copy) — `autoLog` stays capped at 40 lines for display only. */
 	let sessionLog: Array<string> = [];
 	function recordSessionCapture(phase: string, value: number | undefined, metrics: unknown): void {
 		if (!tuneSession.value || !rawText.value) { return; }
 		const series = capture.value ? (downsampleCapture(capture.value, sampleRate.value) ?? undefined) : undefined;
-		const m = metrics as { pTermSatDuty?: number } | null;
-		const notable = !!(m && typeof m.pTermSatDuty === "number" && m.pTermSatDuty >= REPORT_NOTABLE_SAT_DUTY);
-		tuneSession.value.captures.push({ seq: sessionSeq++, phase, value, metrics, series, csv: rawText.value, notable });
+		tuneSession.value.captures.push({ seq: sessionSeq++, phase, value, metrics, series, csv: rawText.value, notable: isNotableCapture(metrics) });
 	}
 	function downloadTuningReport(): void {
 		if (!tuneSession.value) { return; }

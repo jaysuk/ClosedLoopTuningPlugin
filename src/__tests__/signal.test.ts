@@ -181,6 +181,25 @@ describe("signalCost", () => {
 		const onset = signalCost(signalOf("move250-instability-onset.csv"));
 		expect(best).toBeLessThan(onset);
 	});
+
+	// Real field case (docs/PLAN-standstill-effort.md): package/refine's ONLY objective is this
+	// function, and until this term existed it had no P-term/effort data in it at all — a small
+	// encoder-scale dither with near-zero restBias and no railing could be jointly optimised straight
+	// past. Uses the real user captures, not hand-built fakes.
+	it("costs a real dithering capture more than the equivalent settled one", () => {
+		const dither = signalOf("hold-dither-i0.csv");
+		const settled = signalOf("hold-settled-i23.csv");
+		expect(dither.restEffort.restTailValid).toBe(true);
+		expect(settled.restEffort.restTailValid).toBe(true);
+		expect(signalCost(dither)).toBeGreaterThan(signalCost(settled));
+	});
+
+	it("an invalid rest-effort tail contributes nothing to cost — never a penalty for an unmeasurable capture", () => {
+		const base = signalOf("move250-stable-best.csv");
+		const invalid: TuneSignal = { ...base, restEffort: { ...base.restEffort, restTailValid: false, pTermRestRipple: 999 } };
+		const zeroRipple: TuneSignal = { ...base, restEffort: { ...base.restEffort, restTailValid: true, pTermRestRipple: 0 } };
+		expect(signalCost(invalid)).toBeCloseTo(signalCost(zeroRipple), 6);
+	});
 });
 
 describe("significantlyBetter / withinNoise", () => {
