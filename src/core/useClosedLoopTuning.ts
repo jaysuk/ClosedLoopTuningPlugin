@@ -645,7 +645,14 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		const captureMs = opts.rate > 0 ? (opts.samples / opts.rate) * 1000 : 4000;
 		if (!(await waitForRuns(startRuns, captureMs + 8000))) { log("Timed out waiting for the capture to finish — is the driver calibrated and in closed loop?"); return null; }
 		await delay(300); // let the CSV finish writing
-		return loadLatestCsv();
+		const c = await loadLatestCsv();
+		// RRF appends a bare "Data lost" line when its capture buffer overruns — parseCapture already
+		// strips it so the rows that DID arrive are still usable (see csv.ts); this just surfaces that
+		// it happened, once, rather than silently keeping the user in the dark about why their captures
+		// are a bit shorter than requested. Never fails the capture — MIN_CAPTURE_SAMPLES already does
+		// that job downstream if too little survived.
+		if (c?.truncated) { log(`Capture truncated by the firmware (${c.rowCount} samples kept) — the requested sample rate may be too high for this board.`); }
+		return c;
 	}
 
 	const MIN_STEP_DISTANCE_FRACTION = 0.5; // require at least half the intended step-jump distance to bother capturing

@@ -48,6 +48,10 @@ describe("computeTuneSignal — capture validation", () => {
 		const capture = parseCapture(header + rows.join("\n"));
 		expect(computeTuneSignal(capture, 2000)).not.toBeNull();
 	});
+
+	it("accepts a capture RRF cut short with a trailing 'Data lost' line — the rows that DID arrive are still valid, not NaN-poisoned", () => {
+		expect(computeTuneSignal(load("hold-truncated-datalost.csv"), 2000)).not.toBeNull();
+	});
 });
 
 describe("computeTuneSignal — stable captures", () => {

@@ -10,25 +10,49 @@ export interface ParsedCapture {
 	/** Column header → numeric values (NaN for blanks). */
 	columns: Record<string, Array<number>>;
 	rowCount: number;
+	/** Non-data lines the firmware appended (e.g. RRF's "Data lost" buffer-overrun marker). Always
+	 *  present ([] when none) so callers never need an optional check. */
+	notes: Array<string>;
+	/** True when the firmware reported it dropped samples — the capture is short but the rows it did
+	 *  write are still valid; callers should keep using it above the usual minimum-sample floor. */
+	truncated: boolean;
 }
 
+const DATA_LOST_RE = /data\s*lost/i;
+
+/**
+ * A line that doesn't split into the expected column count isn't a data row — RRF appends a bare
+ * "Data lost" line when its capture buffer overruns, and a torn final line is possible too. Previously
+ * every field of a malformed row parsed to NaN and silently poisoned every downstream stat (restBias,
+ * computeTuneSignal, …) into null — an otherwise-usable multi-hundred-row capture was discarded
+ * outright over one trailing marker. Skip such lines instead of parsing them as data.
+ */
 export function parseCapture(text: string): ParsedCapture {
 	const lines = text.split(/\r?\n/).filter((l) => l.trim() !== "");
 	if (lines.length === 0) {
-		return { headers: [], columns: {}, rowCount: 0 };
+		return { headers: [], columns: {}, rowCount: 0, notes: [], truncated: false };
 	}
 	const headers = lines[0].split(",").map((h) => h.trim());
 	const columns: Record<string, Array<number>> = {};
 	for (const h of headers) {
 		columns[h] = [];
 	}
+	const notes: Array<string> = [];
+	let truncated = false;
+	let rowCount = 0;
 	for (let r = 1; r < lines.length; r++) {
 		const cells = lines[r].split(",");
+		if (cells.length !== headers.length) {
+			notes.push(lines[r].trim());
+			if (DATA_LOST_RE.test(lines[r])) { truncated = true; }
+			continue;
+		}
 		for (let c = 0; c < headers.length; c++) {
 			columns[headers[c]].push(parseFloat(cells[c]));
 		}
+		rowCount++;
 	}
-	return { headers, columns, rowCount: lines.length - 1 };
+	return { headers, columns, rowCount, notes, truncated };
 }
 
 /** Find a column case-insensitively (header text varies slightly across firmware). */
