@@ -83,6 +83,8 @@ describe("analyzeMove (A/V feed-forward)", () => {
 			headers: ["Target Motor Steps", "PID P Term"],
 			columns: { "Target Motor Steps": target, "PID P Term": pterm },
 			rowCount: n,
+			notes: [],
+			truncated: false,
 		};
 		const m = analyzeMove(capture, 1000);
 		expect(m).not.toBeNull();
@@ -96,6 +98,8 @@ describe("analyzeMove (A/V feed-forward)", () => {
 			headers: ["Target Motor Steps", "PID P Term"],
 			columns: { "Target Motor Steps": [0, 0, 0, 0, 0, 0, 0, 0], "PID P Term": [1, 1, 1, 1, 1, 1, 1, 1] },
 			rowCount: 8,
+			notes: [],
+			truncated: false,
 		};
 		expect(analyzeMove(capture, 1000)!.hasMove).toBe(false);
 	});

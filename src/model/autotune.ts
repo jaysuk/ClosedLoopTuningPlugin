@@ -16,7 +16,7 @@
  *
  * Every strategy is bounded (value caps + max attempts) and vetoes instability before anything else.
  */
-import type { StepMetrics } from "./analysis";
+import { REST_EFFORT_RIPPLE_LIMIT, type StepMetrics } from "./analysis";
 import { OVERSHOOT_GOOD, REST_GOOD, RING_WARN } from "./evaluate";
 import { SAT_DUTY_LIMIT, signalDiverging, signalUnstable, type TuneSignal } from "./signal";
 import type { PidTerm } from "./wizard";
@@ -300,13 +300,29 @@ export const SIGNAL_I_STRATEGY: SignalStrategy = {
 		// Integral windup shows up as hunting/ring — vetoed before the bias check.
 		if (signalUnstable(last.signal)) { return backOff(attempts, "I", 0); }
 		if (!last.signal.hasMove) { return noMove; }
-		if (Math.abs(last.signal.stats.restBias) <= REST_GOOD) {
-			return { kind: "accept", value: last.value, note: `Standing error ${last.signal.stats.restBias.toFixed(2)} step — settled.` };
+		const { stats, restEffort } = last.signal;
+		const biasSettled = Math.abs(stats.restBias) <= REST_GOOD;
+		// A limit cycle centred on zero has ~zero mean error, so bias alone can't tell a genuinely
+		// settled driver from one still dithering between adjacent encoder counts (audible buzz, P
+		// term repeatedly reacting to single-count position changes) — see
+		// docs/PLAN-standstill-effort.md. restTailValid false (tail too short, or the integrator was
+		// still converging when the capture ended) means "can't judge effort yet", never "reject" —
+		// bias alone decides in that case, same as before this criterion existed.
+		const effortSettled = !restEffort.restTailValid || restEffort.pTermRestRipple <= REST_EFFORT_RIPPLE_LIMIT;
+		if (biasSettled && effortSettled) {
+			return { kind: "accept", value: last.value, note: `Standing error ${stats.restBias.toFixed(2)} step — settled.` };
 		}
 		const next = round(last.value <= 0 ? 1000 : last.value * 1.5);
 		if (next > I_MAX) { return { kind: "accept", value: last.value, note: `Reached the I limit (${I_MAX}).` }; }
 		if (attempts.length >= this.maxAttempts) {
-			return { kind: "accept", value: bestBy(attempts, (s) => Math.abs(s.stats.restBias)).value, note: "Max attempts reached." };
+			// Prefer an attempt whose effort was actually settled, if one exists, over the attempt with
+			// the smallest bias — a dithering attempt with slightly-better bias is not the value to keep.
+			const settled = attempts.filter((a) => !a.signal.restEffort.restTailValid || a.signal.restEffort.pTermRestRipple <= REST_EFFORT_RIPPLE_LIMIT);
+			const pool = settled.length ? settled : attempts;
+			return { kind: "accept", value: bestBy(pool, (s) => Math.abs(s.stats.restBias)).value, note: "Max attempts reached." };
+		}
+		if (biasSettled) {
+			return { kind: "set", value: next, note: `I=${last.value}: standing error ${stats.restBias.toFixed(2)} step is fine, but the P term is still swinging ${restEffort.pTermRestRipple.toFixed(1)} at rest — the motor is dithering. Raising I.` };
 		}
 		return { kind: "set", value: next, note: `Increasing I to ${next}.` };
 	},

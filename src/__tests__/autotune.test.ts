@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -5,8 +7,17 @@ import {
 	SIGNAL_P_STRATEGY, SIGNAL_V_STRATEGY, describeMetrics, interpolateVZero, type Attempt, type SignalAttempt,
 } from "../model/autotune";
 import { EMPTY_REST_EFFORT, type StepMetrics } from "../model/analysis";
-import type { TuneSignal } from "../model/signal";
+import { parseCapture } from "../model/csv";
+import { computeTuneSignal, type TuneSignal } from "../model/signal";
 import type { TuneStats } from "../model/evaluate";
+
+const FIXTURE_DIR = path.join(__dirname, "fixtures");
+function realSignal(name: string): TuneSignal {
+	const capture = parseCapture(readFileSync(path.join(FIXTURE_DIR, name), "utf8"));
+	const s = computeTuneSignal(capture, 2000);
+	if (!s) { throw new Error(`${name}: computeTuneSignal returned null`); }
+	return s;
+}
 
 function m(over: Partial<StepMetrics>): StepMetrics {
 	return { stepSize: 4, riseTime: 0.02, overshootPct: 0, settlingTime: 0.03, steadyStateError: 0, peakError: 0.1, rmsError: 0.05, oscillations: 0, hasStep: true, pTermSatDuty: 0, restEffort: EMPTY_REST_EFFORT, ...over };
@@ -202,6 +213,29 @@ describe("SIGNAL_I_STRATEGY", () => {
 		]);
 		expect(d.kind).toBe("accept");
 		if (d.kind === "accept") expect(d.value).toBe(1000);
+	});
+
+	// Real field case (docs/PLAN-standstill-effort.md): restBias alone accepts BOTH of these captures
+	// (a limit cycle centred on zero has ~zero mean error) — the effort-ripple check is what tells them
+	// apart. computeTuneSignal on the real captures, not a hand-built fake, so this exercises the real
+	// restEffort wiring end to end, not just the strategy's own logic in isolation.
+	it("REJECTS a real capture of the driver audibly dithering at I=0, even though restBias alone would accept it", () => {
+		const dithering = realSignal("hold-dither-i0.csv");
+		expect(Math.abs(dithering.stats.restBias)).toBeLessThanOrEqual(0.25); // bias alone says "fine"
+		const d = SIGNAL_I_STRATEGY.decide([sat(0, dithering)]);
+		expect(d.kind).toBe("set"); // keeps raising I instead of accepting
+	});
+
+	it("ACCEPTS the equivalent real capture once I has actually settled the standstill dither", () => {
+		const settled = realSignal("hold-settled-i23.csv");
+		const d = SIGNAL_I_STRATEGY.decide([sat(23.5, settled)]);
+		expect(d.kind).toBe("accept");
+	});
+
+	it("an invalid tail (restTailValid: false) falls back to bias alone — never a false rejection", () => {
+		// EMPTY_REST_EFFORT's restTailValid is false, so even a huge pTermRestRipple must be ignored.
+		const d = SIGNAL_I_STRATEGY.decide([sat(1000, sig({ stats: { restBias: 0.1 } }))]);
+		expect(d.kind).toBe("accept");
 	});
 });
 

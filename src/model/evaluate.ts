@@ -8,7 +8,7 @@
  * to change and the direction, mirroring the auto-tuner's own logic:
  *   bias at rest → I · lag at steady speed → V · spikes in accel/decel → A · overshoot → D · ringing → P↓/D↑
  */
-import { buildSeries, segmentMove } from "./analysis";
+import { buildSeries, computeRestEffort, REST_EFFORT_RIPPLE_LIMIT, segmentMove } from "./analysis";
 import type { ParsedCapture } from "./csv";
 
 export type Severity = "good" | "info" | "warn" | "bad";
@@ -195,7 +195,28 @@ export function evaluateTune(capture: ParsedCapture, sampleRateHz: number): Tune
 		const b = Math.abs(s.restBias);
 		if (b > REST_FAIR) { add({ severity: "bad", title: "Standing error at rest", detail: `The motor settles ${s.restBias.toFixed(2)} step away from target — it isn't reaching the commanded position.`, fix: "Raise I (integral)", term: "i", direction: "up" }); }
 		else if (b > REST_GOOD) { add({ severity: "warn", title: "Slight standing error", detail: `Settles ${s.restBias.toFixed(2)} step off target.`, fix: "Raise I (integral) a little", term: "i", direction: "up" }); }
-		else { add({ severity: "good", title: "Reaches target", detail: `Settles to within ${b.toFixed(2)} step of target — no standing offset.` }); }
+		else {
+			// Standing error alone can't tell "settled" from a limit cycle centred on zero — a fraction
+			// of one encoder count can swing the P term hard, audible as buzz or hum, without ever
+			// moving the mean error enough to show up as bias. See docs/PLAN-standstill-effort.md.
+			// restTailValid false (too-short rest window, or the integrator was still converging when
+			// the capture ended) means "can't judge effort yet" — falls through to "Reaches target",
+			// same as before this check existed, never a false "dithers" finding.
+			const re = computeRestEffort(capture, sampleRateHz);
+			if (re.restTailValid && re.pTermRestRipple > REST_EFFORT_RIPPLE_LIMIT) {
+				add({
+					severity: "warn",
+					title: "Dithers at standstill",
+					detail: `Position error is only ${b.toFixed(2)} step, but the P term swings ${re.pTermRestRipple.toFixed(1)} `
+						+ `at rest — the motor is working hard to hold position, which is audible as buzz or hum.`,
+					fix: "Raise I (integral) so it holds the static load instead of P",
+					term: "i",
+					direction: "up",
+				});
+			} else {
+				add({ severity: "good", title: "Reaches target", detail: `Settles to within ${b.toFixed(2)} step of target — no standing offset.` });
+			}
+		}
 	}
 
 	// 2. Steady-speed lag (velocity feed-forward).

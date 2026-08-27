@@ -8,7 +8,7 @@
  * with A and V offered as advanced feed-forward steps (these need steady-speed G1 moves to judge, so
  * they give guidance rather than an auto-recommendation).
  */
-import type { StepMetrics } from "./analysis";
+import { REST_EFFORT_RIPPLE_LIMIT, type StepMetrics } from "./analysis";
 import type { PidValues } from "./m569";
 
 export type PidTerm = keyof PidValues; // "p" | "i" | "d" | "v" | "a"
@@ -109,6 +109,21 @@ export const WIZARD_STEPS: Array<WizardStep> = [
 			}
 			if (m.oscillations >= 14) {
 				return { verdict: "decrease", message: `I=${current} is causing oscillation — reduce it.`, suggested: round(current * 0.6) };
+			}
+			// Steady-state error alone can't tell "settled" from a limit cycle centred on zero — a
+			// fraction of one encoder count can swing the P term hard, audible as buzz, without ever
+			// moving the mean error. See docs/PLAN-standstill-effort.md. restTailValid false (too-short
+			// tail, or the integrator was still converging) means "can't judge effort yet" — steady-
+			// state error alone decides then, same as before this criterion existed.
+			const { restEffort } = m;
+			if (restEffort.restTailValid && restEffort.pTermRestRipple > REST_EFFORT_RIPPLE_LIMIT) {
+				return {
+					verdict: "increase",
+					message: `Steady-state error is ${m.steadyStateError.toFixed(2)} steps — fine — but the P term is still `
+						+ `swinging ${restEffort.pTermRestRipple.toFixed(1)} at rest, which is audible as buzz or hum. `
+						+ `Increase I so it holds the static load instead of P.`,
+					suggested: round(current <= 0 ? 1000 : current * 1.5),
+				};
 			}
 			return { verdict: "accept", message: `Steady-state error is ${m.steadyStateError.toFixed(2)} steps — settled. Keep I=${current}.` };
 		},

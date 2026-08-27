@@ -15,7 +15,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { computeRestEffort, REST_TAIL_MIN_SAMPLES } from "../model/analysis";
+import { computeRestEffort, REST_EFFORT_RIPPLE_LIMIT, REST_TAIL_MIN_SAMPLES } from "../model/analysis";
 import { parseCapture } from "../model/csv";
 
 const FIXTURE_DIR = path.join(__dirname, "fixtures");
@@ -24,28 +24,32 @@ function load(name: string) {
 }
 
 describe("computeRestEffort — calibration set (§3.3)", () => {
-	it("hold-stable-transient.csv: normal encoder jitter, must NOT trip a limit of 10", () => {
+	it("hold-stable-transient.csv: normal encoder jitter, must NOT trip REST_EFFORT_RIPPLE_LIMIT", () => {
 		const re = computeRestEffort(load("hold-stable-transient.csv"), 2000);
 		expect(re.restTailValid).toBe(true);
 		expect(re.pTermRestRipple).toBeCloseTo(3.6, 5);
+		expect(re.pTermRestRipple).toBeLessThanOrEqual(REST_EFFORT_RIPPLE_LIMIT);
 	});
 
 	it("hold-settled-i23.csv (user, I≈23.5 settled): must NOT trip", () => {
 		const re = computeRestEffort(load("hold-settled-i23.csv"), 2000);
 		expect(re.restTailValid).toBe(true);
 		expect(re.pTermRestRipple).toBeCloseTo(0, 5);
+		expect(re.pTermRestRipple).toBeLessThanOrEqual(REST_EFFORT_RIPPLE_LIMIT);
 	});
 
-	it("hold-dither-i0.csv (user, I=0 dithering): MUST trip a limit of 10", () => {
+	it("hold-dither-i0.csv (user, I=0 dithering): MUST trip REST_EFFORT_RIPPLE_LIMIT", () => {
 		const re = computeRestEffort(load("hold-dither-i0.csv"), 2000);
 		expect(re.restTailValid).toBe(true);
 		expect(re.pTermRestRipple).toBeCloseTo(33.6, 5);
+		expect(re.pTermRestRipple).toBeGreaterThan(REST_EFFORT_RIPPLE_LIMIT);
 	});
 
 	it("hold-limit-cycle.csv (railed hunt, already caught by postMoveOsc): far above any reasonable limit", () => {
 		const re = computeRestEffort(load("hold-limit-cycle.csv"), 2000);
 		expect(re.restTailValid).toBe(true);
 		expect(re.pTermRestRipple).toBeCloseTo(512.0, 5);
+		expect(re.pTermRestRipple).toBeGreaterThan(REST_EFFORT_RIPPLE_LIMIT);
 	});
 
 	it("the dithering capture has SMALLER position error than the stable fixture but 9x the effort — the whole point of this metric", () => {

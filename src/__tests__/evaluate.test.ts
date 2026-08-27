@@ -1,7 +1,14 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import type { ParsedCapture } from "../model/csv";
+import { parseCapture, type ParsedCapture } from "../model/csv";
 import { evaluateTune, tuneStats } from "../model/evaluate";
+
+const FIXTURE_DIR = path.join(__dirname, "fixtures");
+function loadCapture(name: string): ParsedCapture {
+	return parseCapture(readFileSync(path.join(FIXTURE_DIR, name), "utf8"));
+}
 
 /** Trapezoid target move with a controllable measured-vs-target error model. */
 function moveCapture(opts: { cruiseLag?: number; restBias?: number; accelSpike?: number; noise?: number; overshoot?: number; cruiseWander?: number } = {}): ParsedCapture {
@@ -31,7 +38,7 @@ function moveCapture(opts: { cruiseLag?: number; restBias?: number; accelSpike?:
 		if (i >= 180 && i < 195) { err += overshoot; }        // overshoot just after stopping
 		return t + err + noiseAt(i);
 	});
-	return { headers: ["Measured Motor Steps", "Target Motor Steps"], columns: { "Measured Motor Steps": measured, "Target Motor Steps": target }, rowCount: n };
+	return { headers: ["Measured Motor Steps", "Target Motor Steps"], columns: { "Measured Motor Steps": measured, "Target Motor Steps": target }, rowCount: n, notes: [], truncated: false };
 }
 
 describe("tuneStats", () => {
@@ -44,7 +51,7 @@ describe("tuneStats", () => {
 	});
 
 	it("reports no movement for a flat capture", () => {
-		const flat: ParsedCapture = { headers: ["Measured Motor Steps", "Target Motor Steps"], columns: { "Measured Motor Steps": [5, 5, 5, 5, 5, 5], "Target Motor Steps": [5, 5, 5, 5, 5, 5] }, rowCount: 6 };
+		const flat: ParsedCapture = { headers: ["Measured Motor Steps", "Target Motor Steps"], columns: { "Measured Motor Steps": [5, 5, 5, 5, 5, 5], "Target Motor Steps": [5, 5, 5, 5, 5, 5] }, rowCount: 6, notes: [], truncated: false };
 		expect(tuneStats(flat, 1000).moved).toBe(false);
 	});
 
@@ -113,7 +120,7 @@ describe("evaluateTune", () => {
 	});
 
 	it("returns unknown when columns are missing", () => {
-		const bad: ParsedCapture = { headers: ["Raw Encoder Reading"], columns: { "Raw Encoder Reading": [1, 2, 3] }, rowCount: 3 };
+		const bad: ParsedCapture = { headers: ["Raw Encoder Reading"], columns: { "Raw Encoder Reading": [1, 2, 3] }, rowCount: 3, notes: [], truncated: false };
 		expect(evaluateTune(bad, 1000).grade).toBe("unknown");
 	});
 
@@ -122,5 +129,33 @@ describe("evaluateTune", () => {
 		expect(e.headline.length).toBeGreaterThan(0);
 		expect(e.score).toBeGreaterThanOrEqual(0);
 		expect(e.score).toBeLessThanOrEqual(100);
+	});
+
+	// Real field case (docs/PLAN-standstill-effort.md): the panel previously graded this exact capture
+	// "Reaches target — no standing offset", good severity, on the strength of restBias alone — while
+	// the driver was audibly dithering at standstill the whole time. Uses the real user-supplied
+	// captures, not a hand-built fake.
+	describe("standstill effort ripple (real field captures)", () => {
+		it("flags dithering at standstill instead of calling it good, and does NOT also emit 'Reaches target'", () => {
+			const e = evaluateTune(loadCapture("hold-dither-i0.csv"), 2000);
+			const dither = e.findings.find((f) => f.title === "Dithers at standstill");
+			expect(dither).toBeTruthy();
+			expect(dither!.severity).toBe("warn");
+			expect(dither!.term).toBe("i");
+			expect(dither!.direction).toBe("up");
+			expect(e.findings.some((f) => f.title === "Reaches target")).toBe(false);
+			expect(e.grade).not.toBe("excellent");
+		});
+
+		it("does not flag the equivalent settled capture, and still emits 'Reaches target'", () => {
+			const e = evaluateTune(loadCapture("hold-settled-i23.csv"), 2000);
+			expect(e.findings.some((f) => f.title === "Dithers at standstill")).toBe(false);
+			expect(e.findings.some((f) => f.title === "Reaches target")).toBe(true);
+		});
+
+		it("does not flag ordinary encoder jitter (the stable fixture) as dithering", () => {
+			const e = evaluateTune(loadCapture("hold-stable-transient.csv"), 2000);
+			expect(e.findings.some((f) => f.title === "Dithers at standstill")).toBe(false);
+		});
 	});
 });

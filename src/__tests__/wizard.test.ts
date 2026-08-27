@@ -1,7 +1,10 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { WIZARD_STEPS } from "../model/wizard";
-import { EMPTY_REST_EFFORT, type StepMetrics } from "../model/analysis";
+import { analyzeCapture, EMPTY_REST_EFFORT, type StepMetrics } from "../model/analysis";
+import { parseCapture } from "../model/csv";
 
 const P = WIZARD_STEPS.find((s) => s.id === "p")!;
 const D = WIZARD_STEPS.find((s) => s.id === "d")!;
@@ -9,6 +12,14 @@ const I = WIZARD_STEPS.find((s) => s.id === "i")!;
 
 function metrics(over: Partial<StepMetrics>): StepMetrics {
 	return { stepSize: 4, riseTime: 0.01, overshootPct: 0, settlingTime: 0.02, steadyStateError: 0, peakError: 0.1, rmsError: 0.05, oscillations: 0, hasStep: true, pTermSatDuty: 0, restEffort: EMPTY_REST_EFFORT, ...over };
+}
+
+const FIXTURE_DIR = path.join(__dirname, "fixtures");
+function realMetrics(name: string): StepMetrics {
+	const capture = parseCapture(readFileSync(path.join(FIXTURE_DIR, name), "utf8"));
+	const m = analyzeCapture(capture, 2000);
+	if (!m) { throw new Error(`${name}: analyzeCapture returned null`); }
+	return m;
 }
 
 describe("wizard ordering", () => {
@@ -55,5 +66,24 @@ describe("I step", () => {
 	});
 	it("accepts when settled on target", () => {
 		expect(I.recommend(metrics({ steadyStateError: 0.02 }), 1000).verdict).toBe("accept");
+	});
+
+	// Real field case (docs/PLAN-standstill-effort.md): a limit cycle centred on zero has ~zero mean
+	// error, so steadyStateError alone can't tell it apart from a genuinely settled driver — the
+	// effort-ripple check is what does. Uses the REAL restEffort measured from the dithering capture
+	// (not a hand-built fake), with steadyStateError forced comfortably below the pre-existing
+	// threshold so this isolates the NEW gate rather than accidentally re-exercising the old one.
+	it("recommends INCREASING I when standstill effort ripple is high, even though steady-state error alone is fine", () => {
+		const dithering = realMetrics("hold-dither-i0.csv");
+		expect(dithering.restEffort.restTailValid).toBe(true);
+		expect(dithering.restEffort.pTermRestRipple).toBeGreaterThan(10);
+		const r = I.recommend(metrics({ steadyStateError: 0.02, restEffort: dithering.restEffort }), 0);
+		expect(r.verdict).toBe("increase");
+	});
+	it("ACCEPTS the equivalent real capture once I has actually settled the standstill dither", () => {
+		const settled = realMetrics("hold-settled-i23.csv");
+		expect(settled.restEffort.restTailValid).toBe(true);
+		expect(settled.restEffort.pTermRestRipple).toBeLessThanOrEqual(10);
+		expect(I.recommend(settled, 23.5).verdict).toBe("accept");
 	});
 });

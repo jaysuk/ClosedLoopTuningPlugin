@@ -423,3 +423,10 @@ export function computeRestEffort(capture: ParsedCapture, sampleRateHz: number):
 		restTailValid: pTail.length >= REST_TAIL_MIN_SAMPLES && iConverged,
 	};
 }
+
+/** Peak-to-peak P-term at rest above this = control-effort dither, even if position error is tiny.
+ *  Judgement call between the measured, real-capture values 3.60 (stable) and 33.60 (dithering) —
+ *  ~3x margin either side. P-term units; 4% of the 250 rail (P_TERM_RAIL). See docs/PLAN-standstill-
+ *  effort.md §3.3 for the full calibration set this was picked against. Only ever gates a decision
+ *  when `restTailValid` is also true — see each consumer (autotune.ts, wizard.ts, evaluate.ts). */
+export const REST_EFFORT_RIPPLE_LIMIT = 10;
