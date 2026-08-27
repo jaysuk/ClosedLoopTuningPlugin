@@ -1,7 +1,14 @@
 # Plan: standstill control-effort criteria, capture hygiene, and a truncated-capture parser bug
 
-**Status:** planned, not started. Written 2026-08-22 from a user feedback report (3 items) plus 4 more
-found while verifying it against the code and their captures.
+**Status:** implemented, all 5 phases (commits `fe7628f`, `2a2ca99`, `3a85f2c`, `86eecfb`, `877b46b`).
+Written 2026-08-22 from a user feedback report (3 items) plus 4 more found while verifying it against
+the code and their captures. Every §3.3 calibration number matched on the first implementation attempt,
+no threshold retuning needed. 371 tests pass (35 new); typecheck + verify-build clean against a real
+DWC 3.7 checkout; `check-ui36` (4/4 SFCs) and a real DWC 3.6 webpack build both clean.
+
+**Open, not blocking:** item D (§5.1) is report-only — no capture yet shows non-zero D-term ripple to
+calibrate a gate against. §7's four questions to the user (D data, cleanup defaults, truncation
+frequency, a longer-rest-window capture to de-risk §3.4) are still open; none block what shipped.
 
 **Audience:** this is written to be implemented directly. Every threshold below was measured against
 real captures (§3.3), every file:line anchor was checked, and §11 lists what NOT to do. Where a number
