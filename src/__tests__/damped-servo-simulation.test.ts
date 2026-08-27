@@ -10,6 +10,7 @@
  */
 import { describe, expect, it, vi } from "vitest";
 
+import { EMPTY_REST_EFFORT } from "../model/analysis";
 import { runAutoTune, type TuneEffects } from "../model/autorun";
 import type { TuneEvaluation } from "../model/evaluate";
 import type { PidConfig } from "../model/m569";
@@ -45,6 +46,9 @@ function plant(pid: PidConfig): TuneSignal {
 		oscAmplitude: 0,
 		itae: moveRms,
 		hasMove: true,
+		// Not modelled by this plant — restTailValid: false means the new standstill-effort gate is
+		// skipped transparently, same as a real capture too short/without a PID I Term column to judge.
+		restEffort: EMPTY_REST_EFFORT,
 	};
 }
 

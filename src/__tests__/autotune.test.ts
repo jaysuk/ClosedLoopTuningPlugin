@@ -4,12 +4,12 @@ import {
 	D_STRATEGY, I_STRATEGY, P_STRATEGY, SIGNAL_A_STRATEGY, SIGNAL_D_STRATEGY, SIGNAL_I_STRATEGY,
 	SIGNAL_P_STRATEGY, SIGNAL_V_STRATEGY, describeMetrics, interpolateVZero, type Attempt, type SignalAttempt,
 } from "../model/autotune";
-import type { StepMetrics } from "../model/analysis";
+import { EMPTY_REST_EFFORT, type StepMetrics } from "../model/analysis";
 import type { TuneSignal } from "../model/signal";
 import type { TuneStats } from "../model/evaluate";
 
 function m(over: Partial<StepMetrics>): StepMetrics {
-	return { stepSize: 4, riseTime: 0.02, overshootPct: 0, settlingTime: 0.03, steadyStateError: 0, peakError: 0.1, rmsError: 0.05, oscillations: 0, hasStep: true, pTermSatDuty: 0, ...over };
+	return { stepSize: 4, riseTime: 0.02, overshootPct: 0, settlingTime: 0.03, steadyStateError: 0, peakError: 0.1, rmsError: 0.05, oscillations: 0, hasStep: true, pTermSatDuty: 0, restEffort: EMPTY_REST_EFFORT, ...over };
 }
 const at = (value: number, metrics: StepMetrics): Attempt => ({ value, metrics });
 
@@ -99,7 +99,7 @@ function sig(over: Partial<Omit<TuneSignal, "stats">> & { stats?: Partial<TuneSt
 	return {
 		stats: stats(statsOver ?? {}),
 		pTermAccelPeak: 0, pTermCruiseMean: 0, pTermSatDuty: 0, postMoveOsc: 0,
-		oscPeriod: null, oscAmplitude: 0, itae: 0, hasMove: true,
+		oscPeriod: null, oscAmplitude: 0, itae: 0, hasMove: true, restEffort: EMPTY_REST_EFFORT,
 		...rest,
 	};
 }

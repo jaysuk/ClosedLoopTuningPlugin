@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import type { StepMetrics } from "../model/analysis";
+import { EMPTY_REST_EFFORT, type StepMetrics } from "../model/analysis";
 import {
 	detectUltimate, nextBackoff, refineAxisCycle, refinementDelta, refineTerm, runAutoTune, runSignalTerm,
 	runStepTerm, seedFromUltimate, verifyAccepted, type TuneEffects,
@@ -24,14 +24,14 @@ function sig(over: Partial<Omit<TuneSignal, "stats">> & { stats?: Partial<TuneSt
 	return {
 		stats: stats(statsOver ?? {}),
 		pTermAccelPeak: 50, pTermCruiseMean: 1, pTermSatDuty: 0, postMoveOsc: 0,
-		oscPeriod: null, oscAmplitude: 0, itae: 0, hasMove: true,
+		oscPeriod: null, oscAmplitude: 0, itae: 0, hasMove: true, restEffort: EMPTY_REST_EFFORT,
 		...rest,
 	};
 }
 /** A signal that every strategy accepts immediately, first capture, no ramping. */
 const GOOD_SIGNAL = sig({ stats: { moveRms: 0.05, restBias: 0.05, settleOvershoot: 0.1, restRing: 0 } });
 function stepM(over: Partial<StepMetrics> = {}): StepMetrics {
-	return { stepSize: 16, riseTime: 0.02, overshootPct: 0, settlingTime: 0.03, steadyStateError: 0.05, peakError: 0.1, rmsError: 0.05, oscillations: 0, hasStep: true, pTermSatDuty: 0, ...over };
+	return { stepSize: 16, riseTime: 0.02, overshootPct: 0, settlingTime: 0.03, steadyStateError: 0.05, peakError: 0.1, rmsError: 0.05, oscillations: 0, hasStep: true, pTermSatDuty: 0, restEffort: EMPTY_REST_EFFORT, ...over };
 }
 const GOOD_STEP = stepM();
 

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { EMPTY_REST_EFFORT } from "../model/analysis";
 import type { TuneEvaluation, TuneStats } from "../model/evaluate";
 import type { PidConfig } from "../model/m569";
 import type { TuneSignal } from "../model/signal";
@@ -17,7 +18,7 @@ function sig(over: Partial<Omit<TuneSignal, "stats">> & { stats?: Partial<TuneSt
 	return {
 		stats: stats(statsOver ?? {}),
 		pTermAccelPeak: 0, pTermCruiseMean: 0, pTermSatDuty: 0, postMoveOsc: 0,
-		oscPeriod: null, oscAmplitude: 0, itae: 0, hasMove: true,
+		oscPeriod: null, oscAmplitude: 0, itae: 0, hasMove: true, restEffort: EMPTY_REST_EFFORT,
 		...rest,
 	};
 }

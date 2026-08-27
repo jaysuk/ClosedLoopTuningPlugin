@@ -100,6 +100,10 @@ export interface StepMetrics {
 	 * of the rise/overshoot metrics, which a saturated response can silently distort.
 	 */
 	pTermSatDuty: number;
+	/** Standstill control-effort ripple (see computeRestEffort below) — attached post-hoc in
+	 *  analyzeCapture the same way pTermSatDuty is, since analyzeStep only has the series, not the
+	 *  raw capture columns it needs. Defaults to the all-zero/invalid EMPTY_REST_EFFORT shape. */
+	restEffort: RestEffort;
 }
 
 const SETTLE_BAND_FRACTION = 0.05;   // ±5% of the step
@@ -151,7 +155,7 @@ export function analyzeStep(series: CaptureSeries): StepMetrics {
 	const steadyStateError = tailCount ? tailSum / tailCount : 0;
 
 	if (startIdx < 0 || absStep < 1e-6) {
-		return { stepSize, riseTime: null, overshootPct: 0, settlingTime: null, steadyStateError, peakError, rmsError, oscillations: 0, hasStep: false, pTermSatDuty: 0 };
+		return { stepSize, riseTime: null, overshootPct: 0, settlingTime: null, steadyStateError, peakError, rmsError, oscillations: 0, hasStep: false, pTermSatDuty: 0, restEffort: EMPTY_REST_EFFORT };
 	}
 
 	const dir = Math.sign(stepSize);
@@ -199,7 +203,7 @@ export function analyzeStep(series: CaptureSeries): StepMetrics {
 		if (s !== 0) { prevSign = s; }
 	}
 
-	return { stepSize, riseTime, overshootPct, settlingTime, steadyStateError, peakError, rmsError, oscillations, hasStep: true, pTermSatDuty: 0 };
+	return { stepSize, riseTime, overshootPct, settlingTime, steadyStateError, peakError, rmsError, oscillations, hasStep: true, pTermSatDuty: 0, restEffort: EMPTY_REST_EFFORT };
 }
 
 /** |PID P term| at or above this is actuator saturation — the firmware clamps the term around ±256. */
@@ -225,6 +229,7 @@ export function analyzeCapture(capture: ParsedCapture, sampleRateHz: number): St
 	// Saturation duty from the PID P term when the capture recorded it (the step recipe does).
 	const pterm = column(capture, "PID P Term");
 	if (pterm) { metrics.pTermSatDuty = satDuty(pterm); }
+	metrics.restEffort = computeRestEffort(capture, sampleRateHz);
 	return metrics;
 }
 
@@ -305,4 +310,116 @@ export function analyzeMove(capture: ParsedCapture, sampleRateHz: number): MoveM
 	// segments above never look at (they're keyed off the commanded velocity, which is zero here).
 	const postMoveOsc = countGatedOscillations(pterm, seg.lastMoving + 1, n, P_TERM_RAIL * 0.5);
 	return { hasMove: cruiseCount >= 3, pTermAccelPeak: accelPeak, pTermCruiseMean: cruiseCount ? cruiseSum / cruiseCount : 0, cruiseSamples: cruiseCount, pTermSatDuty, postMoveOsc };
+}
+
+// ---- Standstill control-effort ripple ----
+// Distinct from postMoveOsc above: that counts RAILED hunting (gated at half the effort rail, P_TERM_
+// RAIL * 0.5 = 125), which catches gross limit cycles but is blind to a much smaller, still mechanically
+// noticeable standstill dither — a fraction of a single encoder count can swing the P term by tens of
+// units when P is large, without ever railing or moving the mean position error enough to trip restBias
+// or restRing (evaluate.ts). Field case + calibration data: docs/PLAN-standstill-effort.md.
+
+/** Fraction of the rest window (measured from the end) judged as "settled" — long enough after a move
+ *  stops for a genuine settling transient to have died out before ripple is judged as persistent. */
+export const REST_TAIL_FRACTION = 0.10;
+/** Below this many samples in the tail, ripple can't be measured meaningfully — skip the gate. */
+export const REST_TAIL_MIN_SAMPLES = 25;
+/** The integrator is "converged" once every tail sample stays within this fraction of its own final
+ *  value — the guard that stops a still-settling transient from reading as persistent dither (a
+ *  transient can swing the P term just as hard as a real limit cycle while I is still climbing). */
+export const I_SETTLED_TOL_FRACTION = 0.01;
+
+export interface RestEffort {
+	/** Peak-to-peak PID P term over the settled tail of the rest window — the primary dither signal. */
+	pTermRestRipple: number;
+	/** RMS about the mean over the same window (outlier-resistant companion to p2p). */
+	pTermRestRms: number;
+	/** Peak-to-peak PID D term over the same window. 0 when the capture didn't record it. Reported for
+	 *  the tuning report only — no field data yet to calibrate a D threshold against. */
+	dTermRestRipple: number;
+	/** Peak-to-peak PID Control Signal (total output) over the same window. 0 when not recorded. */
+	outputRestRipple: number;
+	/** Samples actually measured in the tail window. */
+	restTailSamples: number;
+	/**
+	 * The ripple numbers above are trustworthy. False when the tail was too short, or the integrator
+	 * had not converged by the start of the tail (still mid settling-transient, not yet dithering).
+	 * MUST only ever skip a decision that depends on it — never a rejection, never a cost penalty.
+	 */
+	restTailValid: boolean;
+}
+
+/** The all-zero/"not measured" shape — always `restTailValid: false`, so it can never accidentally
+ *  gate a decision. Exported for test fixtures that build a StepMetrics/TuneSignal by hand. */
+export const EMPTY_REST_EFFORT: RestEffort = {
+	pTermRestRipple: 0, pTermRestRms: 0, dTermRestRipple: 0, outputRestRipple: 0,
+	restTailSamples: 0, restTailValid: false,
+};
+
+function peakToPeak(a: Array<number>): number {
+	if (a.length === 0) { return 0; }
+	let min = Infinity;
+	let max = -Infinity;
+	for (const v of a) {
+		if (v < min) { min = v; }
+		if (v > max) { max = v; }
+	}
+	return max - min;
+}
+
+function rmsAboutMean(a: Array<number>): number {
+	if (a.length === 0) { return 0; }
+	const mean = a.reduce((s, v) => s + v, 0) / a.length;
+	return Math.sqrt(a.reduce((s, v) => s + (v - mean) ** 2, 0) / a.length);
+}
+
+/**
+ * Measure control-effort dither over the SETTLED tail of a capture's rest window. Complements the
+ * position-error stats (restBias/restRing in evaluate.ts), which a limit cycle small enough can clear
+ * without ever tripping — see the module comment above.
+ */
+export function computeRestEffort(capture: ParsedCapture, sampleRateHz: number): RestEffort {
+	const target = column(capture, "Target Motor Steps");
+	const pterm = column(capture, "PID P Term");
+	if (!target || !pterm) { return EMPTY_REST_EFFORT; }
+	const time = timeAxisSeconds(capture, sampleRateHz);
+	const n = Math.min(target.length, pterm.length, time.length);
+	if (n < 2) { return EMPTY_REST_EFFORT; }
+
+	const seg = segmentMove(target.slice(0, n), time, sampleRateHz);
+	const restStart = seg.moved ? seg.lastMoving + 1 : 0;
+	const restLen = n - restStart;
+	if (restLen <= 0) { return EMPTY_REST_EFFORT; }
+
+	const tailLen = Math.min(restLen, Math.max(REST_TAIL_MIN_SAMPLES, Math.floor(restLen * REST_TAIL_FRACTION)));
+	const tailStart = n - tailLen;
+	const tailOf = (a: Array<number>) => a.slice(tailStart, n).filter(Number.isFinite);
+
+	const pTail = tailOf(pterm);
+	const dcol = column(capture, "PID D Term");
+	const outcol = column(capture, "PID Control Signal");
+	const dTail = dcol ? tailOf(dcol) : [];
+	const outTail = outcol ? tailOf(outcol) : [];
+
+	// Converged unless the I column is present, has samples in the tail, AND those samples visibly
+	// vary — a genuinely constant I (including I=0, no integrator to converge) needs no wait at all.
+	const icol = column(capture, "PID I Term");
+	let iConverged = true;
+	if (icol) {
+		const iTail = icol.slice(tailStart, n).filter(Number.isFinite);
+		if (iTail.length > 0) {
+			const iFinal = iTail[iTail.length - 1];
+			const tol = Math.max(1e-6, I_SETTLED_TOL_FRACTION * Math.abs(iFinal));
+			iConverged = iTail.every((v) => Math.abs(v - iFinal) <= tol);
+		}
+	}
+
+	return {
+		pTermRestRipple: peakToPeak(pTail),
+		pTermRestRms: rmsAboutMean(pTail),
+		dTermRestRipple: peakToPeak(dTail),
+		outputRestRipple: peakToPeak(outTail),
+		restTailSamples: pTail.length,
+		restTailValid: pTail.length >= REST_TAIL_MIN_SAMPLES && iConverged,
+	};
 }

@@ -13,7 +13,7 @@
  *
  * Pure and unit-tested against real captures (see src/__tests__/fixtures).
  */
-import { analyzeMove, buildSeries, P_TERM_RAIL, segmentMove } from "./analysis";
+import { analyzeMove, buildSeries, computeRestEffort, P_TERM_RAIL, segmentMove, type RestEffort } from "./analysis";
 import type { ParsedCapture } from "./csv";
 import { autocorrelationPeriod } from "./dsp";
 import { tuneStats, type TuneStats } from "./evaluate";
@@ -39,6 +39,9 @@ export interface TuneSignal {
 	itae: number;
 	/** A commanded move with a steady-speed section was detected. */
 	hasMove: boolean;
+	/** Standstill control-effort ripple (P/D/output) — see analysis.ts. Distinct from postMoveOsc
+	 *  above: that only counts RAILED hunting, this catches dither too small to ever rail. */
+	restEffort: RestEffort;
 }
 
 // Stability limits (exported for tests + transparency).
@@ -161,6 +164,7 @@ export function computeTuneSignal(capture: ParsedCapture, sampleRateHz: number):
 		oscAmplitude,
 		itae,
 		hasMove: stats.moved && stats.cruiseSamples >= 3,
+		restEffort: computeRestEffort(capture, sampleRateHz),
 	};
 }
 
@@ -298,6 +302,16 @@ export function medianSignal(signals: Array<TuneSignal>): TuneSignal {
 		oscAmplitude: median(signals.map((s) => s.oscAmplitude)),
 		itae: median(signals.map((s) => s.itae)),
 		hasMove: signals.filter((s) => s.hasMove).length * 2 > signals.length,
+		restEffort: {
+			pTermRestRipple: median(signals.map((s) => s.restEffort.pTermRestRipple)),
+			pTermRestRms: median(signals.map((s) => s.restEffort.pTermRestRms)),
+			dTermRestRipple: median(signals.map((s) => s.restEffort.dTermRestRipple)),
+			outputRestRipple: median(signals.map((s) => s.restEffort.outputRestRipple)),
+			restTailSamples: median(signals.map((s) => s.restEffort.restTailSamples)),
+			// Majority vote, same pattern as `moved`/`hasMove` above — a median across a mix of valid
+			// and invalid measurements would itself be untrustworthy, so require most captures agree.
+			restTailValid: signals.filter((s) => s.restEffort.restTailValid).length * 2 > signals.length,
+		},
 	};
 }
 
