@@ -624,9 +624,30 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		if (t && wizardStep.value.defaultStart !== undefined) { (pid as any)[t] = wizardStep.value.defaultStart; void applyPid(); }
 	}
 	async function runWizardCapture(): Promise<void> {
-		// Use the same G1-move step capture as auto-tune (the V64 manoeuvre doesn't move on all setups).
 		recording.value = true;
-		try { await captureStep(); } finally { recording.value = false; }
+		try {
+			// Opt-in: the same custom-G1 mechanism the "Advanced: manual capture" panel already offers
+			// (moveMode/customMove), now also reachable from the wizard — see docs/PLAN-v2.4-feedback.md
+			// item J. Only activates once the user has switched moveMode to "custom" there; default
+			// behaviour (below) is untouched.
+			if (moveMode.value === "custom") {
+				if (!customMove.value) {
+					host.notify("warning", "Closed Loop Tuning", "Enter a move before recording.");
+					return;
+				}
+				const coupled = coupledAxesForDriver();
+				if ("error" in coupled) { log(`Step capture: ${coupled.error}`); host.notify("error", "Closed Loop Tuning", coupled.error); return; }
+				if (!(await ensureAxisReady(coupled))) { return; }
+				const c = await runCapture({
+					driver: selectedDriver.value ?? "", samples: samples.value, activate: 1,
+					rate: sampleRate.value, variables: varIds(ALL_CAPTURE_KEYS), manoeuvre: 0, move: customMove.value,
+				});
+				if (c) { metrics.value = analyzeCapture(c, sampleRate.value); }
+				return;
+			}
+			// Default: a small, fast, auto-sized G1 move (the V64 manoeuvre doesn't move on all setups).
+			await captureStep();
+		} finally { recording.value = false; }
 	}
 	watch(metrics, (m) => {
 		const term = wizardStep.value.term;

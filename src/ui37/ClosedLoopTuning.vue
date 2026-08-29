@@ -256,7 +256,7 @@
 										</v-btn>
 										<v-btn v-if="wizardStep.term && wizardStep.defaultStart !== undefined" size="small" variant="text"
 											   :disabled="!selectedDriver" @click="seedDefault">Set start ({{ wizardStep.defaultStart }})</v-btn>
-										<HelpTip :href="DOCS.m569_5" text="Runs M569.5 with the step manoeuvre (V64): a 4 full-step jump so the controller's response can be measured. Recorded to a CSV and plotted below." />
+										<HelpTip :href="DOCS.m569_5" text="Uses a small, auto-sized G1 move by default (fast enough to behave like a step jump). To use your own move instead, set it in Advanced → Manual capture below, then switch Move to Custom — the wizard will use that move too." />
 									</div>
 									<v-alert v-if="recommendation" :type="verdictType" variant="tonal" density="compact">
 										{{ recommendation.message }}
