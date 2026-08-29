@@ -1,7 +1,19 @@
 # Plan: v2.4.0 field feedback — D-term over-damping, combined current, wizard moves, rounding
 
-**Status:** planned, not started. Written 2026-08-29 from one user's v2.4.0 testbench report (4 points)
-plus their unprompted compliment about "Refine" (no code change — noted in §8).
+**Status:** implemented, all items (H.1, H.2, H.3, I, J, K) — commits `60abfbb`, `52bc063`, `4285f90`,
+`5168223`. Written 2026-08-29 from one user's v2.4.0 testbench report (4 points) plus their unprompted
+compliment about "Refine" (no code change — noted in §8). 389 tests pass (18 new, none removed, up from
+371 before this plan); typecheck + verify-build clean against a real DWC 3.7 checkout (typecheck caught
+one real bug — `medianSignal` missing `cruiseRing` — that all 389 passing vitest tests had missed);
+`check-ui36` (4/4 SFCs) and a real DWC 3.6 webpack build both clean against a fresh `v3.6-dev` checkout
+at `C:/Users/live/Documents/Github/DuetWebControl-3.6-dev`.
+
+**Incident during implementation:** `stage-dwc36.mjs` was mistakenly invoked with the real (old) DWC 3.6
+checkout path as its output-directory argument, which wiped that checkout down to just the staged plugin
+source. Recovered via a fresh `git clone -b v3.6-dev` into the new path above — verified with `npm
+install` and a full plugin build, not just checked out and assumed working. The old checkout at
+`C:\Users\live\Documents\Input Shaping\DuetWebControl-3.6-dev` is left as-is (still wiped); the new one
+above is now the working DWC 3.6 reference for this repo.
 
 **Audience:** written to be implemented directly. Every claim below was checked against the current
 code (file:line anchors throughout), not assumed from the report. §9 lists what NOT to do.
