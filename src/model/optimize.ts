@@ -24,7 +24,7 @@
 import type { PidConfig } from "./m569";
 import { describeSignal, significantlyBetterForTerm, type TuneSignal } from "./signal";
 import {
-	captureMedian, clampTerm, SETTLE_DELAY_MS, TERM_MAX, ZERO_START, type AutoRunAttempt, type TuneEffects,
+	captureMedian, clampTerm, ROUND_DP, SETTLE_DELAY_MS, TERM_MAX, ZERO_START, type AutoRunAttempt, type TuneEffects,
 } from "./tuneShared";
 import type { PidTerm } from "./wizard";
 
@@ -66,8 +66,6 @@ const STEP_SHRINK = 0.5;
 const INITIAL_STEP_FRACTION = 0.25;
 /** Absolute step-size floor per term (steps stop shrinking below this even at convergeFraction=0). */
 const MIN_STEP: Record<PidTerm, number> = { p: 0.5, i: 5, d: 0.0005, a: 250, v: 1 };
-/** Rounding precision per term — D needs more decimal places than the others (its whole range is ≤0.6). */
-const ROUND_DP: Record<PidTerm, number> = { p: 2, i: 2, d: 4, a: 2, v: 2 };
 
 function round(v: number, dp: number): number {
 	const f = Math.pow(10, dp);

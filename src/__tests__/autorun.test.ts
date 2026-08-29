@@ -14,7 +14,7 @@ import type { TuneEvaluation, TuneStats } from "../model/evaluate";
 
 function stats(over: Partial<TuneStats> = {}): TuneStats {
 	return {
-		restBias: 0, restNoise: 0.05, restRing: 0, settleOvershoot: 0, cruiseLag: 0, cruiseSpread: 0,
+		restBias: 0, restNoise: 0.05, restRing: 0, cruiseRing: 0, settleOvershoot: 0, cruiseLag: 0, cruiseSpread: 0,
 		accelPeak: 0, movePeak: 5, moveRms: 1, cruiseSamples: 10, restSamples: 10, moved: true,
 		...over,
 	};
@@ -64,9 +64,16 @@ function fakeEffects(over: Partial<TuneEffects> = {}): { effects: TuneEffects; l
 
 describe("nextBackoff", () => {
 	it("halves on the first retry, quarters on the second", () => {
-		expect(nextBackoff(100, 0)).toBe(50);
-		expect(nextBackoff(100, 1)).toBe(25);
-		expect(nextBackoff(100, 2)).toBe(12.5);
+		expect(nextBackoff(100, 0, "p")).toBe(50);
+		expect(nextBackoff(100, 1, "p")).toBe(25);
+		expect(nextBackoff(100, 2, "p")).toBe(12.5);
+	});
+
+	it("rounds to the term's own precision, not a fixed 6dp — a large A backoff stays 2dp", () => {
+		// 3 halvings of a six-figure A value lands on an exact .125 binary fraction — at 6dp this used to
+		// surface real-but-meaningless digits in the UI; at A's own 2dp it's clean.
+		expect(nextBackoff(253125, 2, "a")).toBe(31640.63);
+		expect(String(nextBackoff(253125, 2, "a"))).not.toMatch(/\.\d{3,}/);
 	});
 });
 
@@ -124,7 +131,7 @@ describe("verifyAccepted", () => {
 		const { effects } = fakeEffects({ captureSignal });
 		const result = await verifyAccepted(effects, "p", basePid(), 200, 1, 2);
 		expect(result.ok).toBe(true);
-		if (result.ok) { expect(result.value).toBe(nextBackoff(200, 0)); }
+		if (result.ok) { expect(result.value).toBe(nextBackoff(200, 0, "p")); }
 		expect(captureSignal).toHaveBeenCalledTimes(2);
 	});
 
@@ -169,6 +176,32 @@ describe("runSignalTerm", () => {
 		const result = await runSignalTerm(effects, SIGNAL_P_STRATEGY, basePid(), 1, 2, 30);
 		expect(result.ok).toBe(false);
 		expect(result.reason).toContain("capture failed");
+	});
+
+	it("clamps a manual D ceiling instead of following the strategy's own next value (docs/PLAN-v2.4-feedback.md §2.2)", async () => {
+		const pid = basePid();
+		let overshoot = 20;
+		// Overshoot keeps "genuinely improving" every attempt (never plateaus, never rings) so the
+		// strategy would ramp D all the way to its own max on its own — the ceiling is the only thing
+		// that should stop it here.
+		const captureSignal = vi.fn(async () => {
+			const s = sig({ stats: { settleOvershoot: overshoot, restRing: 0 } });
+			overshoot *= 0.9;
+			return s;
+		});
+		const { effects } = fakeEffects({ captureSignal });
+		const ceiling = 0.05;
+		await runSignalTerm(effects, SIGNAL_D_STRATEGY, pid, 1, 2, 0, [], ceiling);
+		expect(pid.d).toBeLessThanOrEqual(ceiling);
+	});
+
+	it("omitting the ceiling (default Infinity) reproduces the un-clamped ramp unchanged", async () => {
+		const captureSignal = vi.fn(async () => sig({ stats: { settleOvershoot: 3, restRing: 0 } }));
+		const { effects: effectsA } = fakeEffects({ captureSignal });
+		const { effects: effectsB } = fakeEffects({ captureSignal });
+		const noCeiling = await runSignalTerm(effectsA, SIGNAL_D_STRATEGY, basePid(), 1, 2, 0);
+		const explicitInfinity = await runSignalTerm(effectsB, SIGNAL_D_STRATEGY, basePid(), 1, 2, 0, [], Infinity);
+		expect(noCeiling).toEqual(explicitInfinity);
 	});
 
 	it("propagates a verification failure as a term failure", async () => {

@@ -49,6 +49,13 @@ export const P_RISE_PLATEAU = 0.05;  // <5% rise-time improvement → stop raisi
 export const D_OVERSHOOT_OK = 8;     // % overshoot considered critically damped
 export const D_OSC_LIMIT = 14;       // ringing/noise that means D is too high
 export const D_MAX = 0.6;
+/**
+ * <5% overshoot improvement vs. the previous attempt → more D isn't helping, stop raising it. Without
+ * this, a persistent NON-resonant disturbance (e.g. a ballscrew's lead-error ripple) that never quite
+ * clears the "critically damped" bar and never quite gets classed as "getting worse" either rides D all
+ * the way to D_MAX chasing something no D value can remove — see docs/PLAN-v2.4-feedback.md §2.
+ */
+export const D_OVERSHOOT_PLATEAU = 0.05;
 export const I_SSE_OK = 0.1;         // steady-state error (steps) considered settled
 export const I_OSC_LIMIT = 14;
 export const I_MAX = 60000;
@@ -72,6 +79,12 @@ function bestStable(attempts: Array<Attempt>): Attempt | null {
 		if (!best || (best.metrics.riseTime != null && a.metrics.riseTime < best.metrics.riseTime)) { best = a; }
 	}
 	return best;
+}
+
+/** The lowest-overshoot attempt — the "best" attempt for D, whose goal is overshoot, not rise time
+ * (unlike `bestStable`, which picks by rise time and is P's own metric). */
+function bestByOvershoot(attempts: Array<Attempt>): Attempt {
+	return attempts.reduce((best, a) => (a.metrics.overshootPct < best.metrics.overshootPct ? a : best), attempts[0]);
 }
 
 const noStep: AutoDecision = { kind: "fail", reason: "No clear step detected — check the driver is in closed/assisted mode, calibrated, and that the axis can move." };
@@ -124,6 +137,17 @@ export const D_STRATEGY: TermStrategy = {
 		}
 		if (last.metrics.overshootPct <= D_OVERSHOOT_OK) {
 			return { kind: "accept", value: last.value, note: `Overshoot ${last.metrics.overshootPct.toFixed(0)}% — critically damped.` };
+		}
+		// Diminishing returns: overshoot barely moved vs. the last attempt — more D is not fixing this
+		// (a persistent non-resonant disturbance is the likely culprit). Settle on the best attempt seen
+		// instead of riding this to D_MAX.
+		if (attempts.length >= 2) {
+			const prev = attempts[attempts.length - 2];
+			const po = prev.metrics.overshootPct;
+			if (po > 0 && (po - last.metrics.overshootPct) / po < D_OVERSHOOT_PLATEAU) {
+				const best = bestByOvershoot(attempts);
+				return { kind: "accept", value: best.value, note: `Overshoot plateaued at ~${last.metrics.overshootPct.toFixed(0)}% — more D isn't helping. Settled on D=${best.value}.` };
+			}
 		}
 		const next = round(last.value + (last.value < 0.5 ? 0.01 : 0.025), 3);
 		if (next > D_MAX) { return { kind: "accept", value: last.value, note: `Reached the D limit (${D_MAX}).` }; }
@@ -223,6 +247,21 @@ function backOff(attempts: Array<SignalAttempt>, term: string, fallback: number)
 	return { kind: "accept", value: v, note: `${term}=${last.value} destabilised the loop (${why}) — backed off to ${v}.` };
 }
 
+/**
+ * Report-only context for a D accept note: when cruise-phase ripple was present at the start of a D ramp
+ * and never meaningfully cleared as D rose, that's evidence it isn't something D can fix (a persistent
+ * mechanical source, e.g. a ballscrew, rather than loop resonance) — see docs/PLAN-v2.4-feedback.md
+ * §2.3. Never changes the decision, only the log text.
+ */
+function cruiseRippleNote(attempts: Array<SignalAttempt>): string {
+	const first = attempts[0].signal.stats.cruiseRing;
+	const last = attempts[attempts.length - 1].signal.stats.cruiseRing;
+	if (first >= RING_WARN && last >= first * 0.5) {
+		return ` Ripple was also present while cruising (${first} → ${last} cycles) and didn't clear as D rose — may be mechanical (e.g. a ballscrew), not underdamping.`;
+	}
+	return "";
+}
+
 export const SIGNAL_P_STRATEGY: SignalStrategy = {
 	term: "p",
 	label: "P (proportional)",
@@ -281,10 +320,24 @@ export const SIGNAL_D_STRATEGY: SignalStrategy = {
 				return { kind: "accept", value: prev.value, note: `D=${last.value} increased ringing (${s.restRing} cycles) — backed off to ${prev.value}.` };
 			}
 		}
+		// Diminishing returns: overshoot barely moved vs. the last attempt, and ring didn't clear either
+		// — more D is not fixing this. A persistent NON-resonant ripple (e.g. a ballscrew's lead-error)
+		// is an external forcing function; no D value removes it, so without this check the ramp would
+		// otherwise ride D all the way to D_MAX chasing something it can never fix. Settle on whichever
+		// attempt had the lowest overshoot instead.
+		if (attempts.length >= 2) {
+			const prev = attempts[attempts.length - 2];
+			const po = prev.signal.stats.settleOvershoot;
+			if (po > 0 && (po - s.settleOvershoot) / po < D_OVERSHOOT_PLATEAU) {
+				const best = bestBy(attempts, (sig) => sig.stats.settleOvershoot);
+				return { kind: "accept", value: best.value, note: `Overshoot plateaued at ~${s.settleOvershoot.toFixed(2)} step (${po.toFixed(2)} → ${s.settleOvershoot.toFixed(2)}) — more D isn't helping.${cruiseRippleNote(attempts)} Settled on D=${best.value}.` };
+			}
+		}
 		const next = round(last.value + (last.value < 0.5 ? 0.01 : 0.025), 3);
 		if (next > D_MAX) { return { kind: "accept", value: last.value, note: `Reached the D limit (${D_MAX}).` }; }
 		if (attempts.length >= this.maxAttempts) {
-			return { kind: "accept", value: bestBy(attempts, (sig) => sig.stats.settleOvershoot).value, note: "Max attempts reached." };
+			const best = bestBy(attempts, (sig) => sig.stats.settleOvershoot);
+			return { kind: "accept", value: best.value, note: `Max attempts reached.${cruiseRippleNote(attempts)}` };
 		}
 		return { kind: "set", value: next, note: `Increasing D to ${next}.` };
 	},

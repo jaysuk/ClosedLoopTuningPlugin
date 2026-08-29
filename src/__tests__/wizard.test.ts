@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
+import { D_MAX } from "../model/autotune";
 import { WIZARD_STEPS } from "../model/wizard";
 import { analyzeCapture, EMPTY_REST_EFFORT, type StepMetrics } from "../model/analysis";
 import { parseCapture } from "../model/csv";
@@ -55,6 +56,11 @@ describe("D step", () => {
 	});
 	it("accepts when critically damped", () => {
 		expect(D.recommend(metrics({ overshootPct: 2 }), 0.2).verdict).toBe("accept");
+	});
+	it("never suggests past D_MAX — the wizard's own D step had no upper bound before this", () => {
+		const r = D.recommend(metrics({ overshootPct: 90 }), D_MAX);
+		expect(r.verdict).toBe("increase");
+		expect(r.suggested).toBeLessThanOrEqual(D_MAX);
 	});
 });
 

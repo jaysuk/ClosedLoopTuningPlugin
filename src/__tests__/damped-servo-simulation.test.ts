@@ -35,7 +35,7 @@ function plant(pid: PidConfig): TuneSignal {
 	const satDuty = p > 500 ? 0.5 : 0; // only an excessive P actually saturates
 	return {
 		stats: {
-			restBias: -0.05, restNoise: 0.05, restRing: 0, settleOvershoot: 0.05, cruiseLag, cruiseSpread: 0,
+			restBias: -0.05, restNoise: 0.05, restRing: 0, cruiseRing: 0, settleOvershoot: 0.05, cruiseLag, cruiseSpread: 0,
 			accelPeak, movePeak: moveRms * 3, moveRms, cruiseSamples: 20, restSamples: 20, moved: true,
 		},
 		pTermAccelPeak: accelPeak,

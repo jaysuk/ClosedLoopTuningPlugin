@@ -242,6 +242,10 @@
 												<v-text-field v-if="identifyMethod !== 'model-fit' && seedRule === 'amigo'" v-model.number="seedLambda" type="number" step="0.1" label="λ (aggressiveness)" dense outlined hide-details style="max-width: 160px" class="mr-3 mb-2"><template #append><HelpTip text="Scales the AMIGO seed rule: >1 pushes the seeded gains hotter/faster, <1 backs them off. 1 = unscaled." /></template></v-text-field>
 												<v-text-field v-model.number="medianOf" type="number" :min="1" :max="5" label="Captures per decision" dense outlined hide-details style="max-width: 190px" class="mr-3 mb-2"><template #append><HelpTip text="How many captures to median-combine before each decision. Higher rejects one-off glitches better but takes longer to run. 1 is the default; try 3 for a noisy encoder or a Thorough/Refine run." /></template></v-text-field>
 												<v-text-field v-if="tuneMethod !== 'sequential'" v-model.number="captureBudget" type="number" :min="10" :max="200" label="Optimise capture budget" dense outlined hide-details style="max-width: 200px" class="mb-2"><template #append><HelpTip text="Maximum captures the joint (package/refine) optimisation pass may spend before stopping with its best result so far. Default 40." /></template></v-text-field>
+												<v-text-field :value="dCeiling === null ? '' : dCeiling" @input="dCeiling = $event === '' ? null : Number($event)"
+															  type="number" step="0.01" :min="0" :max="D_MAX" label="Max D (optional)" dense outlined hide-details style="max-width: 170px" class="mb-2">
+													<template #append><HelpTip text="Manual cap on D during the sequential ramp, below the firmware's own limit. Auto-tune already stops on its own once raising D stops helping (e.g. a persistent, non-loop ripple like a ballscrew) — use this only if you want a firm ceiling regardless. Leave blank for no extra cap." /></template>
+												</v-text-field>
 											</div>
 										</v-expansion-panel-content>
 									</v-expansion-panel>
@@ -544,7 +548,7 @@ const {
 	autoRunning, autoStatus, autoLog, startAutoTune, abortAutoTune,
 	tuneMethod, estimatedMoves, identifyMethod, modelFitBackoff, seedRule, seedLambda,
 	medianOf, captureBudget, cycles, avDistance, avFeed, marginMm, axisTravelInfo,
-	stageStates, tuneSession, includeAllCsv, downloadTuningReport,
+	stageStates, tuneSession, includeAllCsv, downloadTuningReport, dCeiling, D_MAX,
 	samples, sampleRate, moveMode, customMove, recordKeys, canRecord, capturePreview, record,
 	recording, capture, overlayCapture, rawText, viewKeys, availableViewVars, pinOverlay,
 	metrics, evaluation, goToManualTerm, deleteCapturesAfterRead,

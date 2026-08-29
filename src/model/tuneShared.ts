@@ -60,6 +60,10 @@ export const SEED_START = 30;
 export const ZERO_START: Record<PidTerm, number> = { p: SEED_START, i: 1000, d: 0.01, a: 50000, v: 100 };
 export const TERM_MAX: Record<PidTerm, number> = { p: P_MAX, i: I_MAX, d: D_MAX, a: A_MAX, v: V_MAX };
 
+/** Decimal places each term is rounded/displayed to — single source of truth (previously duplicated in
+ * optimize.ts and autorun.ts, which is how `nextBackoff` below ended up drifting to a hardcoded 6). */
+export const ROUND_DP: Record<PidTerm, number> = { p: 2, i: 2, d: 4, a: 2, v: 2 };
+
 export function clampTerm(term: PidTerm, value: number): number {
 	return Math.min(TERM_MAX[term], Math.max(0, value));
 }
@@ -99,9 +103,11 @@ function round(v: number, dp = 2): number {
 	return Math.round(v * f) / f;
 }
 
-/** Halve the accepted value on each verification retry (retry 0 → half, retry 1 → quarter, …). */
-export function nextBackoff(value: number, retry: number): number {
-	return round(value * Math.pow(0.5, retry + 1), 6);
+/** Halve the accepted value on each verification retry (retry 0 → half, retry 1 → quarter, …), rounded
+ * to the term's own display precision — NOT a fixed dp, or repeated halving on a large term (A in
+ * particular) surfaces real-but-meaningless digits (.5, .25, .125, .0625, …) in the UI. */
+export function nextBackoff(value: number, retry: number, term: PidTerm): number {
+	return round(value * Math.pow(0.5, retry + 1), ROUND_DP[term]);
 }
 
 export interface VerifiedAccept {
@@ -130,7 +136,7 @@ export async function verifyAccepted(
 		if (!signal) { return { ok: false, reason: `${term.toUpperCase()}: verification capture failed.` }; }
 		if (!signalUnstable(signal)) { return { ok: true, value, signal }; }
 		effects.log(`${term.toUpperCase()}=${value} was unstable on verification (retry ${retry + 1}/${verifyRetries}) — backing off.`);
-		value = nextBackoff(acceptedValue, retry);
+		value = nextBackoff(acceptedValue, retry, term);
 	}
 	return { ok: false, reason: `${term.toUpperCase()}: stayed unstable after ${verifyRetries} verification backoffs — stopping the run.` };
 }

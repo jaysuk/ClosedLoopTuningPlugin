@@ -67,6 +67,15 @@ describe("D strategy", () => {
 		expect(d.kind).toBe("accept");
 		if (d.kind === "accept") expect(d.value).toBe(0.2);
 	});
+	it("accepts on diminishing returns instead of riding to D_MAX when overshoot stops improving", () => {
+		const d = D_STRATEGY.decide([at(0.2, m({ overshootPct: 20, oscillations: 2 })), at(0.3, m({ overshootPct: 19.5, oscillations: 2 }))]);
+		expect(d.kind).toBe("accept");
+		if (d.kind === "accept") expect(d.value).toBe(0.3); // lowest overshoot seen so far
+	});
+	it("keeps increasing while overshoot is still meaningfully improving (regression: plateau must not fire early on a normal ramp)", () => {
+		const d = D_STRATEGY.decide([at(0.2, m({ overshootPct: 20 })), at(0.3, m({ overshootPct: 10 }))]);
+		expect(d.kind).toBe("set");
+	});
 	it("backs off when D saturates the P term", () => {
 		const d = D_STRATEGY.decide([at(0.2, m({ overshootPct: 20 })), at(0.3, m({ overshootPct: 5, pTermSatDuty: 0.4 }))]);
 		expect(d.kind).toBe("accept");
@@ -100,7 +109,7 @@ describe("describeMetrics", () => {
 
 function stats(over: Partial<TuneStats>): TuneStats {
 	return {
-		restBias: 0, restNoise: 0.05, restRing: 0, settleOvershoot: 0, cruiseLag: 0, cruiseSpread: 0,
+		restBias: 0, restNoise: 0.05, restRing: 0, cruiseRing: 0, settleOvershoot: 0, cruiseLag: 0, cruiseSpread: 0,
 		accelPeak: 0, movePeak: 5, moveRms: 1, cruiseSamples: 10, restSamples: 10, moved: true,
 		...over,
 	};
@@ -172,6 +181,29 @@ describe("SIGNAL_D_STRATEGY", () => {
 		const d = SIGNAL_D_STRATEGY.decide([sat(0, sig({ stats: { settleOvershoot: 3 } }))]);
 		expect(d.kind).toBe("set");
 		if (d.kind === "set") expect(d.value).toBeGreaterThan(0);
+	});
+	it("accepts on diminishing returns instead of riding to D_MAX when overshoot stops improving (e.g. a persistent, non-resonant ripple)", () => {
+		const d = SIGNAL_D_STRATEGY.decide([
+			sat(0.2, sig({ stats: { settleOvershoot: 2.0, restRing: 3 } })),
+			sat(0.3, sig({ stats: { settleOvershoot: 1.95, restRing: 3 } })),
+		]);
+		expect(d.kind).toBe("accept");
+		if (d.kind === "accept") expect(d.value).toBe(0.3); // lowest overshoot seen so far
+	});
+	it("keeps increasing while overshoot is still meaningfully improving (regression: plateau must not fire early on a normal ramp)", () => {
+		const d = SIGNAL_D_STRATEGY.decide([
+			sat(0.2, sig({ stats: { settleOvershoot: 3, restRing: 2 } })),
+			sat(0.3, sig({ stats: { settleOvershoot: 1.5, restRing: 2 } })),
+		]);
+		expect(d.kind).toBe("set");
+	});
+	it("names a mechanical (non-D) cause in the plateau note when cruise-phase ripple never cleared", () => {
+		const d = SIGNAL_D_STRATEGY.decide([
+			sat(0.2, sig({ stats: { settleOvershoot: 2.0, restRing: 3, cruiseRing: 5 } })),
+			sat(0.3, sig({ stats: { settleOvershoot: 1.95, restRing: 3, cruiseRing: 5 } })),
+		]);
+		expect(d.kind).toBe("accept");
+		if (d.kind === "accept") expect(d.note).toMatch(/mechanical/i);
 	});
 	it("does NOT accept D=0 on a trapezoid move whose true overshoot is small relative to the whole move but still bad in absolute steps", () => {
 		// This is the category-error regression: the legacy step metrics would see ~2% overshoot on a

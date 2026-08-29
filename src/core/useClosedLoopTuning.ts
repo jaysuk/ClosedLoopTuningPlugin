@@ -42,6 +42,7 @@ import {
 } from "../model/limits";
 import { resolveMotionCoupling } from "../model/kinematics";
 import { WIZARD_STEPS, type Recommendation } from "../model/wizard";
+import { D_MAX } from "../model/autotune";
 import { computeTuneSignal, type TuneSignal } from "../model/signal";
 import {
 	runAutoTune as runAutoTuneCore,
@@ -117,6 +118,8 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		 *  deleteTrackedCapture(). Off by default: deleting files off the user's SD card unprompted is
 		 *  the kind of thing that should be opted into. */
 		deleteCapturesAfterRead?: boolean;
+		/** Manual cap on D during auto-tune's sequential ramp; null/undefined = no extra cap. */
+		dCeiling?: number | null;
 	}
 	function loadState(): SavedState {
 		try { return JSON.parse(localStorage.getItem(LS_STATE) ?? "{}") as SavedState; } catch { return {}; }
@@ -166,7 +169,7 @@ export function useClosedLoopTuning(host: HostAdapter) {
 					tuneMethod: tuneMethod.value, identifyMethod: identifyMethod.value, modelFitBackoff: modelFitBackoff.value,
 					seedRule: seedRule.value, seedLambda: seedLambda.value, medianOf: medianOf.value,
 					captureBudget: captureBudget.value, includeAllCsv: includeAllCsv.value,
-					deleteCapturesAfterRead: deleteCapturesAfterRead.value,
+					deleteCapturesAfterRead: deleteCapturesAfterRead.value, dCeiling: dCeiling.value,
 				} satisfies SavedState));
 			} catch { /* storage unavailable */ }
 		}, 300);
@@ -238,7 +241,15 @@ export function useClosedLoopTuning(host: HostAdapter) {
 	const medianOf = ref(saved.medianOf ?? 1);           // captures per decision, median-combined
 	const captureBudget = ref(saved.captureBudget ?? 40); // extra captures for the package/refine joint optimiser
 	const includeAllCsv = ref(saved.includeAllCsv ?? false); // download every capture's raw CSV, not just the notable/last-per-phase ones
-	watch([avDistance, avFeed, cycles, marginMm, tuneMethod, identifyMethod, modelFitBackoff, seedRule, seedLambda, medianOf, captureBudget, includeAllCsv], persistState);
+	/**
+	 * Manual cap on D during auto-tune's "sequential" ramp, below the firmware's own D_MAX — for a
+	 * machine where a persistent mechanical ripple (e.g. a ballscrew) means "more D" is never the right
+	 * answer past some point. `null` = no extra cap (today's behaviour); the automatic diminishing-
+	 * returns check (docs/PLAN-v2.4-feedback.md §2.1) already stops runaway ramps without this, so this
+	 * is a manual override on top, not a replacement for it.
+	 */
+	const dCeiling = ref<number | null>(saved.dCeiling ?? null);
+	watch([avDistance, avFeed, cycles, marginMm, tuneMethod, identifyMethod, modelFitBackoff, seedRule, seedLambda, medianOf, captureBudget, includeAllCsv, dCeiling], persistState);
 
 	/** Rough move-count estimate shown next to the method select, so the cost of "Thorough" is visible upfront. */
 	const estimatedMoves = computed(() => {
@@ -622,7 +633,12 @@ export function useClosedLoopTuning(host: HostAdapter) {
 	function applySuggestion(): void {
 		const term = wizardStep.value.term;
 		if (term && recommendation.value?.suggested !== undefined) {
-			(pid as any)[term] = recommendation.value.suggested;
+			// The wizard's own D step already caps at D_MAX (autotune.ts); this is the user's own,
+			// optionally-tighter manual ceiling on top — see AutoRunOptions.dCeiling.
+			const suggested = term === "d" && dCeiling.value != null
+				? Math.min(dCeiling.value, recommendation.value.suggested)
+				: recommendation.value.suggested;
+			(pid as any)[term] = suggested;
 			void applyPid();
 		}
 	}
@@ -931,6 +947,7 @@ export function useClosedLoopTuning(host: HostAdapter) {
 			cycles: totalCycles, hasAxis, calibrationMoveIds: requiredMoveIds.value,
 			method: tuneMethod.value, identifyMethod: identifyMethod.value, modelFitBackoff: modelFitBackoff.value,
 			seedRule: seedRule.value, seedLambda: seedLambda.value, medianOf: medianOf.value, captureBudget: captureBudget.value,
+			dCeiling: dCeiling.value ?? undefined,
 		};
 		tuneSession.value = {
 			startedAt: new Date().toISOString(), driver: selectedDriver.value, mode: currentMode.value,
@@ -1109,7 +1126,7 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		autoRunning, autoStatus, autoLog, startAutoTune, abortAutoTune,
 		tuneMethod, estimatedMoves, identifyMethod, modelFitBackoff, seedRule, seedLambda,
 		medianOf, captureBudget, cycles, avDistance, avFeed, marginMm, axisTravelInfo,
-		stageStates, tuneSession, includeAllCsv, downloadTuningReport,
+		stageStates, tuneSession, includeAllCsv, downloadTuningReport, dCeiling, D_MAX,
 
 		// Manual capture & the shared chart.
 		samples, sampleRate, moveMode, customMove, recordKeys, canRecord, capturePreview, record,

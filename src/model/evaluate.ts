@@ -34,6 +34,14 @@ export interface TuneStats {
 	restNoise: number;
 	/** Significant oscillation cycles after the motor stops (ringing). */
 	restRing: number;
+	/**
+	 * Significant oscillation cycles WHILE cruising, using the same gate as `restRing`. Report-only —
+	 * never gates a decision. Its purpose is context: a ripple present at a similar level whether the
+	 * motor is moving or stopped usually isn't loop underdamping (which D fixes) but a persistent
+	 * mechanical source such as a ballscrew's lead-error — more D is unlikely to help. See
+	 * docs/PLAN-v2.4-feedback.md §2.3.
+	 */
+	cruiseRing: number;
 	/** Peak |error| in the moment the move stops (overshoot). */
 	settleOvershoot: number;
 	/** Mean signed error during the steady-speed section (velocity lag). */
@@ -112,7 +120,7 @@ function ringCount(err: Array<number>, threshold: number): number {
 }
 
 const empty: TuneStats = {
-	restBias: 0, restNoise: 0, restRing: 0, settleOvershoot: 0, cruiseLag: 0, cruiseSpread: 0,
+	restBias: 0, restNoise: 0, restRing: 0, cruiseRing: 0, settleOvershoot: 0, cruiseLag: 0, cruiseSpread: 0,
 	accelPeak: 0, movePeak: 0, moveRms: 0, cruiseSamples: 0, restSamples: 0, moved: false,
 };
 
@@ -155,6 +163,7 @@ export function tuneStats(capture: ParsedCapture, sampleRateHz: number): TuneSta
 		restBias: mean(restErr),
 		restNoise,
 		restRing: ringCount(restErr, Math.max(0.3, 3 * restNoise)),
+		cruiseRing: ringCount(cruiseErr, Math.max(0.3, 3 * restNoise)),
 		settleOvershoot,
 		cruiseLag: mean(cruiseErr),
 		cruiseSpread: std(cruiseErr),
@@ -247,7 +256,16 @@ export function evaluateTune(capture: ParsedCapture, sampleRateHz: number): Tune
 	else if (s.settleOvershoot > OVERSHOOT_GOOD) { add({ severity: "info", title: "Slight overshoot", detail: `Overshoots ${s.settleOvershoot.toFixed(2)} step then settles.`, fix: "A touch more D (derivative)", term: "d", direction: "up" }); }
 
 	// 5. Ringing after the stop (too much P / too little D).
-	if (s.restRing >= RING_WARN) { add({ severity: "warn", title: "Rings after stopping", detail: `${s.restRing} oscillation cycles after the move stops — the loop is under-damped.`, fix: "Lower P, or raise D (derivative)", term: "p", direction: "down" }); }
+	if (s.restRing >= RING_WARN) {
+		// Ripple present at a similar level while cruising too is context, not a different verdict — a
+		// mechanical source (e.g. a leadscrew/ballscrew) shows up regardless of whether the motor is
+		// moving or stopped, whereas loop underdamping (what this finding is normally about) is worst
+		// right after the stop. Never changes severity/score/fix — see docs/PLAN-v2.4-feedback.md §2.3.
+		const alsoAtSpeed = s.cruiseRing >= RING_WARN
+			? ` A similar ${s.cruiseRing} cycles show up while cruising too — that pattern usually means a mechanical source (e.g. a leadscrew/ballscrew), not underdamping. More D is unlikely to help; check the mechanics before raising it further.`
+			: "";
+		add({ severity: "warn", title: "Rings after stopping", detail: `${s.restRing} oscillation cycles after the move stops — the loop is under-damped.${alsoAtSpeed}`, fix: "Lower P, or raise D (derivative)", term: "p", direction: "down" });
+	}
 
 	// 6. Encoder noise floor (informational, never penalised badly).
 	if (s.restNoise > 0) { add({ severity: "good", title: "Encoder noise floor", detail: `±${s.restNoise.toFixed(2)} step of high-frequency fuzz at rest — normal for the encoder resolution.` }); }

@@ -9,6 +9,7 @@
  * they give guidance rather than an auto-recommendation).
  */
 import { REST_EFFORT_RIPPLE_LIMIT, type StepMetrics } from "./analysis";
+import { D_MAX } from "./autotune";
 import type { PidValues } from "./m569";
 
 export type PidTerm = keyof PidValues; // "p" | "i" | "d" | "v" | "a"
@@ -84,7 +85,10 @@ export const WIZARD_STEPS: Array<WizardStep> = [
 			if (pre) { return pre; }
 			const m = metrics as StepMetrics;
 			if (m.overshootPct > 8) {
-				return { verdict: "increase", message: `Overshoot is ${m.overshootPct.toFixed(0)}% — increase D to damp it.`, suggested: round(current + (current < 0.5 ? 0.01 : 0.025), 3) };
+				// D_MAX cap: the auto-tune D strategies already stop here, but the wizard's own step had no
+				// upper bound at all before this — nothing stopped a user from clicking "apply" past the
+				// firmware's sane range one 0.01/0.025 nudge at a time.
+				return { verdict: "increase", message: `Overshoot is ${m.overshootPct.toFixed(0)}% — increase D to damp it.`, suggested: Math.min(D_MAX, round(current + (current < 0.5 ? 0.01 : 0.025), 3)) };
 			}
 			if (m.oscillations >= 12) {
 				return { verdict: "decrease", message: `D=${current} looks too high (ringing/noise). Reduce it.`, suggested: round(Math.max(0, current - 0.025), 3) };

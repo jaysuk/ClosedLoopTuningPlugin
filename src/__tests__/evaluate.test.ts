@@ -11,8 +11,16 @@ function loadCapture(name: string): ParsedCapture {
 }
 
 /** Trapezoid target move with a controllable measured-vs-target error model. */
-function moveCapture(opts: { cruiseLag?: number; restBias?: number; accelSpike?: number; noise?: number; overshoot?: number; cruiseWander?: number } = {}): ParsedCapture {
-	const { cruiseLag = 0, restBias = 0, accelSpike = 0, noise = 0, overshoot = 0, cruiseWander = 0 } = opts;
+function moveCapture(opts: {
+	cruiseLag?: number; restBias?: number; accelSpike?: number; noise?: number; overshoot?: number; cruiseWander?: number;
+	/** Fast alternating-sign error at rest / during cruise — real oscillation cycles for `restRing`/`cruiseRing`
+	 * (unlike `cruiseWander`'s one slow symmetric swing, which is a mean-preserving spread, not a ring count). */
+	restRingAmplitude?: number; cruiseRingAmplitude?: number;
+} = {}): ParsedCapture {
+	const {
+		cruiseLag = 0, restBias = 0, accelSpike = 0, noise = 0, overshoot = 0, cruiseWander = 0,
+		restRingAmplitude = 0, cruiseRingAmplitude = 0,
+	} = opts;
 	const n = 240;
 	const vel: Array<number> = [];
 	for (let i = 0; i < n; i++) {
@@ -28,13 +36,25 @@ function moveCapture(opts: { cruiseLag?: number; restBias?: number; accelSpike?:
 	// A slow, roughly-symmetric swing across the whole cruise window (30..149) — one full cycle, so it
 	// averages toward zero (mean-based cruiseLag stays small) while still having real spread.
 	const wanderAt = (i: number) => (cruiseWander ? cruiseWander * Math.sin(((i - 30) / 120) * 2 * Math.PI) : 0);
+	// A short constant-amplitude burst (not a decay, not a full-window square wave) at the START of a
+	// region, then flat for the rest of it. `ringCount`'s gate is 3× the WHOLE region's own std, which is
+	// self-referential: a square wave filling the entire region can never clear 3× its own std (std ==
+	// amplitude for a symmetric square wave), and a slowly-decaying ring's later, smaller half-cycles drag
+	// the count back down to ~1. A brief burst against an otherwise-flat region is the shape that actually
+	// clears the gate multiple times — calibrated (BURST_LEN=6) against both region lengths below.
+	const BURST_LEN = 6;
 	const measured: Array<number> = target.map((t, i) => {
 		const moving = vel[i] > 0.1;
 		const accel = (i < 30 || (i >= 150 && i < 180));
 		let err = 0;
+		const ringAt = (amp: number, regionStart: number) => (amp && i >= regionStart && i - regionStart < BURST_LEN ? amp * (i % 2 === 0 ? 1 : -1) : 0);
 		if (accel) { err += accelSpike * Math.sign(150 - i); }
-		else if (moving) { err += -cruiseLag + wanderAt(i); }  // trail behind target, optionally wandering
-		else { err += restBias; }                            // standing offset at rest
+		// Burst starts at i=40, not the nominal cruise start (i=30) — segmentMove's own accel/cruise
+		// boundary lands a couple of samples later than this file's `moving`/`accel` booleans (verified:
+		// it classifies up to i=31 as "accel"), and a burst that starts before the REAL boundary loses its
+		// first samples to accelErr instead of cruiseErr, undercounting cruiseRing. Margin, not exactness.
+		else if (moving) { err += -cruiseLag + wanderAt(i) + ringAt(cruiseRingAmplitude, 40); }  // trail behind target, optionally wandering/ringing
+		else { err += restBias + ringAt(restRingAmplitude, 180); }  // standing offset at rest, optionally ringing
 		if (i >= 180 && i < 195) { err += overshoot; }        // overshoot just after stopping
 		return t + err + noiseAt(i);
 	});
@@ -157,5 +177,39 @@ describe("evaluateTune", () => {
 			const e = evaluateTune(loadCapture("hold-stable-transient.csv"), 2000);
 			expect(e.findings.some((f) => f.title === "Dithers at standstill")).toBe(false);
 		});
+	});
+});
+
+describe("cruise-phase ripple context (report-only, docs/PLAN-v2.4-feedback.md §2.3)", () => {
+	it("computes cruiseRing alongside restRing", () => {
+		const s = tuneStats(moveCapture({ restRingAmplitude: 1.0, cruiseRingAmplitude: 1.0 }), 1000);
+		expect(s.restRing).toBeGreaterThan(0);
+		expect(s.cruiseRing).toBeGreaterThan(0);
+	});
+
+	it("flags ringing at rest exactly as before when there is no matching cruise-phase ripple", () => {
+		const e = evaluateTune(moveCapture({ restRingAmplitude: 1.0 }), 1000);
+		const f = e.findings.find((x) => x.title === "Rings after stopping");
+		expect(f).toBeTruthy();
+		expect(f!.severity).toBe("warn");
+		expect(f!.term).toBe("p");
+		expect(f!.direction).toBe("down");
+		expect(f!.detail).not.toMatch(/mechanical/i);
+	});
+
+	it("appends mechanical-source context to the SAME finding when ripple also shows up while cruising — never a new finding, never a different severity/fix", () => {
+		const ringingAtRestOnly = evaluateTune(moveCapture({ restRingAmplitude: 1.0 }), 1000);
+		const ringingBoth = evaluateTune(moveCapture({ restRingAmplitude: 1.0, cruiseRingAmplitude: 1.0 }), 1000);
+		const restOnlyFinding = ringingAtRestOnly.findings.find((x) => x.title === "Rings after stopping")!;
+		const bothFinding = ringingBoth.findings.find((x) => x.title === "Rings after stopping")!;
+		expect(bothFinding).toBeTruthy();
+		expect(bothFinding.severity).toBe(restOnlyFinding.severity);
+		expect(bothFinding.term).toBe(restOnlyFinding.term);
+		expect(bothFinding.direction).toBe(restOnlyFinding.direction);
+		expect(bothFinding.detail).toMatch(/mechanical/i);
+		expect(ringingBoth.findings.filter((x) => x.title === "Rings after stopping")).toHaveLength(1);
+		// The extended text costs nothing extra — same score as the rest-only case (same severity, same
+		// number of findings triggered by this capture shape).
+		expect(ringingBoth.score).toBe(ringingAtRestOnly.score);
 	});
 });

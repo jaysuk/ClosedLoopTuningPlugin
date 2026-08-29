@@ -49,7 +49,7 @@ import {
 	describeSignal, RUNAWAY_STEPS, significantlyBetterForTerm, signalUnstable, type TuneSignal,
 } from "./signal";
 import {
-	captureMedian, clampTerm, nextBackoff, SEED_START, SETTLE_DELAY_MS, verifyAccepted, ZERO_START,
+	captureMedian, clampTerm, nextBackoff, ROUND_DP, SEED_START, SETTLE_DELAY_MS, verifyAccepted, ZERO_START,
 	type AutoRunAttempt, type TuneEffects,
 } from "./tuneShared";
 import type { PidTerm } from "./wizard";
@@ -112,6 +112,14 @@ export interface AutoRunOptions {
 	method?: TuneMethod;
 	/** Capture budget for "package"/"refine" methods' joint-optimisation pass. Default 40. */
 	captureBudget?: number;
+	/**
+	 * User-supplied manual cap on D, below `D_MAX`. `undefined`/`null` = no extra cap (today's
+	 * behaviour). Only applies to the "sequential" cycle-1 ramp (`SIGNAL_D_STRATEGY` via
+	 * `runSignalTerm`) — the thing that can ride D upward chasing a persistent, non-resonant ripple
+	 * (see `D_OVERSHOOT_PLATEAU`, which already fixes that automatically; this is a manual override on
+	 * top). "refine"/"package" take small bounded steps from wherever D already is and don't need it.
+	 */
+	dCeiling?: number;
 }
 
 export interface AutoRunResult {
@@ -276,6 +284,9 @@ export interface TermRunResult {
 export async function runSignalTerm(
 	effects: TuneEffects, strategy: SignalStrategy, pid: PidConfig, medianOf: number, verifyRetries: number, startValue: number,
 	priorAttempts: Array<SignalAttempt> = [],
+	/** Manual cap on the values this ramp will ever try — `Infinity` (default) is a no-op for every
+	 * term. Only D's caller passes a real value (see `AutoRunOptions.dCeiling`). */
+	ceiling = Infinity,
 ): Promise<TermRunResult> {
 	let value = startValue;
 	// Readings an identification pass already took for this term feed the strategy's decide() as real
@@ -306,7 +317,7 @@ export async function runSignalTerm(
 			effects.log(`${strategy.label}: ✓ ${note}`);
 			return { ok: true, finalSignal: verified.signal, attempts: log };
 		}
-		value = d.value;
+		value = Math.min(d.value, ceiling);
 	}
 	return { ok: true, attempts: log };
 }
@@ -383,6 +394,8 @@ async function runAxisCycle(
 	effects: TuneEffects, pid: PidConfig, cycle: number, medianOf: number, verifyRetries: number, seedRule: SeedRule,
 	seedLambda: number, method: TuneMethod, captureBudget: number | undefined, identifyMethod: IdentifyMethod,
 	modelFitBackoff: number, priorInsensitiveTerms: Array<PidTerm> = [],
+	/** See `AutoRunOptions.dCeiling` — only used by the "sequential" D ramp below. */
+	dCeiling?: number,
 ): Promise<CycleResult> {
 	// "refine" never seeds/ramps — every cycle is a joint-optimisation pass from whatever's already set.
 	if (method === "refine") { return runPackageCycle(effects, pid, medianOf, captureBudget, priorInsensitiveTerms); }
@@ -443,7 +456,7 @@ async function runAxisCycle(
 			let tries = 0;
 			const backoffRetries = 2;
 			while (signal && signalUnstable(signal) && tries < backoffRetries) {
-				pid.p = nextBackoff(candidate.p, tries); pid.i = nextBackoff(candidate.i, tries); pid.d = nextBackoff(candidate.d, tries);
+				pid.p = nextBackoff(candidate.p, tries, "p"); pid.i = nextBackoff(candidate.i, tries, "i"); pid.d = nextBackoff(candidate.d, tries, "d");
 				await effects.applyPid(pid);
 				await effects.delay(SETTLE_DELAY_MS);
 				signal = await captureMedian(effects, medianOf);
@@ -473,7 +486,8 @@ async function runAxisCycle(
 		const startValue = prior.length
 			? prior[prior.length - 1].value
 			: (isFeedForward ? strategy.start : (seeded[strategy.term] ?? strategy.start));
-		const result = await runSignalTerm(effects, strategy, pid, medianOf, verifyRetries, startValue, prior);
+		const ceiling = strategy.term === "d" && dCeiling != null ? dCeiling : Infinity;
+		const result = await runSignalTerm(effects, strategy, pid, medianOf, verifyRetries, startValue, prior, ceiling);
 		attempts.push(...result.attempts);
 		if (!result.ok) {
 			// P failing always means capture isn't working at all (nothing else can be trusted either) —
@@ -506,8 +520,6 @@ export function refinementDelta(cycle: number): number {
  * value a from-scratch ramp would try), since this is a bidirectional nudge, not a fresh start.
  */
 const REFINE_ZERO_STEP: Record<PidTerm, number> = { p: SEED_START / 4, i: 250, d: 0.0025, a: 12500, v: 25 };
-/** Rounding precision per term — D needs more decimal places than the others (its whole range is ≤0.6). */
-const REFINE_ROUND_DP: Record<PidTerm, number> = { p: 2, i: 2, d: 4, a: 2, v: 2 };
 
 function refineStepSize(term: PidTerm, value: number, deltaFraction: number): number {
 	return value > 0 ? value * deltaFraction : REFINE_ZERO_STEP[term];
@@ -552,7 +564,7 @@ export async function refineTerm(
 
 	let best = original;
 	let bestSignal = baseline;
-	const dp = REFINE_ROUND_DP[term];
+	const dp = ROUND_DP[term];
 	const upValue = clampTerm(term, round(original + step, dp));
 	if (upValue !== original) {
 		const upSignal = await probe(upValue);
@@ -816,7 +828,7 @@ export async function runAutoTune(effects: TuneEffects, startPid: PidConfig, opt
 			if (effects.isCancelled()) { ok = false; reason = "Cancelled."; break; }
 			effects.log(`──── Cycle ${cycle} of ${totalCycles} ────`);
 			const result = opts.hasAxis
-				? await runAxisCycle(effects, pid, cycle, medianOf, verifyRetries, seedRule, seedLambda, method, opts.captureBudget, identifyMethod, modelFitBackoff, insensitiveTerms)
+				? await runAxisCycle(effects, pid, cycle, medianOf, verifyRetries, seedRule, seedLambda, method, opts.captureBudget, identifyMethod, modelFitBackoff, insensitiveTerms, opts.dCeiling)
 				: await runExtruderCycle(effects, pid, cycle);
 			attempts.push(...result.attempts);
 			if (result.ku != null) { ku = result.ku; tu = result.tu; }
