@@ -296,6 +296,7 @@ export function medianSignal(signals: Array<TuneSignal>): TuneSignal {
 			restBias: stat((s) => s.restBias),
 			restNoise: stat((s) => s.restNoise),
 			restRing: stat((s) => s.restRing),
+			cruiseRing: stat((s) => s.cruiseRing),
 			settleOvershoot: stat((s) => s.settleOvershoot),
 			cruiseLag: stat((s) => s.cruiseLag),
 			cruiseSpread: stat((s) => s.cruiseSpread),
