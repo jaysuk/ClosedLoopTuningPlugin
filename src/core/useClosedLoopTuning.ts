@@ -90,7 +90,10 @@ export async function maybeDeleteCapture(
 export function useClosedLoopTuning(host: HostAdapter) {
 
 
-	const captureVariables = CAPTURE_VARIABLES;
+	// Excludes `derived` entries (e.g. combined current) — those are never recorded by the firmware, only
+	// computed client-side once their source columns exist (see csv.ts, m569.ts). `availableViewVars`
+	// below needs no equivalent filter: it already only lists what's actually present in the capture.
+	const captureVariables = CAPTURE_VARIABLES.filter((v) => !v.derived);
 	const encoderTypes = ENCODER_TYPES;
 	const steps = WIZARD_STEPS;
 	const modeList = (Object.keys(MODE_LABELS) as Array<LoopMode>).map((value) => ({ value, label: MODE_LABELS[value] }));
@@ -667,7 +670,7 @@ export function useClosedLoopTuning(host: HostAdapter) {
 	 * controls what's AVAILABLE to tick on, not what's shown by default. If firmware can't buffer this many
 	 * columns at the requested sample count, `runCapture` already surfaces that as a clear "Firmware
 	 * rejected the capture" error rather than failing silently. */
-	const ALL_CAPTURE_KEYS = CAPTURE_VARIABLES.map((v) => v.key);
+	const ALL_CAPTURE_KEYS = CAPTURE_VARIABLES.filter((v) => !v.derived).map((v) => v.key);
 
 	/** Seeds a sensible starting chart selection only when there isn't one yet (nothing ticked) — never
 	 * overwrites a selection the user already made. Without this, every capture (including each of auto-

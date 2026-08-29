@@ -52,6 +52,17 @@ export function parseCapture(text: string): ParsedCapture {
 		}
 		rowCount++;
 	}
+	// Derived "combined current" column: RRF has no such M569.5 variable (Coil A/B Current are separate
+	// bits), but the vector magnitude is what actually relates to torque headroom — see
+	// docs/PLAN-v2.4-feedback.md item I. Computed here (once, deterministically) rather than on every
+	// chart/report read; only appears when both raw columns were actually recorded.
+	const coilA = columns["Coil A Current"];
+	const coilB = columns["Coil B Current"];
+	if (coilA && coilB) {
+		const combinedHeader = "Motor Current (combined)";
+		headers.push(combinedHeader);
+		columns[combinedHeader] = coilA.map((a, i) => Math.hypot(a, coilB[i] ?? 0));
+	}
 	return { headers, columns, rowCount, notes, truncated };
 }
 

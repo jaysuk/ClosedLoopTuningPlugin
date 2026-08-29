@@ -117,6 +117,10 @@ export interface CaptureVariable {
 	axis: "count" | "steps" | "error" | "degrees" | "unitless";
 	/** Degrees-type values are 0–4095 in the CSV; scale to 0–360 for display. */
 	scaleToDegrees?: boolean;
+	/** Computed client-side from other recorded columns (see csv.ts's `parseCapture`) — never sent in
+	 *  the M569.5 bitmask, and never offered in a "record" variable list, only in "view" once it exists
+	 *  (i.e. once the columns it's derived from were actually recorded). */
+	derived?: boolean;
 }
 
 export const CAPTURE_VARIABLES: Array<CaptureVariable> = [
@@ -136,6 +140,10 @@ export const CAPTURE_VARIABLES: Array<CaptureVariable> = [
 	{ id: 8192, key: "pidVTerm", header: "PID V Term", axis: "unitless" },
 	{ id: 16384, key: "pidATerm", header: "PID A Term", axis: "unitless" },
 	{ id: 32768, key: "motorCurrentFraction", header: "Motor current fraction", axis: "unitless" },
+	// id: 0 is a safe no-op if this key ever ends up in a `variables` array sent to firmware (captureBitmask
+	// OR-reduces ids, so 0 contributes nothing) — but every recordable-variable list must filter `derived`
+	// out regardless; see useClosedLoopTuning.ts's `captureVariables`/`ALL_CAPTURE_KEYS`.
+	{ id: 0, key: "motorCurrentCombined", header: "Motor Current (combined)", axis: "unitless", derived: true },
 ];
 
 /** Sum the bit ids of the chosen variables into the M569.5 D bitmask. */

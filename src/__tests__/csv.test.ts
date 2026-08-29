@@ -42,6 +42,27 @@ describe("parseCapture — RRF's 'Data lost' buffer-overrun marker", () => {
 	});
 });
 
+describe("parseCapture — derived 'Motor Current (combined)' column (docs/PLAN-v2.4-feedback.md item I)", () => {
+	it("computes hypot(A, B) per row when both raw coil currents are present", () => {
+		const csv = "Sample,Coil A Current,Coil B Current\n0,3,4\n1,0,0\n2,-3,4\n";
+		const c = parseCapture(csv);
+		expect(c.headers).toContain("Motor Current (combined)");
+		expect(c.columns["Motor Current (combined)"]).toEqual([5, 0, 5]);
+	});
+
+	it("does not add the column when only one raw coil current is recorded", () => {
+		const csv = "Sample,Coil A Current\n0,3\n1,4\n";
+		const c = parseCapture(csv);
+		expect(c.headers).not.toContain("Motor Current (combined)");
+		expect(c.columns["Motor Current (combined)"]).toBeUndefined();
+	});
+
+	it("does not add the column when neither raw coil current is recorded (regression: the normal fixture is unaffected)", () => {
+		const c = parseCapture(CSV);
+		expect(c.headers).not.toContain("Motor Current (combined)");
+	});
+});
+
 describe("column lookup", () => {
 	it("finds columns case-insensitively", () => {
 		const c = parseCapture(CSV);

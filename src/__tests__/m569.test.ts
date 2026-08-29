@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
 	buildCalibrationCommand, buildCaptureCommand, buildModeCommand, buildPidCommand,
-	captureBitmask, DEFAULT_MODE_D, parseCalibrationReply, parsePidReply,
+	CAPTURE_VARIABLES, captureBitmask, DEFAULT_MODE_D, parseCalibrationReply, parsePidReply,
 } from "../model/m569";
 
 describe("mode commands", () => {
@@ -20,6 +20,9 @@ describe("capture command", () => {
 	it("sums the variable bitmask", () => {
 		expect(captureBitmask([2, 4, 8])).toBe(14);
 		expect(captureBitmask([2048, 4096])).toBe(6144);
+	});
+	it("id:0 (a derived variable, e.g. combined current) is always a no-op in the bitmask, even if a caller forgets to filter it out", () => {
+		expect(captureBitmask([2, 4, 0])).toBe(6);
 	});
 	it("builds a step manoeuvre capture", () => {
 		const cmd = buildCaptureCommand({ driver: "50.0", samples: 500, activate: 0, rate: 0, variables: [2, 4], manoeuvre: 64 });
@@ -72,5 +75,19 @@ describe("PID command + parse", () => {
 		const reply = "Closed loop driver 50.0: P=150 I=5000 D=0.2 V=400 A=200000, Warning/error threshold 1.00/2.00";
 		const p = parsePidReply(reply);
 		expect(p).toEqual({ p: 150, i: 5000, d: 0.2, v: 400, a: 200000, warn: 1, err: 2 });
+	});
+});
+
+describe("CAPTURE_VARIABLES — derived entries (docs/PLAN-v2.4-feedback.md item I)", () => {
+	it("flags the combined-current entry as derived, with a safe no-op firmware id", () => {
+		const combined = CAPTURE_VARIABLES.find((v) => v.key === "motorCurrentCombined");
+		expect(combined).toBeTruthy();
+		expect(combined!.derived).toBe(true);
+		expect(combined!.id).toBe(0);
+	});
+	it("every OTHER entry is a real, non-derived firmware variable", () => {
+		const real = CAPTURE_VARIABLES.filter((v) => v.key !== "motorCurrentCombined");
+		expect(real.every((v) => !v.derived)).toBe(true);
+		expect(real.every((v) => v.id > 0)).toBe(true);
 	});
 });
