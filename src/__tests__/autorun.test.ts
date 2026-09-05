@@ -363,6 +363,50 @@ describe("runAutoTune — happy path", () => {
 	});
 });
 
+describe("runAutoTune — E (warn/error threshold) raise-and-restore", () => {
+	it("raises E before preflight's own probe runs, then restores it to whatever readPid actually reported (not a hardcoded default)", async () => {
+		// A deliberately non-default snapshot — proves the restore uses the REAL prior value, not E2:4.
+		// applyPid mutates and reuses the SAME pid object across the whole run, so a plain vi.fn()'s
+		// .mock.calls would hold live references, not what was true at each call — snapshot with a
+		// spread on every call instead.
+		const snapshot: PidConfig = { p: 30, i: 0, d: 0, v: 0, a: 0, warn: 5, err: 10 };
+		const applySnapshots: Array<PidConfig> = [];
+		const applyPid = vi.fn(async (p: PidConfig) => { applySnapshots.push({ ...p }); });
+		const { effects } = fakeEffects({ readPid: vi.fn(async () => snapshot), applyPid });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
+		expect(result.ok).toBe(true);
+
+		// The very first applyPid call of the whole run is the E raise, before preflight/any capture.
+		expect(applySnapshots[0]).toMatchObject({ warn: 500000, err: 1000000 });
+		expect(effects.captureSignal).toHaveBeenCalled();
+		const firstCaptureCallOrder = (effects.captureSignal as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+		const raiseCallOrder = applyPid.mock.invocationCallOrder[0];
+		expect(raiseCallOrder).toBeLessThan(firstCaptureCallOrder);
+		// Restored on success: the final PID must carry the run's own tuned P/I/D/V/A but the ORIGINAL E.
+		expect(result.pid.warn).toBe(5);
+		expect(result.pid.err).toBe(10);
+		expect(applySnapshots[applySnapshots.length - 1]).toMatchObject({ warn: 5, err: 10 });
+	});
+
+	it("restores E (to the real snapshot, not a default) on a failed/cancelled run too", async () => {
+		const snapshot: PidConfig = { p: 77, i: 1, d: 2, v: 3, a: 4, warn: 7, err: 14 };
+		const { effects } = fakeEffects({ readPid: vi.fn(async () => snapshot), captureSignal: vi.fn(async () => null) });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
+		expect(result.ok).toBe(false);
+		expect(result.pid.warn).toBe(7);
+		expect(result.pid.err).toBe(14);
+		expect(effects.applyPid).toHaveBeenLastCalledWith(snapshot);
+	});
+
+	it("leaves E untouched (no E parameter at all) when the user never had one set (both null)", async () => {
+		const { effects } = fakeEffects({ readPid: vi.fn(async () => basePid()) }); // warn/err: null
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
+		expect(result.ok).toBe(true);
+		expect(result.pid.warn).toBeNull();
+		expect(result.pid.err).toBeNull();
+	});
+});
+
 describe("runAutoTune — safety: snapshot and rollback", () => {
 	it("restores the pre-run PID snapshot when every capture fails", async () => {
 		const snapshot: PidConfig = { p: 77, i: 1, d: 2, v: 3, a: 4, warn: null, err: null };

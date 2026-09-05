@@ -148,6 +148,19 @@ const IDENTIFY_METHOD_DEFAULT: IdentifyMethod = "model-fit";
 const SEED_MAX_ATTEMPTS = 10;
 const ITAE_PLATEAU = 0.05;
 
+/**
+ * M569.1 E<warn>:<err> thresholds to use for the DURATION of an auto-tune run, restored to whatever
+ * M569.1 actually reported before the run (never a hardcoded default — the user may have their own)
+ * on every exit path. Intentionally-extreme early P/D/I/A/V probes produce transient position errors far
+ * larger than any sane running threshold would tolerate; on RP2350-based boards the resulting stream of
+ * warn/error messages was enough to crash the board outright (confirmed on real hardware — raising E,
+ * not lowering the capture rate, is the actual fix for that). Applied on every board, not just RP2350
+ * ones: suppressing spurious threshold events during tuning is a correctness improvement generally, and
+ * restoring the exact prior value afterward makes it a no-op for anyone who didn't need it.
+ */
+const TUNING_WARN_THRESHOLD = 500000;
+const TUNING_ERR_THRESHOLD = 1000000;
+
 function round(v: number, dp = 2): number {
 	const f = Math.pow(10, dp);
 	return Math.round(v * f) / f;
@@ -807,6 +820,16 @@ export async function runAutoTune(effects: TuneEffects, startPid: PidConfig, opt
 
 	effects.log(`Auto-tune config: method=${method}, identify=${identifyMethod}, seedRule=${seedRule}, medianOf=${medianOf}, cycles=${totalCycles}${opts.captureBudget != null ? `, captureBudget=${opts.captureBudget}` : ""}.`);
 
+	// Raise E BEFORE preflight's own probe capture runs — that probe can already produce a large
+	// transient error on a fresh axis, so the window this closes has to start here, not at the first
+	// ramp/seed stage's own applyPid(). M569.1 only changes the parameters it's given, so leaving E off
+	// every other call site in this run (preflight's probe included) can never revert it early.
+	const priorWarn = restoreTarget.warn ?? "unset", priorErr = restoreTarget.err ?? "unset";
+	effects.log(`Raising M569.1 error thresholds to E${TUNING_WARN_THRESHOLD}:${TUNING_ERR_THRESHOLD} for this run (was E${priorWarn}:${priorErr} — restored afterward).`);
+	pid.warn = TUNING_WARN_THRESHOLD;
+	pid.err = TUNING_ERR_THRESHOLD;
+	await effects.applyPid(pid);
+
 	let ok = true;
 	let reason: string | undefined;
 	try {
@@ -856,6 +879,16 @@ export async function runAutoTune(effects: TuneEffects, startPid: PidConfig, opt
 		effects.log(`Auto-tune stopped: ${reason ?? "cancelled"}. Restoring the PID values from before this run.`);
 		await effects.applyPid(restoreTarget);
 		return { ok: false, reason, pid: restoreTarget, restored: true, attempts, ku, tu, preflightActions };
+	}
+
+	// Success keeps the newly tuned P/I/D/V/A, but E (warn/err) must go back to whatever was actually on
+	// the driver before this run started — not the elevated tuning-only thresholds still sitting in `pid`
+	// (see the top of this function). Otherwise a successful tune would silently widen the user's own
+	// error-detection thresholds forever, the exact opposite of the point of restoring them at all.
+	if (pid.warn !== restoreTarget.warn || pid.err !== restoreTarget.err) {
+		pid.warn = restoreTarget.warn;
+		pid.err = restoreTarget.err;
+		await effects.applyPid(pid);
 	}
 
 	let evaluation: TuneEvaluation | undefined;

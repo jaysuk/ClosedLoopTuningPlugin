@@ -246,10 +246,12 @@
 															  type="number" step="0.01" :min="0" :max="D_MAX" label="Max D (optional)" dense outlined hide-details style="max-width: 170px" class="mb-2">
 													<template #append><HelpTip text="Manual cap on D during the sequential ramp, below the firmware's own limit. Auto-tune already stops on its own once raising D stops helping (e.g. a persistent, non-loop ripple like a ballscrew) — use this only if you want a firm ceiling regardless. Leave blank for no extra cap." /></template>
 												</v-text-field>
-											</div>
-											<div class="d-flex align-center flex-wrap mt-3">
 												<v-text-field v-model.number="samples" type="number" :min="10" label="Samples" dense outlined hide-details style="max-width: 150px" class="mr-3 mb-2"><template #append><HelpTip text="Samples captured per attempt (M569.5 S parameter) — the same setting used everywhere else in the plugin, including manual captures below. Lower this if the board is truncating captures ('Data lost')." /></template></v-text-field>
-												<v-text-field v-model.number="sampleRate" type="number" :min="0" label="Rate (/s, 0=max)" dense outlined hide-details style="max-width: 170px" class="mb-2"><template #append><HelpTip text="Capture sample rate. With the Distance above left at 0 (auto, the default), this is only a starting point — the real rate is derived from the move's own duration, then capped to a safe ceiling for the board (lower on some RP2350-based boards). Set an explicit Distance above if you need this rate to apply directly." /></template></v-text-field>
+												<v-text-field v-model.number="sampleRate" type="number" :min="0" label="Rate (/s, 0=max)" dense outlined hide-details style="max-width: 170px" class="mr-3 mb-2"><template #append><HelpTip text="Capture sample rate. With the Distance above left at 0 (auto, the default), this is only a starting point — the real rate is derived from the move's own duration, then capped to a safe ceiling for the board (lower on some RP2350-based boards). Set an explicit Distance above if you need this rate to apply directly." /></template></v-text-field>
+												<v-text-field :value="pid.warn === null ? '' : pid.warn" @input="pid.warn = $event === '' ? null : Number($event)" type="number" label="Warn threshold (E)" dense outlined hide-details style="max-width: 170px" class="mr-3 mb-2" />
+												<v-text-field :value="pid.err === null ? '' : pid.err" @input="pid.err = $event === '' ? null : Number($event)" type="number" label="Error threshold (E)" dense outlined hide-details style="max-width: 170px" class="mb-2">
+													<template #append><HelpTip :href="DOCS.m569_1" text="M569.1 E<warn>:<err> — position-error thresholds that put the driver into a warning or error state if exceeded. Both must be set (either blank omits E entirely, leaving RRF's own default/config.g value in place). Also editable in the PID parameters card below." /></template>
+												</v-text-field>
 											</div>
 										</v-expansion-panel-content>
 									</v-expansion-panel>
