@@ -21,6 +21,44 @@ not from memory or documentation. §11 lists what NOT to do.
 Phases 1 and 3 are pure model code with no machine interaction and can be built and merged
 independently — they're useful on their own (a parser and metrics with tests) and de-risk the rest.
 
+---
+
+## START HERE (implementer handoff)
+
+**Build exactly this, in this order, and nothing else:**
+
+1. `src/model/accelerometer.ts` — §3's code verbatim.
+2. `src/model/accelCsv.ts` — §4's code verbatim.
+3. `src/model/vibration.ts` — §7.2 + §7.3's code verbatim.
+4. `src/__tests__/accelerometer.test.ts`, `accelCsv.test.ts`, `vibration.test.ts` — §9's Phase 1 and
+   Phase 3 cases. **The numbers in §9 are exact values the code actually produced, not estimates** — if a
+   test fails, the implementation has drifted from §7.3; do not "adjust" the expectation to make it pass.
+
+**Do NOT do any of these** (each is blocked or explicitly out of scope):
+- Anything in §5 (item B), §6 (item D), §7.4, or §8 (item F) — blocked on hardware that doesn't exist yet.
+- Any change to `useClosedLoopTuning.ts` — the §3 "wiring" snippet is Phase 4, not now.
+- Any change to a `.vue` file, `csv.ts`, `analysis.ts`, `dsp.ts`, or anything under `src/ui36`/`src/ui37`.
+- See §11 for the traps, especially: do not fold `dominantLag` into `dsp.ts`'s `autocorrelationPeriod`.
+
+**These three files are new and self-contained.** Nothing existing imports them yet, so this phase cannot
+break any current behaviour — and if it appears to, something has gone wrong; stop rather than adapting
+existing code to fit.
+
+**Verification for this phase:**
+```
+npm test
+DWC_DIR="C:/Users/live/Documents/Github/DuetWebControl" npm run typecheck
+```
+`npm test` alone is not sufficient. Vitest transpiles without type-checking, so it will happily pass code
+with missing required fields on an object literal — a real bug shipped that way earlier in this repo
+(`medianSignal` missing a `TuneStats` field) and only the `DWC_DIR` typecheck caught it. Run both.
+
+`verify-build`, `check-ui36` and the 3.6 webpack build are **not needed** for this phase (no `.vue` files
+change). Leave them alone.
+
+**Do not commit to `main` and do not push** without being asked — this repo pushes straight to
+`origin/main`, so a push is immediately public.
+
 **Why this is worth doing:** the plugin currently infers "is this ripple mechanical or is it the control
 loop?" indirectly, from encoder data alone — see `cruiseRing` (docs/PLAN-v2.4-feedback.md §2.3), which is
 explicitly report-only *because* it's a signature match rather than evidence. An accelerometer measures
