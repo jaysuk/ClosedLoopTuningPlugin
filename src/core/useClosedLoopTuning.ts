@@ -38,7 +38,7 @@ import { parseCapture, type ParsedCapture } from "../model/csv";
 import { analyzeCapture, type StepMetrics } from "../model/analysis";
 import {
 	CENTER_TOLERANCE_MM, CENTERING_FEED_MM_MIN, DEFAULT_MARGIN_MM,
-	getAxisLimits, midpoint, planCaptureProfile, planCoupledSymmetricMove, type CoupledAxisLimits,
+	getAxisLimits, midpoint, planCaptureProfile, planCoupledSymmetricMove, rateCeilingForBoard, type CoupledAxisLimits,
 } from "../model/limits";
 import { resolveMotionCoupling } from "../model/kinematics";
 import { WIZARD_STEPS, type Recommendation } from "../model/wizard";
@@ -405,6 +405,16 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		return (host.model() as any).boards?.find((b: any) => b && b.canAddress === addr) ?? null;
 	});
 
+	/** Safe capture-rate ceiling for the selected driver's board — applied to every capture path (manual
+	 * record, wizard step, auto-tune's own trapezoid move), not just the auto-sized one, since a
+	 * rate-constrained board would truncate on any of them at the default rate. See rateCeilingForBoard. */
+	const captureRateCeiling = computed(() => rateCeilingForBoard(selectedBoard.value?.shortName ?? null));
+	/** The rate a manual/wizard capture actually requests — must be used for BOTH the M569.5 command and
+	 * the subsequent analysis call, or a clamped capture gets mis-timed against the unclamped setting.
+	 * (Auto-tune's own trapezoid move is a separate case — see `captureRaw`'s use of `profile.sampleRateHz`,
+	 * which is derived from the move itself, not this value, and already threaded through correctly.) */
+	const effectiveSampleRate = computed(() => Math.min(sampleRate.value, captureRateCeiling.value));
+
 	/** The axis object the selected driver belongs to (null for extruders / unknown). */
 	function axisForDriver(): any {
 		if (!selectedDriver.value) { return null; }
@@ -538,7 +548,7 @@ export function useClosedLoopTuning(host: HostAdapter) {
 			driver: selectedDriver.value ?? "",
 			samples: samples.value,
 			activate: (moveMode.value === "custom" ? 1 : 0) as 0 | 1,
-			rate: sampleRate.value,
+			rate: effectiveSampleRate.value,
 			variables: recordKeys.value.map((k) => CAPTURE_VARIABLES.find((v) => v.key === k)?.id ?? 0),
 			manoeuvre: moveMode.value === "step" ? 64 : 0,
 			move: moveMode.value === "custom" ? (customMove.value || undefined) : undefined,
@@ -602,7 +612,7 @@ export function useClosedLoopTuning(host: HostAdapter) {
 	/** Manual record path: load newest CSV and analyse it as a step response. */
 	async function loadLatestCapture(): Promise<void> {
 		const c = await loadLatestCsv();
-		if (c) { metrics.value = analyzeCapture(c, sampleRate.value); }
+		if (c) { metrics.value = analyzeCapture(c, effectiveSampleRate.value); }
 	}
 
 	const availableViewVars = computed(() => CAPTURE_VARIABLES.filter((v) => capture.value && capture.value.columns[v.header]));
@@ -640,9 +650,9 @@ export function useClosedLoopTuning(host: HostAdapter) {
 				if (!(await ensureAxisReady(coupled))) { return; }
 				const c = await runCapture({
 					driver: selectedDriver.value ?? "", samples: samples.value, activate: 1,
-					rate: sampleRate.value, variables: varIds(ALL_CAPTURE_KEYS), manoeuvre: 0, move: customMove.value,
+					rate: effectiveSampleRate.value, variables: varIds(ALL_CAPTURE_KEYS), manoeuvre: 0, move: customMove.value,
 				});
-				if (c) { metrics.value = analyzeCapture(c, sampleRate.value); }
+				if (c) { metrics.value = analyzeCapture(c, effectiveSampleRate.value); }
 				return;
 			}
 			// Default: a small, fast, auto-sized G1 move (the V64 manoeuvre doesn't move on all setups).
@@ -790,13 +800,13 @@ export function useClosedLoopTuning(host: HostAdapter) {
 			const signedDist = sign * dist;
 			const feed = stepJumpFeedMmPerMin(dist).toFixed(0);
 			const move = `G91 G1 H2 ${ax.letter}${signedDist.toFixed(3)} F${feed} G90`;
-			c = await runCapture({ driver: selectedDriver.value ?? "", samples: samples.value, activate: 1, rate: sampleRate.value, variables: stepVars, manoeuvre: 0, move });
+			c = await runCapture({ driver: selectedDriver.value ?? "", samples: samples.value, activate: 1, rate: effectiveSampleRate.value, variables: stepVars, manoeuvre: 0, move });
 			try { await host.sendCode(`G91 G1 H2 ${ax.letter}${(-signedDist).toFixed(3)} F${feed} G90`, { log: false }); } catch { /* return move */ }
 		} else {
-			c = await runCapture({ driver: selectedDriver.value ?? "", samples: samples.value, activate: 0, rate: sampleRate.value, variables: stepVars, manoeuvre: 64 });
+			c = await runCapture({ driver: selectedDriver.value ?? "", samples: samples.value, activate: 0, rate: effectiveSampleRate.value, variables: stepVars, manoeuvre: 64 });
 		}
 		if (!c) { return null; }
-		metrics.value = analyzeCapture(c, sampleRate.value);
+		metrics.value = analyzeCapture(c, effectiveSampleRate.value);
 		return metrics.value;
 	}
 
@@ -837,7 +847,9 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		if (!(await ensureAxisReady(coupled, { centerToMid: false }))) { return null; }
 		const freshCoupled = coupledAxesForDriver();
 		if ("error" in freshCoupled) { log(`Tuning capture: ${freshCoupled.error}`); host.notify("error", "Closed Loop Tuning", freshCoupled.error); return null; }
-		const profile = planCaptureProfile(freshCoupled, avFeed.value, samples.value, sampleRate.value, marginMm.value, { maxDistanceMm: avDistance.value });
+		const profile = planCaptureProfile(freshCoupled, avFeed.value, samples.value, sampleRate.value, marginMm.value, {
+			maxDistanceMm: avDistance.value, rateCeilingHz: captureRateCeiling.value,
+		});
 		if ("error" in profile) { log(`Tuning capture: ${profile.error}`); host.notify("error", "Closed Loop Tuning", profile.error); return null; }
 
 		// Centre the MOVE on every coupled axis's own midpoint, not just the nominal one: pre-position ALL
@@ -862,7 +874,10 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		const signedDist = profile.sign * profile.distance;
 		ensureViewKeys(["measuredMotorSteps", "targetMotorSteps", "pidPTerm"]);
 		const c = await runCapture({
-			driver: selectedDriver.value ?? "", samples: samples.value, activate: 1, rate: profile.sampleRateHz,
+			// `profile.samples`, not `samples.value` — the rate ceiling can reduce the effective count
+			// (see planCaptureProfile / CaptureProfile.samples); using the raw setting here would ask the
+			// firmware for more samples than the (now lower) rate can actually spread across this window.
+			driver: selectedDriver.value ?? "", samples: profile.samples, activate: 1, rate: profile.sampleRateHz,
 			variables: varIds(ALL_CAPTURE_KEYS), manoeuvre: 0,
 			move: `G91 G1 H2 ${axis}${signedDist.toFixed(3)} F${avFeed.value} G90`,
 		});

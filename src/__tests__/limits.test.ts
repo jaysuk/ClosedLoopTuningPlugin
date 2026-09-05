@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
-	AUTO_MOVE_CAP_MM, AUTO_RATE_FLOOR_HZ, getAxisLimits, midpoint, planCaptureProfile, planCenteredMove,
+	AUTO_MOVE_CAP_MM, AUTO_RATE_CEILING_HZ, AUTO_RATE_FLOOR_HZ, getAxisLimits, midpoint, planCaptureProfile, planCenteredMove,
+	rateCeilingForBoard,
 	planCoupledCenteredMove, planCoupledSymmetricMove, planSymmetricMove, type CoupledAxisLimits,
 } from "../model/limits";
 
@@ -196,6 +197,64 @@ describe("planCaptureProfile", () => {
 	it("errors when the feed rate is zero", () => {
 		const plan = planCaptureProfile(coupled(centred), 0, 2000, 2000, 2);
 		expect(plan).toHaveProperty("error");
+	});
+
+	describe("rate ceiling (docs/PLAN-v2.4-feedback.md follow-up: board-aware sample rate)", () => {
+		// A short-travel axis: 10 mm max, 2 mm margin each side -> 6 mm clear, well under AUTO_MOVE_CAP_MM.
+		// A short auto move at the default 2000 samples is exactly the "5 mm move at 100 mm/s" pathological
+		// case from the field report — even the general default ceiling (not a board-specific one) catches it.
+		const short = { letter: "X", min: 0, max: 10, position: 5, homed: true };
+
+		it("the default ceiling alone already catches a short auto-sized move", () => {
+			const plan = planCaptureProfile(coupled(short), 6000, 2000, 2000, 2);
+			expect(plan).not.toHaveProperty("error");
+			if ("error" in plan) return;
+			expect(plan.sampleRateHz).toBe(AUTO_RATE_CEILING_HZ);
+			expect(plan.samples).toBeLessThan(2000); // fewer samples, not a longer/different move
+			expect(plan.distance).toBeCloseTo(6, 5); // the move itself is untouched
+		});
+
+		it("auto mode: a tighter ceiling reduces samples, not distance/moveTime — the move can't always be lengthened (travel is what capped it)", () => {
+			const withoutCeiling = planCaptureProfile(coupled(short), 6000, 2000, 2000, 2, { rateCeilingHz: Infinity });
+			const withCeiling = planCaptureProfile(coupled(short), 6000, 2000, 2000, 2, { rateCeilingHz: 500 });
+			if ("error" in withoutCeiling || "error" in withCeiling) throw new Error("expected both to plan");
+			expect(withCeiling.sampleRateHz).toBe(500);
+			expect(withCeiling.samples).toBeLessThan(withoutCeiling.samples);
+			expect(withCeiling.distance).toBeCloseTo(withoutCeiling.distance, 9);
+			expect(withCeiling.moveTimeS).toBeCloseTo(withoutCeiling.moveTimeS, 9);
+			expect(withCeiling.startPositions).toEqual(withoutCeiling.startPositions);
+		});
+
+		it("explicit distance: a tighter ceiling grows the rest window instead, keeping samples AND the move exactly as requested", () => {
+			const field = { letter: "X", min: 0, max: 300, position: 150, homed: true };
+			const withoutCeiling = planCaptureProfile(coupled(field), 6000, 2000, 2000, 2, { maxDistanceMm: 10, rateCeilingHz: Infinity });
+			const withCeiling = planCaptureProfile(coupled(field), 6000, 2000, 2000, 2, { maxDistanceMm: 10, rateCeilingHz: 500 });
+			if ("error" in withoutCeiling || "error" in withCeiling) throw new Error("expected both to plan");
+			expect(withCeiling.sampleRateHz).toBe(500);
+			expect(withCeiling.samples).toBe(withoutCeiling.samples); // 2000, unchanged
+			expect(withCeiling.distance).toBeCloseTo(withoutCeiling.distance, 9); // 10 mm, unchanged
+			expect(withCeiling.restTimeS).toBeGreaterThan(withoutCeiling.restTimeS); // window grew instead
+		});
+
+		it("omitting rateCeilingHz defaults to AUTO_RATE_CEILING_HZ (no behaviour change for a normal move)", () => {
+			const field = { letter: "X", min: 0, max: 300, position: 150, homed: true };
+			const defaulted = planCaptureProfile(coupled(field), 6000, 2000, 2000, 2);
+			const explicitDefault = planCaptureProfile(coupled(field), 6000, 2000, 2000, 2, { rateCeilingHz: AUTO_RATE_CEILING_HZ });
+			expect(defaulted).toEqual(explicitDefault);
+		});
+	});
+});
+
+describe("rateCeilingForBoard", () => {
+	it("returns the known-lower ceiling for the reported RP2350-based board", () => {
+		expect(rateCeilingForBoard("MNBN17R1_5")).toBeLessThan(AUTO_RATE_CEILING_HZ);
+	});
+	it("falls back to the general ceiling for any other board shortName", () => {
+		expect(rateCeilingForBoard("MB6HC")).toBe(AUTO_RATE_CEILING_HZ);
+	});
+	it("falls back to the general ceiling when the board (or its shortName) isn't known yet", () => {
+		expect(rateCeilingForBoard(null)).toBe(AUTO_RATE_CEILING_HZ);
+		expect(rateCeilingForBoard(undefined)).toBe(AUTO_RATE_CEILING_HZ);
 	});
 });
 

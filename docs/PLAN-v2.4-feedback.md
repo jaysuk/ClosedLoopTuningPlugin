@@ -18,6 +18,26 @@ above is now the working DWC 3.6 reference for this repo.
 **Audience:** written to be implemented directly. Every claim below was checked against the current
 code (file:line anchors throughout), not assumed from the report. §9 lists what NOT to do.
 
+**Follow-up (not part of the original 4 items) — board-aware capture sample rate:** a user on an
+RP2350-based expansion board (object model `shortName: "MNBN17R1_5"`) hit truncated captures — the
+auto-sized tuning move had no ceiling on the sample rate it could derive (only a floor,
+`AUTO_RATE_FLOOR_HZ`), so a short/travel-constrained axis could demand tens of kHz. Added:
+- `AUTO_RATE_CEILING_HZ` (5000, general safety net for every board) and `rateCeilingForBoard(shortName)`
+  in `limits.ts` — an allowlist of known-constrained boards, currently just `MNBN17R1_5` at 500 Hz
+  (**unverified placeholder** — the user asked for a conservative default to tune against real hardware,
+  not a measured number; adjust `RP2350_RATE_CEILING_HZ` once one is known).
+- `planCaptureProfile` now clamps to the ceiling in both modes: **auto** mode reduces the sample COUNT
+  (the move can't always be lengthened — travel may already be what capped it), **explicit-distance**
+  mode just grows the rest window (no travel implication either way). `CaptureProfile` gained a
+  `samples` field callers must use instead of their own requested count.
+- The ceiling applies to every capture path (manual record, wizard step/custom move, auto-tune's own
+  trapezoid move) via `useClosedLoopTuning.ts`'s new `captureRateCeiling`/`effectiveSampleRate`
+  computeds — a rate-constrained board would otherwise still truncate on the paths that don't go through
+  `planCaptureProfile`. The clamped rate is reused for the post-capture analysis call too (not the raw
+  UI setting), or a clamped capture would be mis-timed against the wrong rate.
+- 7 new tests (`limits.test.ts`). No `.vue` changes, so no 3.6 webpack build was re-run for this — the
+  4/4 `check-ui36` compile-check plus the full DWC 3.7 typecheck/verify-build already covered it.
+
 ---
 
 ## 0. Scope — 4 items

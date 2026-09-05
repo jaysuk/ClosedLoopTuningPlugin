@@ -31,6 +31,32 @@ export const AUTO_MOVE_CAP_MM = 200;
 /** Never derive a sample rate below this for an auto-sized move — preserves capture resolution; the
  * move shrinks instead of sampling slower than this. */
 export const AUTO_RATE_FLOOR_HZ = 250;
+/**
+ * General safety net on the OTHER end: a short move (travel-constrained axis, or a fast feed) can drive
+ * `samples / windowS` arbitrarily high with no ceiling at all — a 5 mm move at 100 mm/s with the default
+ * 2000 samples derives to ~25 kHz, which nothing has a documented capture path fast enough for. This
+ * default is deliberately generous (comfortably above the UI's own 2000 Hz default) — it exists to catch
+ * the pathological case, not to restrict ordinary use. `rateCeilingForBoard` below applies a much
+ * tighter, per-board override where one is known to be needed.
+ */
+export const AUTO_RATE_CEILING_HZ = 5000;
+
+/**
+ * Boards known to need a lower capture rate than most Duet 3 hardware, keyed by the object model's
+ * `board.shortName` (stable identifier; `board.name` is a human-readable string not meant for matching).
+ * Currently just the one board reported — the number is an UNVERIFIED conservative starting point, not
+ * measured against real hardware; adjust `RP2350_RATE_CEILING_HZ` once a real safe ceiling is known.
+ */
+const RP2350_RATE_CEILING_HZ = 500;
+const RP2350_BOARD_SHORT_NAMES = new Set<string>(["MNBN17R1_5"]);
+
+/** The safe capture-rate ceiling for a board, by its object model `shortName` — falls back to the
+ * general `AUTO_RATE_CEILING_HZ` for anything not in the known-constrained list (or when the board
+ * isn't known yet, e.g. `shortName` missing/null). */
+export function rateCeilingForBoard(shortName: string | null | undefined): number {
+	if (shortName && RP2350_BOARD_SHORT_NAMES.has(shortName)) { return RP2350_RATE_CEILING_HZ; }
+	return AUTO_RATE_CEILING_HZ;
+}
 
 /** Number(...), but null/undefined stay null instead of coercing to 0 — needed since machinePosition is null when unknown. */
 function toFiniteNumber(v: unknown): number | null {
@@ -202,8 +228,15 @@ export interface CaptureProfile {
 	/** Seconds of the capture window left over after the move — the at-rest tail I/D/ring metrics need. */
 	restTimeS: number;
 	/** Sample rate to actually use for the capture — the requested rate in explicit-distance mode, or
-	 * one derived from the move's own duration in "auto" (longest) mode. */
+	 * one derived from the move's own duration in "auto" (longest) mode. Never exceeds the ceiling
+	 * passed in (`opts.rateCeilingHz`, default `AUTO_RATE_CEILING_HZ`). */
 	sampleRateHz: number;
+	/** Sample COUNT to actually request — equal to the `samples` argument, unless the rate ceiling
+	 * forced it down (auto mode only: the move can't always be lengthened to compensate, since its
+	 * distance may already be everything the axis's travel allows, so fewer samples over the same
+	 * window is the only always-safe way to bring the rate down). Callers must use this, not their
+	 * own `samples` value, when building the capture command. */
+	samples: number;
 	/** Which coupled axis's clear travel capped the distance, or null if nothing did. */
 	limitedBy: string | null;
 }
@@ -235,9 +268,10 @@ export function planCaptureProfile(
 	samples: number,
 	sampleRateHz: number,
 	marginMm: number,
-	opts: { restFraction?: number; maxDistanceMm?: number; minDistanceFloorMm?: number } = {},
+	opts: { restFraction?: number; maxDistanceMm?: number; minDistanceFloorMm?: number; rateCeilingHz?: number } = {},
 ): CaptureProfile | { error: string } {
 	const restFraction = opts.restFraction ?? CAPTURE_REST_FRACTION_DEFAULT;
+	const rateCeilingHz = opts.rateCeilingHz ?? AUTO_RATE_CEILING_HZ;
 	const feedMmPerS = feedMmPerMin / 60;
 	if (!(feedMmPerS > 0)) { return { error: "Feed rate is too small to plan a tuning move." }; }
 
@@ -263,6 +297,7 @@ export function planCaptureProfile(
 
 	let moveTimeS = distance / feedMmPerS;
 	let effectiveRate = sampleRateHz > 0 ? sampleRateHz : AUTO_RATE_FLOOR_HZ;
+	let effectiveSamples = samples;
 	let windowS: number;
 
 	if (auto) {
@@ -278,11 +313,24 @@ export function planCaptureProfile(
 			if (axes.length > 0) {
 				startPositions = axes.map((a) => ({ letter: a.letter, position: midpoint(a) - a.perUnit * distance / 2 }));
 			}
+		} else if (effectiveRate > rateCeilingHz) {
+			// The opposite problem: a short move (often because travel is what capped `distance` above,
+			// not choice) needs the same `samples` squeezed into a short window, deriving an unreasonably
+			// high rate. Unlike the floor case, the move can't always just be lengthened to compensate —
+			// there may be no more travel to give it — so the always-safe fix is fewer samples over the
+			// SAME window (distance/moveTimeS/startPositions untouched) instead.
+			effectiveRate = rateCeilingHz;
+			effectiveSamples = Math.max(1, Math.round(rateCeilingHz * windowS));
 		}
 	} else {
+		// Explicit distance: the window is however long `samples` at `effectiveRate` takes, independent
+		// of the move's own duration (the axis simply sits at rest for any window time past moveTimeS).
+		// So clamping the rate down here just makes the capture run longer, never shorter than the move
+		// — no travel implication, so `samples` itself never needs to change in this branch.
+		effectiveRate = Math.min(effectiveRate, rateCeilingHz);
 		windowS = effectiveRate > 0 ? samples / effectiveRate : 4;
 	}
 
 	if (!(distance > 0)) { return { error: "Feed rate or capture window is too small to plan a tuning move." }; }
-	return { distance, sign: 1, startPositions, moveTimeS, restTimeS: Math.max(0, windowS - moveTimeS), sampleRateHz: effectiveRate, limitedBy };
+	return { distance, sign: 1, startPositions, moveTimeS, restTimeS: Math.max(0, windowS - moveTimeS), sampleRateHz: effectiveRate, samples: effectiveSamples, limitedBy };
 }
