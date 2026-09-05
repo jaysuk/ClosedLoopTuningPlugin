@@ -44,8 +44,8 @@ export const AUTO_RATE_CEILING_HZ = 5000;
 /**
  * Boards known to need a lower capture rate than most Duet 3 hardware, keyed by the object model's
  * `board.shortName` (stable identifier; `board.name` is a human-readable string not meant for matching).
- * Currently just the one board reported — the number is an UNVERIFIED conservative starting point, not
- * measured against real hardware; adjust `RP2350_RATE_CEILING_HZ` once a real safe ceiling is known.
+ * 500 Hz / 500 samples confirmed stable (no longer crashes) on real MNBN17R1_5 hardware — started as a
+ * conservative guess, since validated, not just guessed.
  */
 const RP2350_RATE_CEILING_HZ = 500;
 const RP2350_BOARD_SHORT_NAMES = new Set<string>(["MNBN17R1_5"]);

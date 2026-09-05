@@ -23,9 +23,9 @@ RP2350-based expansion board (object model `shortName: "MNBN17R1_5"`) hit trunca
 auto-sized tuning move had no ceiling on the sample rate it could derive (only a floor,
 `AUTO_RATE_FLOOR_HZ`), so a short/travel-constrained axis could demand tens of kHz. Added:
 - `AUTO_RATE_CEILING_HZ` (5000, general safety net for every board) and `rateCeilingForBoard(shortName)`
-  in `limits.ts` — an allowlist of known-constrained boards, currently just `MNBN17R1_5` at 500 Hz
-  (**unverified placeholder** — the user asked for a conservative default to tune against real hardware,
-  not a measured number; adjust `RP2350_RATE_CEILING_HZ` once one is known).
+  in `limits.ts` — an allowlist of known-constrained boards, currently just `MNBN17R1_5` at 500 Hz.
+  Started as a conservative guess pending real-hardware testing; **confirmed** — 500 Hz / 500 samples no
+  longer crashes the real board.
 - `planCaptureProfile` now clamps to the ceiling in both modes: **auto** mode reduces the sample COUNT
   (the move can't always be lengthened — travel may already be what capped it), **explicit-distance**
   mode just grows the rest window (no travel implication either way). `CaptureProfile` gained a
