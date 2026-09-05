@@ -81,3 +81,24 @@ export interface HostAdapter {
 	 */
 	t(key: string, args?: Record<string, unknown>): string;
 }
+
+/**
+ * Object-model `state.status` values under which sending another G-code move is unsafe or meaningless:
+ *  - `"halted"` — an emergency stop (M112) fired. RRF halts everything; a fresh move from the plugin
+ *    would queue behind nothing, then execute the instant the user clears the halt (M999) — an
+ *    unattended, uncommanded move on hardware the user just deliberately stopped.
+ *  - `"disconnected"` — DWC itself sets this on connection loss (see both DWC 3.6's and 3.7's own
+ *    machine store — this is not something the plugin invents). The exact field failure this guards
+ *    against: a capture times out, retries, the board comes back mid-retry, and the plugin's own retry
+ *    loop repositions the axis on a driver whose closed-loop config may not have survived the outage.
+ *  - `"updating"` — a firmware update is in progress; same reasoning, folded in for free.
+ *
+ * Auto-tune must never send another positioning/capture move while any of these hold — see
+ * `TuneEffects.isCancelled()`, which every capture/retry loop already checks before each attempt.
+ */
+const UNSAFE_TUNING_STATUSES = new Set(["halted", "disconnected", "updating"]);
+
+/** True when the object model's `state.status` means auto-tune must stop and not send anything else. */
+export function isMachineUnsafeForTuning(status: unknown): boolean {
+	return typeof status === "string" && UNSAFE_TUNING_STATUSES.has(status);
+}

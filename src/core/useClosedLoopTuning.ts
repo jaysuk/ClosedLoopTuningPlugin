@@ -24,7 +24,7 @@ import { computed, reactive, ref, watch } from "vue";
 // Subpath, not the barrel — see the note above.
 import { buildReport, downloadReport } from "dwc-plugin-runtime/diagnostics";
 
-import type { HostAdapter } from "./host";
+import { isMachineUnsafeForTuning, type HostAdapter } from "./host";
 import { evaluateTune, gradeColor, severityColor, severityIcon, type Term, type TuneEvaluation } from "../model/evaluate";
 import { CAPTURE_DIR, CONFIG_FILE, DOCS, LS_STATE, PLUGIN_ID } from "../model/constants";
 import { upsertTuneBlock } from "../model/config";
@@ -414,6 +414,15 @@ export function useClosedLoopTuning(host: HostAdapter) {
 	 * (Auto-tune's own trapezoid move is a separate case — see `captureRaw`'s use of `profile.sampleRateHz`,
 	 * which is derived from the move itself, not this value, and already threaded through correctly.) */
 	const effectiveSampleRate = computed(() => Math.min(sampleRate.value, captureRateCeiling.value));
+
+	/** Live object-model machine status ("idle", "halted", "disconnected", …) — read fresh every time,
+	 * same discipline as `selectedBoard`/`drivers` above. Drives `isCancelled()` below: an emergency
+	 * stop or a lost connection must stop a running auto-tune before it sends another move, not just
+	 * when the user clicks Abort. See `isMachineUnsafeForTuning`. */
+	const machineStatus = computed<string | null>(() => {
+		const s = (host.model() as any)?.state?.status;
+		return typeof s === "string" ? s : null;
+	});
 
 	/** The axis object the selected driver belongs to (null for extruders / unknown). */
 	function axisForDriver(): any {
@@ -943,7 +952,11 @@ export function useClosedLoopTuning(host: HostAdapter) {
 				stageStates[stage] = state;
 				if (tuneSession.value) { tuneSession.value.stageTimeline.push({ stage, state, at: new Date().toISOString() }); }
 			},
-			isCancelled: () => autoCancel.value,
+			// Machine-safety stop, not just the user's own Abort button: an emergency stop or a lost
+			// connection must never be followed by another positioning/capture move (see
+			// isMachineUnsafeForTuning) — every capture/retry loop in autorun.ts/optimize.ts already
+			// checks isCancelled() before each attempt, so this one change covers all of them.
+			isCancelled: () => autoCancel.value || isMachineUnsafeForTuning(machineStatus.value),
 			delay,
 		};
 	}
@@ -1003,9 +1016,15 @@ export function useClosedLoopTuning(host: HostAdapter) {
 				autoStatus.value = `Auto-tune complete — P=${pid.p} D=${pid.d} I=${pid.i} A=${pid.a} V=${pid.v}.${gradeNote}`;
 				host.notify("success", "Closed Loop Tuning", autoStatus.value + " Review the evaluation, then save to config.g.");
 			} else {
+				// Distinguish an automatic machine-safety stop from the user's own Abort click or an
+				// ordinary capture failure — both report the identical "Cancelled." reason otherwise,
+				// leaving the user to guess why a run they didn't touch just stopped.
+				const safetyStop = !autoCancel.value && isMachineUnsafeForTuning(machineStatus.value);
+				const reason = safetyStop ? `the machine is ${machineStatus.value} — stopped automatically` : (result.reason ?? "see log");
 				autoStatus.value = result.restored
-					? `Auto-tune stopped (${result.reason ?? "see log"}) — PID restored to its values from before this run.`
-					: `Auto-tune stopped: ${result.reason ?? "see log"}.`;
+					? `Auto-tune stopped (${reason}) — PID restored to its values from before this run.`
+					: `Auto-tune stopped: ${reason}.`;
+				if (safetyStop) { host.notify("error", "Closed Loop Tuning", `Auto-tune stopped automatically — the machine is ${machineStatus.value}. No further moves were sent.`); }
 			}
 		} catch (e) {
 			console.warn("[ClosedLoopTuning] auto-tune failed", e);
