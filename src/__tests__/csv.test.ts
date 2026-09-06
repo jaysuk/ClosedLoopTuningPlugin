@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { column, parseCapture, timeAxisSeconds } from "../model/csv";
+import { achievedRateHz, column, parseCapture, timeAxisSeconds } from "../model/csv";
 
 const CSV = "Sample,Timestamp,Measured Motor Steps,Target Motor Steps\n0,1000,0,0\n1,1001,0.5,1\n2,1002,1,1\n";
 const FIXTURES = join(__dirname, "fixtures");
@@ -78,5 +78,39 @@ describe("timeAxisSeconds", () => {
 	it("derives time from the sample rate when there is no timestamp", () => {
 		const c = parseCapture("Sample,Measured Motor Steps,Target Motor Steps\n0,0,0\n1,1,1\n");
 		expect(timeAxisSeconds(c, 1000)).toEqual([0, 0.001]);
+	});
+});
+
+// docs/PLAN-capture-window.md §6 — a real forum report needed this to tell "the board delivered what was
+// requested" (it did, verified) apart from "the board ignored the request" (it didn't) without hand-
+// decoding raw CSV timestamps.
+describe("achievedRateHz", () => {
+	function tsCapture(gapsMs: Array<number>): ReturnType<typeof parseCapture> {
+		let t = 0;
+		const rows = gapsMs.map((g, i) => { t += i === 0 ? 0 : g; return `${i},${t.toFixed(2)},0,0`; });
+		return parseCapture(`Sample,Timestamp,Measured Motor Steps,Target Motor Steps\n${rows.join("\n")}\n`);
+	}
+
+	it("reads 4166.7 Hz from real hardware's 0.24 ms interval, the exact case this was built for", () => {
+		const c = tsCapture(new Array(20).fill(0.24));
+		expect(achievedRateHz(c)).toBeCloseTo(4166.7, 0);
+	});
+
+	it("uses the MEDIAN gap, not the mean, so one large outlier gap can't skew it", () => {
+		const gaps = new Array(19).fill(0.5); // 2000 Hz steady rate
+		gaps.push(50); // one huge stall right after the move — must not drag the estimate down
+		const c = tsCapture(gaps);
+		expect(achievedRateHz(c)).toBeCloseTo(2000, 0);
+	});
+
+	it("is null when there is no Timestamp column", () => {
+		const rows = Array.from({ length: 20 }, (_, i) => `${i},${i},${i}`).join("\n");
+		const c = parseCapture(`Sample,Measured Motor Steps,Target Motor Steps\n${rows}\n`);
+		expect(achievedRateHz(c)).toBeNull();
+	});
+
+	it("is null for a capture too short to judge", () => {
+		const c = tsCapture([0, 0.5, 0.5]);
+		expect(achievedRateHz(c)).toBeNull();
 	});
 });

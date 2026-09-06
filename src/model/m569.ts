@@ -166,6 +166,9 @@ export interface CaptureOptions {
 	move?: string;
 	/** Step-change time in ms for a step manoeuvre. */
 	stepTimeMs?: number;
+	/** Another complete command to place on the same line, between the M569.5 parameters and `move`.
+	 *  Used to arm an M956 accelerometer capture on the same trigger (docs/PLAN-accelerometer.md §5). */
+	alongside?: string;
 }
 
 /** Build the `M569.5` capture command, optionally with a move appended on the same line. */
@@ -183,6 +186,9 @@ export function buildCaptureCommand(opts: CaptureOptions): string {
 		parts.push(`T${opts.stepTimeMs}`);
 	}
 	let cmd = parts.join(" ");
+	if (opts.alongside && opts.alongside.trim()) {
+		cmd += ` ${opts.alongside.trim()}`;
+	}
 	if (opts.move && opts.move.trim()) {
 		cmd += ` ${opts.move.trim()}`;
 	}

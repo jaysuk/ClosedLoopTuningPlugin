@@ -42,6 +42,34 @@ export const AUTO_RATE_FLOOR_HZ = 250;
 export const AUTO_RATE_CEILING_HZ = 5000;
 
 /**
+ * Minimum absolute at-rest time in an auto-planned capture window, on top of
+ * CAPTURE_REST_FRACTION_DEFAULT's proportional share. A fraction alone gives a short move a short tail:
+ * measured on a real forum report, a 0.344 s move left only 0.13 s of rest, in which the integrator had
+ * not converged on 29 of 82 captures — so `restTailValid` came back false and those captures' rest-effort
+ * term silently dropped out of every cost comparison (see `signalCostNoEffort` in signal.ts and
+ * docs/PLAN-capture-window.md §3-§4).
+ *
+ * PROVISIONAL: this is ~4x the 0.13 s that demonstrably failed, not a measurement of how long a Duet
+ * integrator actually takes to converge — no capture in hand has a long enough tail to measure that.
+ * docs/PLAN-capture-window.md §4.1 has the one-off hardware capture that would replace this with a real
+ * number; don't present it as measured until that's done.
+ */
+export const AUTO_REST_MIN_S = 0.5;
+
+/**
+ * Values/second a board can stream off its own driver over CAN without overrunning its onboard capture
+ * buffer. The ceiling that matters for this is BANDWIDTH, not rate alone: a capture recording all 17
+ * auto-tune variables at 4167 Hz is ~71k values/s, which intermittently truncated on a real Duet 3 1HCL
+ * (10 of 82 captures in the same forum report AUTO_REST_MIN_S above is drawn from), while the same rate
+ * with only 3 columns recorded is fine.
+ *
+ * PROVISIONAL: derived from that one data point (17 columns × 4167 Hz truncated), not bisected against
+ * where truncation actually starts. docs/PLAN-capture-window.md §5.1 has the hardware sweep that would
+ * replace this with a measured value.
+ */
+export const AUTO_VALUE_RATE_CEILING = 40000;
+
+/**
  * Boards known to need a lower capture rate than most Duet 3 hardware, keyed by the object model's
  * `board.shortName` (stable identifier; `board.name` is a human-readable string not meant for matching).
  * 500 Hz / 500 samples confirmed stable (no longer crashes) on real MNBN17R1_5 hardware — started as a
@@ -56,6 +84,21 @@ const RP2350_BOARD_SHORT_NAMES = new Set<string>(["MNBN17R1_5"]);
 export function rateCeilingForBoard(shortName: string | null | undefined): number {
 	if (shortName && RP2350_BOARD_SHORT_NAMES.has(shortName)) { return RP2350_RATE_CEILING_HZ; }
 	return AUTO_RATE_CEILING_HZ;
+}
+
+/**
+ * Rate ceiling for a capture recording `columns` variables — the lower of the board's own rate ceiling
+ * (`rateCeilingForBoard`) and what its CAN bandwidth allows for that many columns
+ * (`AUTO_VALUE_RATE_CEILING`). Auto-tune records every available variable (17, at the time this was
+ * written) so the chart has full overlay data afterward; a manual capture recording only a few columns
+ * still gets the full board ceiling. Never goes below `AUTO_RATE_FLOOR_HZ` even for an unreasonably large
+ * column count, since a capture below that floor loses resolution outright rather than trading it for
+ * reliability. See docs/PLAN-capture-window.md §5.
+ */
+export function rateCeilingForCapture(shortName: string | null | undefined, columns: number): number {
+	const byBoard = rateCeilingForBoard(shortName);
+	const byBandwidth = columns > 0 ? AUTO_VALUE_RATE_CEILING / columns : byBoard;
+	return Math.max(AUTO_RATE_FLOOR_HZ, Math.min(byBoard, byBandwidth));
 }
 
 /** Number(...), but null/undefined stay null instead of coercing to 0 — needed since machinePosition is null when unknown. */
@@ -301,7 +344,9 @@ export function planCaptureProfile(
 	let windowS: number;
 
 	if (auto) {
-		windowS = moveTimeS / (1 - restFraction);
+		// AUTO_REST_MIN_S is a floor on top of the fractional share, not instead of it — a fraction alone
+		// gives a short move a short (possibly integrator-unconverged) tail; see its doc comment.
+		windowS = Math.max(moveTimeS / (1 - restFraction), moveTimeS + AUTO_REST_MIN_S);
 		effectiveRate = samples / windowS;
 		if (effectiveRate < AUTO_RATE_FLOOR_HZ) {
 			// Even the floor rate can't stretch `samples` across this long a move's window — shrink the

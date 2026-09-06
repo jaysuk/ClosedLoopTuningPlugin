@@ -2,9 +2,11 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { computeRestEffort } from "../model/analysis";
+import { buildSeries, computeRestEffort, segmentMove } from "../model/analysis";
 import { parseCapture } from "../model/csv";
 import { computeTuneSignal } from "../model/signal";
+import { parseAccelCapture } from "../model/accelCsv";
+import { computeVibration } from "../model/vibration";
 import {
 	downsampleCapture, isNotableCapture, shapeCapturesForDownload, slimModelForReport, type ReportCapture,
 } from "../model/report";
@@ -113,6 +115,25 @@ describe("shapeCapturesForDownload", () => {
 		const captures: Array<ReportCapture> = [cap({ seq: 0, phase: "i", metrics: { restEffort: re } })];
 		const [shaped] = shapeCapturesForDownload(captures, false);
 		expect((shaped.metrics as { restEffort: typeof re }).restEffort).toEqual(re);
+	});
+
+	// docs/PLAN-accelerometer.md §8: vibration is attached to TuneSignal post-hoc (captureSignal(), not
+	// computeTuneSignal itself — see useClosedLoopTuning.ts), so this builds that same shape by hand
+	// using the real hardware fixture, same pattern as the restEffort round-trip above.
+	it("carries a capture's vibration metrics through the shaping step untouched", () => {
+		const cl = load("accel-2026-09-05/closed-loop.csv");
+		const accel = parseAccelCapture(readFileSync(path.join(FIXTURE_DIR, "accel-2026-09-05", "accelerometer.csv"), "utf8"));
+		const series = buildSeries(cl, 1000)!;
+		const seg = segmentMove(series.target, series.time, 1000);
+		const vibration = computeVibration(accel, series.time, seg.classes);
+		const signal = computeTuneSignal(cl, 1000)!;
+		signal.vibration = vibration;
+
+		const captures: Array<ReportCapture> = [cap({ seq: 0, phase: "p", metrics: signal })];
+		const [shaped] = shapeCapturesForDownload(captures, false);
+		const metrics = shaped.metrics as typeof signal;
+		expect(metrics.vibration).toEqual(vibration);
+		expect(metrics.vibration!.overall.dominantHz).toBe(200);
 	});
 });
 

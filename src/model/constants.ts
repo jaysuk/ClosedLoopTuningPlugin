@@ -17,6 +17,9 @@ export const LS_STATE = "closedLoopTuning.state";
 /** Directory the firmware writes M569.5 capture CSVs to. */
 export const CAPTURE_DIR = "0:/sys/closed-loop";
 
+/** Directory the firmware writes M956 accelerometer CSVs to (Accelerometers.cpp's CombineName). */
+export const ACCEL_CAPTURE_DIR = "0:/sys/accelerometer";
+
 /** The machine's main config file — the automated "save to config.g" write target. */
 export const CONFIG_FILE = "0:/sys/config.g";
 

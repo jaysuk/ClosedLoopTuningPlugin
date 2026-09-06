@@ -223,6 +223,17 @@
 												<template #append-inner><HelpTip :href="DOCS.m569_1" text="M569.1 E<warn>:<err> — position-error thresholds that put the driver into a warning or error state if exceeded. Both must be set (either blank omits E entirely, leaving RRF's own default/config.g value in place). Also editable in the PID parameters card below." /></template>
 											</v-text-field>
 										</div>
+										<div v-if="accelerometers.length > 0" class="d-flex align-center flex-wrap ga-3 mt-3">
+											<v-checkbox v-model="recordVibration" label="Record vibration" density="compact" hide-details />
+											<v-select v-if="accelerometers.length > 1" :model-value="selectedAccelerometerAddress" @update:model-value="selectedAccelerometerAddress = $event"
+													  :items="accelerometers.map((a) => ({ title: `Board ${a.boardAddress}`, value: a.boardAddress }))"
+													  item-title="title" item-value="value" clearable density="compact" variant="outlined" hide-details
+													  label="Accelerometer" style="max-width: 220px" />
+											<HelpTip text="Arms an M956 accelerometer capture alongside every capture this plugin makes — the Record button as well as every tuning move — on whichever board has one, often a different board from the driver being tuned (e.g. mounted on the toolhead). Report-only: never affects any tuning decision. If more than one accelerometer is available, pick which one to use; otherwise the driver's own board is preferred, falling back to the first one found." />
+										</div>
+										<v-alert v-if="accelDisabledReason" type="warning" density="compact" variant="tonal" class="mt-2 text-caption">
+											Vibration recording stopped: {{ accelDisabledReason }} Untick and re-tick &ldquo;Record vibration&rdquo; to try again.
+										</v-alert>
 									</v-expansion-panel-text>
 								</v-expansion-panel>
 							</v-expansion-panels>
@@ -388,8 +399,11 @@
 			</template>
 		</v-stepper>
 
-		<!-- Persistent results: chart + analysis from the most recent capture -->
-		<v-row dense class="mt-1">
+		<!-- Persistent results: chart + analysis from the most recent capture. align="start" stops
+			 Vuetify's default row-stretch from inflating the chart column (which has a fixed, content-sized
+			 height) to match the right column's often-taller stack of cards — without it, the chart card's
+			 fill-height grows to fill that mismatch as visible blank space below the chart. -->
+		<v-row dense class="mt-1" align="start">
 			<v-col cols="12" md="9">
 				<CaptureChart :capture="capture" :overlay="overlayCapture" :selected-keys="viewKeys" :sample-rate="sampleRate" :raw-text="rawText" />
 			</v-col>
@@ -457,6 +471,12 @@
 			</v-col>
 		</v-row>
 
+		<v-row v-if="accelCapture" dense class="mt-1">
+			<v-col cols="12" md="9">
+				<VibrationChart :capture="accelCapture" :vibration="lastVibration" />
+			</v-col>
+		</v-row>
+
 		<v-dialog v-model="confirmOpen" max-width="460">
 			<v-card>
 				<v-card-title>Confirm movement</v-card-title>
@@ -508,6 +528,7 @@ import { AboutDialog, HelpTip } from "dwc-plugin-runtime";
 import { useClosedLoopTuning } from "../core/useClosedLoopTuning";
 import { createHost } from "./host";
 import CaptureChart from "./CaptureChart.vue";
+import VibrationChart from "./VibrationChart.vue";
 
 const {
 	host,
@@ -523,6 +544,7 @@ const {
 	tuneMethod, estimatedMoves, identifyMethod, modelFitBackoff, seedRule, seedLambda,
 	medianOf, captureBudget, cycles, avDistance, avFeed, marginMm, axisTravelInfo,
 	stageStates, tuneSession, includeAllCsv, downloadTuningReport, dCeiling, D_MAX,
+	recordVibration, accelerometers, selectedAccelerometerAddress, accelCapture, accelDisabledReason, lastVibration,
 	samples, sampleRate, moveMode, customMove, recordKeys, canRecord, capturePreview, record,
 	recording, capture, overlayCapture, rawText, viewKeys, availableViewVars, pinOverlay,
 	metrics, evaluation, goToManualTerm, deleteCapturesAfterRead,

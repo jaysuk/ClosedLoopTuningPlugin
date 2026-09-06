@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
-	AUTO_MOVE_CAP_MM, AUTO_RATE_CEILING_HZ, AUTO_RATE_FLOOR_HZ, getAxisLimits, midpoint, planCaptureProfile, planCenteredMove,
-	rateCeilingForBoard,
+	AUTO_MOVE_CAP_MM, AUTO_REST_MIN_S, AUTO_RATE_CEILING_HZ, AUTO_RATE_FLOOR_HZ, AUTO_VALUE_RATE_CEILING,
+	getAxisLimits, midpoint, planCaptureProfile, planCenteredMove, rateCeilingForBoard, rateCeilingForCapture,
 	planCoupledCenteredMove, planCoupledSymmetricMove, planSymmetricMove, type CoupledAxisLimits,
 } from "../model/limits";
 
@@ -201,16 +201,21 @@ describe("planCaptureProfile", () => {
 
 	describe("rate ceiling (docs/PLAN-v2.4-feedback.md follow-up: board-aware sample rate)", () => {
 		// A short-travel axis: 10 mm max, 2 mm margin each side -> 6 mm clear, well under AUTO_MOVE_CAP_MM.
-		// A short auto move at the default 2000 samples is exactly the "5 mm move at 100 mm/s" pathological
-		// case from the field report — even the general default ceiling (not a board-specific one) catches it.
+		// A short auto move is exactly the "5 mm move at 100 mm/s" pathological case from the field report —
+		// even the general default ceiling (not a board-specific one) catches it.
 		const short = { letter: "X", min: 0, max: 10, position: 5, homed: true };
 
+		// AUTO_REST_MIN_S (docs/PLAN-capture-window.md §4) floors this move's window at moveTimeS + 0.5s
+		// rather than the fractional 0.06/0.7 ≈ 0.086s it would otherwise get, which caps the derivable
+		// rate at samples/0.5 — so it now takes MORE requested samples than before to reach the default
+		// ceiling from this short a move (2000 no longer does; 3000 does). The point of this test — a short
+		// auto move can still derive an unreasonable rate and the ceiling alone catches it — is unchanged.
 		it("the default ceiling alone already catches a short auto-sized move", () => {
-			const plan = planCaptureProfile(coupled(short), 6000, 2000, 2000, 2);
+			const plan = planCaptureProfile(coupled(short), 6000, 3000, 2000, 2);
 			expect(plan).not.toHaveProperty("error");
 			if ("error" in plan) return;
 			expect(plan.sampleRateHz).toBe(AUTO_RATE_CEILING_HZ);
-			expect(plan.samples).toBeLessThan(2000); // fewer samples, not a longer/different move
+			expect(plan.samples).toBeLessThan(3000); // fewer samples, not a longer/different move
 			expect(plan.distance).toBeCloseTo(6, 5); // the move itself is untouched
 		});
 
@@ -255,6 +260,75 @@ describe("rateCeilingForBoard", () => {
 	it("falls back to the general ceiling when the board (or its shortName) isn't known yet", () => {
 		expect(rateCeilingForBoard(null)).toBe(AUTO_RATE_CEILING_HZ);
 		expect(rateCeilingForBoard(undefined)).toBe(AUTO_RATE_CEILING_HZ);
+	});
+});
+
+// docs/PLAN-capture-window.md §4 — a real forum report: a 0.344s auto-planned move left only 0.13s of
+// rest, in which the integrator hadn't converged on 29 of 82 captures. These numbers are measured against
+// the real report's own move, not invented.
+describe("planCaptureProfile — AUTO_REST_MIN_S floor (docs/PLAN-capture-window.md §4)", () => {
+	const coupled = (axis: { letter: string; min: number; max: number; position: number; homed: boolean }) => [{ ...axis, perUnit: 1 }];
+	// AUTO mode only derives its rate from the move's own duration when maxDistanceMm is omitted/0 — passing
+	// a positive maxDistanceMm switches to EXPLICIT mode, a different formula entirely (see the branch in
+	// planCaptureProfile). Every test below controls the auto-derived move length via axis TRAVEL instead.
+
+	it("gives a short auto move at least AUTO_REST_MIN_S of rest, not just the fractional 30% share", () => {
+		// 50 mm clear travel, 6000 mm/min -> a 46 mm move (2 mm margin each side), 0.46s. The fractional
+		// share alone would give 0.46/0.7*0.3 ≈ 0.197s — well under AUTO_REST_MIN_S.
+		const shortAxis = { letter: "Y", min: 0, max: 50, position: 25, homed: true };
+		const plan = planCaptureProfile(coupled(shortAxis), 6000, 2000, 2000, 2);
+		if ("error" in plan) throw new Error("expected a plan");
+		// >= in intent; floating-point division can land a hair under AUTO_REST_MIN_S (0.49999999999999994).
+		expect(plan.restTimeS).toBeGreaterThanOrEqual(AUTO_REST_MIN_S - 1e-9);
+	});
+
+	it("still uses the larger fractional share once the move is long enough to need it", () => {
+		// Enough clear travel to reach AUTO_MOVE_CAP_MM's 200 mm cap, long enough that its own 30% rest
+		// share already exceeds AUTO_REST_MIN_S — the floor must not shrink it back down.
+		const longAxis = { letter: "Y", min: 0, max: 400, position: 200, homed: true };
+		const plan = planCaptureProfile(coupled(longAxis), 6000, 2000, 2000, 2);
+		if ("error" in plan) throw new Error("expected a plan");
+		const fractionalOnly = plan.moveTimeS / 0.7 - plan.moveTimeS; // the 30% share alone would have given
+		expect(fractionalOnly).toBeGreaterThan(AUTO_REST_MIN_S);
+		expect(plan.restTimeS).toBeCloseTo(fractionalOnly, 6);
+	});
+
+	it("lowers the derived rate as a result — the knock-on that also reduces truncation risk (§5)", () => {
+		const shortAxis = { letter: "Y", min: 0, max: 50, position: 25, homed: true };
+		const withFloor = planCaptureProfile(coupled(shortAxis), 6000, 2000, 2000, 2);
+		if ("error" in withFloor) throw new Error("expected a plan");
+		// Without AUTO_REST_MIN_S the fractional-only window would derive a much higher rate for the same
+		// move; recompute it directly rather than re-deriving the constant, to avoid asserting a tautology.
+		const fractionalWindowS = withFloor.moveTimeS / 0.7;
+		const fractionalOnlyRate = 2000 / fractionalWindowS;
+		expect(withFloor.sampleRateHz).toBeLessThan(fractionalOnlyRate);
+	});
+});
+
+describe("rateCeilingForCapture (docs/PLAN-capture-window.md §5)", () => {
+	it("matches the board ceiling exactly for a single-column capture", () => {
+		expect(rateCeilingForCapture("MB6HC", 1)).toBe(AUTO_RATE_CEILING_HZ);
+	});
+
+	// The real failure this exists to prevent: 17 columns at ~4167 Hz (~71k values/s) truncated
+	// intermittently on a real Duet 3 1HCL — a rate the board's own ceiling alone would have allowed.
+	it("lowers the ceiling for a full auto-tune capture (17 columns) below the board's own rate ceiling", () => {
+		const ceiling = rateCeilingForCapture("MB6HC", 17);
+		expect(ceiling).toBeLessThan(AUTO_RATE_CEILING_HZ);
+		expect(ceiling).toBeCloseTo(AUTO_VALUE_RATE_CEILING / 17, 5);
+	});
+
+	it("never drops the ceiling below AUTO_RATE_FLOOR_HZ, however many columns are requested", () => {
+		expect(rateCeilingForCapture("MB6HC", 1000)).toBe(AUTO_RATE_FLOOR_HZ);
+	});
+
+	it("still applies the board's own (lower) ceiling first when that's the tighter constraint", () => {
+		// RP2350's 500 Hz ceiling is already below what 3 columns' bandwidth allows, so it should win.
+		expect(rateCeilingForCapture("MNBN17R1_5", 3)).toBe(rateCeilingForBoard("MNBN17R1_5"));
+	});
+
+	it("treats zero/negative columns as no bandwidth constraint — just the board's own ceiling", () => {
+		expect(rateCeilingForCapture("MB6HC", 0)).toBe(AUTO_RATE_CEILING_HZ);
 	});
 });
 

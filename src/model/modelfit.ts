@@ -32,7 +32,7 @@
 import { P_TERM_RAIL } from "./analysis";
 import { P_MAX, type SignalAttempt } from "./autotune";
 import type { PidConfig } from "./m569";
-import { describeSignal, signalCost, signalUnstable, type TuneSignal } from "./signal";
+import { comparableCost, describeSignal, signalUnstable, type TuneSignal } from "./signal";
 import {
 	captureMedian, clampTerm, SEED_START, SETTLE_DELAY_MS, verifyAccepted, type TuneEffects,
 } from "./tuneShared";
@@ -153,7 +153,11 @@ export async function identifyModelFitP(
 	}
 	// Flat tail: no rail, no trend — the best stable reading IS the measurement. Use it directly.
 	if (attempts.length) {
-		const best = attempts.reduce((acc, a) => (signalCost(a.signal) < signalCost(acc.signal) ? a : acc), attempts[0]);
+		// comparableCost, not plain signalCost: ranking a mixed set of judgeable/unjudgeable rest tails on
+		// the full cost lets an unjudgeable one win purely by contributing nothing — see
+		// signalCostNoEffort's doc comment and docs/PLAN-capture-window.md §3.
+		const cost = comparableCost(attempts.map((a) => a.signal));
+		const best = attempts.reduce((acc, a) => (cost(a.signal) < cost(acc.signal) ? a : acc), attempts[0]);
 		effects.log(`Model fit: rail not reached and no rising accel-peak trend — using the best measured reading directly (P=${best.value}).`);
 		return { result: { pRailOnset: best.value, pStar: best.value, basis: "best-measured" }, attempts };
 	}

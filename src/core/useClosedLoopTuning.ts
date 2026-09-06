@@ -26,7 +26,7 @@ import { buildReport, downloadReport } from "dwc-plugin-runtime/diagnostics";
 
 import { isMachineUnsafeForTuning, type HostAdapter } from "./host";
 import { evaluateTune, gradeColor, severityColor, severityIcon, type Term, type TuneEvaluation } from "../model/evaluate";
-import { CAPTURE_DIR, CONFIG_FILE, DOCS, LS_STATE, PLUGIN_ID } from "../model/constants";
+import { ACCEL_CAPTURE_DIR, CAPTURE_DIR, CONFIG_FILE, DOCS, LS_STATE, PLUGIN_ID } from "../model/constants";
 import { upsertTuneBlock } from "../model/config";
 import { stepJumpDistanceMm, stepJumpFeedMmPerMin } from "../model/scale";
 import {
@@ -34,15 +34,22 @@ import {
 	CALIBRATION_MOVES, CAPTURE_VARIABLES, DEFAULT_MODE_D, ENCODER_TYPES, MODE_LABELS,
 	parsePidReply, type CalibrationMove, type EncoderType, type LoopMode, type PidConfig,
 } from "../model/m569";
-import { parseCapture, type ParsedCapture } from "../model/csv";
-import { analyzeCapture, type StepMetrics } from "../model/analysis";
+import { achievedRateHz, parseCapture, type ParsedCapture } from "../model/csv";
+import { analyzeCapture, buildSeries, segmentMove, type StepMetrics } from "../model/analysis";
 import {
 	CENTER_TOLERANCE_MM, CENTERING_FEED_MM_MIN, DEFAULT_MARGIN_MM,
-	getAxisLimits, midpoint, planCaptureProfile, planCoupledSymmetricMove, rateCeilingForBoard, type CoupledAxisLimits,
+	getAxisLimits, midpoint, planCaptureProfile, planCoupledSymmetricMove, rateCeilingForBoard,
+	rateCeilingForCapture, type CoupledAxisLimits,
 } from "../model/limits";
 import { resolveMotionCoupling } from "../model/kinematics";
 import { WIZARD_STEPS, type Recommendation } from "../model/wizard";
 import { D_MAX } from "../model/autotune";
+import {
+	ACCEL_ASSUMED_RATE_HZ, accelSampleCount, buildAccelCaptureCommand, findAccelerometers, isAccelOnlyError,
+	type AccelerometerInfo,
+} from "../model/accelerometer";
+import { parseAccelCapture, type AccelCapture } from "../model/accelCsv";
+import { computeVibration, VIBRATION_MIN_COVERAGE, type Vibration } from "../model/vibration";
 import { computeTuneSignal, type TuneSignal } from "../model/signal";
 import {
 	runAutoTune as runAutoTuneCore,
@@ -123,6 +130,11 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		deleteCapturesAfterRead?: boolean;
 		/** Manual cap on D during auto-tune's sequential ramp; null/undefined = no extra cap. */
 		dCeiling?: number | null;
+		/** Arm an M956 accelerometer capture alongside every closed-loop capture, when one is available.
+		 *  Off by default: it writes an extra file per capture and most users have no accelerometer. */
+		recordVibration?: boolean;
+		/** User's explicit accelerometer choice (CAN address); null/undefined = auto-pick. */
+		selectedAccelerometerAddress?: number | null;
 	}
 	function loadState(): SavedState {
 		try { return JSON.parse(localStorage.getItem(LS_STATE) ?? "{}") as SavedState; } catch { return {}; }
@@ -157,6 +169,10 @@ export function useClosedLoopTuning(host: HostAdapter) {
 	// go through loadLatestCsv() below. Off by default (see SavedState.deleteCapturesAfterRead).
 	const deleteCapturesAfterRead = ref(saved.deleteCapturesAfterRead ?? false);
 
+	// Off by default: it writes an extra file per capture and most users have no accelerometer. See
+	// SavedState.recordVibration and captureRaw()'s use of accelerometerBoard/canRecordVibration below.
+	const recordVibration = ref(saved.recordVibration ?? false);
+
 	// Save the lightweight selections (not the captured CSV) whenever they change, debounced.
 	let saveTimer: ReturnType<typeof setTimeout> | undefined;
 	function persistState(): void {
@@ -173,11 +189,12 @@ export function useClosedLoopTuning(host: HostAdapter) {
 					seedRule: seedRule.value, seedLambda: seedLambda.value, medianOf: medianOf.value,
 					captureBudget: captureBudget.value, includeAllCsv: includeAllCsv.value,
 					deleteCapturesAfterRead: deleteCapturesAfterRead.value, dCeiling: dCeiling.value,
+					recordVibration: recordVibration.value, selectedAccelerometerAddress: selectedAccelerometerAddress.value,
 				} satisfies SavedState));
 			} catch { /* storage unavailable */ }
 		}, 300);
 	}
-	watch([step, wizardIndex, selectedDriver, currentMode, encoderType, modeD, pid, samples, sampleRate, moveMode, customMove, recordKeys, viewKeys, deleteCapturesAfterRead],
+	watch([step, wizardIndex, selectedDriver, currentMode, encoderType, modeD, pid, samples, sampleRate, moveMode, customMove, recordKeys, viewKeys, deleteCapturesAfterRead, recordVibration],
 		persistState, { deep: true });
 
 	// --- Auto-tune ---
@@ -405,6 +422,80 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		return (host.model() as any).boards?.find((b: any) => b && b.canAddress === addr) ?? null;
 	});
 
+	// --- Accelerometer / vibration (docs/PLAN-accelerometer.md §5, §8) ---
+	const accelerometers = computed(() => findAccelerometers(host.model()));
+	/** User's explicit choice from the accelerometer selector, by CAN address; null = auto-pick. Not
+	 *  persisted across a board being unplugged/renumbered — re-validated against the live list below on
+	 *  every read, so a stale saved address just falls back to auto-pick rather than silently misfiring. */
+	const selectedAccelerometerAddress = ref<number | null>(saved.selectedAccelerometerAddress ?? null);
+	// Declared after both existing persisted-settings watch arrays, so it gets its own — same effect,
+	// just one more line rather than restructuring either array.
+	watch(selectedAccelerometerAddress, persistState);
+	/** Prefer the user's explicit selection if it's still a real accelerometer; else the tuned driver's
+	 *  own board if it has one; else the first available. Confirmed in the field: the accelerometer is
+	 *  often on a DIFFERENT board from the driver being tuned, so auto-pick must never assume they match. */
+	const accelerometerBoard = computed<AccelerometerInfo | null>(() => {
+		const all = accelerometers.value;
+		if (all.length === 0) { return null; }
+		const chosen = all.find((a) => a.boardAddress === selectedAccelerometerAddress.value);
+		if (chosen) { return chosen; }
+		const own = selectedBoard.value?.canAddress;
+		return all.find((a) => a.boardAddress === own) ?? all[0];
+	});
+	/**
+	 * Set once the accelerometer has failed in a way that makes re-arming it a bad idea, which stops this
+	 * session arming it again. Two reasons to latch rather than just retry: a capture that never finished
+	 * may still hold the accelerometer ("Accelerometer is already collecting data" fails the NEXT M956,
+	 * and that M956 shares a line with the closed-loop capture), and a failure that repeats every capture
+	 * would otherwise cost ACCEL_WAIT_MS each time across a run of hundreds. Cleared by toggling
+	 * `recordVibration` off and on again — the natural "I've fixed it, try again" gesture.
+	 */
+	const accelDisabledReason = ref<string | null>(null);
+	/** Consecutive soft failures (arm rejected, read/parse failed) — a few are tolerated before latching
+	 *  off, since any one of them can be a one-off (e.g. a capture from BEFORE this session still finishing
+	 *  up on the accelerometer) rather than something actually wrong. */
+	let accelSoftFailures = 0;
+	const ACCEL_SOFT_FAILURE_LIMIT = 3;
+	function disableAccel(reason: string): void {
+		if (accelDisabledReason.value) { return; }
+		accelDisabledReason.value = reason;
+		log(`Vibration: ${reason} Vibration recording is off for the rest of this session — untick and re-tick "Record vibration" to try again.`);
+	}
+	function noteAccelSoftFailure(reason: string): void {
+		if (++accelSoftFailures >= ACCEL_SOFT_FAILURE_LIMIT) { disableAccel(`${reason} ${accelSoftFailures} times in a row.`); }
+		else { log(`Vibration: ${reason} Continuing without it for this capture.`); }
+	}
+	watch(recordVibration, () => { accelDisabledReason.value = null; accelSoftFailures = 0; accelRetryAfter = 0; });
+
+	/**
+	 * Backoff until this timestamp before arming the accelerometer again, set whenever RRF rejects an M956
+	 * arm (almost always "already collecting data" — see armAccel's caller). Found on real hardware: without
+	 * this, a capture that fails for an unrelated reason (e.g. the driver not yet tracking) retries
+	 * immediately, re-arms M956 while the FIRST attempt's capture is still genuinely running, gets rejected
+	 * again, and repeats every retry — burning the whole retry budget on an accelerometer problem instead of
+	 * ever getting a real tuning capture. Skipping the accelerometer for a few seconds after a rejection lets
+	 * that still-running capture actually finish.
+	 */
+	let accelRetryAfter = 0;
+	const ACCEL_ARM_BACKOFF_MS = 5000;
+
+	const canRecordVibration = computed(() =>
+		recordVibration.value && accelerometerBoard.value != null && accelDisabledReason.value == null);
+	/** The last accelerometer capture's raw per-axis series, for the vibration chart — a separate ref
+	 *  from `vibration` on the TuneSignal (that's the computed summary; this is what a chart needs to draw
+	 *  an actual trace). Null whenever the last attempt had no usable vibration data. */
+	const accelCapture = ref<AccelCapture | null>(null);
+	/** Metrics for the capture in `accelCapture`, so the chart can state what was measured (and how
+	 *  coarsely) rather than leaving the trace to be read by eye. Cleared alongside it. */
+	const lastVibration = ref<Vibration | null>(null);
+	/**
+	 * Real rate of the last accelerometer capture, from its trailer. M956 takes a sample COUNT, not a
+	 * rate, so the count has to be sized against an assumed rate — and getting that wrong low truncates
+	 * the capture. After the first successful read the rate is known, so every later capture is sized
+	 * exactly instead of against ACCEL_ASSUMED_RATE_HZ's deliberately-high guess.
+	 */
+	const lastAccelRateHz = ref<number | null>(null);
+
 	/** Safe capture-rate ceiling for the selected driver's board — applied to every capture path (manual
 	 * record, wizard step, auto-tune's own trapezoid move), not just the auto-sized one, since a
 	 * rate-constrained board would truncate on any of them at the default rate. See rateCeilingForBoard. */
@@ -441,6 +532,14 @@ export function useClosedLoopTuning(host: HostAdapter) {
 	const hasAxisSelected = computed(() => !!axisForDriver()?.letter);
 
 	let loggedCouplingFor: string | null = null;
+	/** Last capture profile actually logged (see captureRaw) — a plain string key, not the object itself,
+	 *  so a fresh CaptureProfile with identical numbers each cycle doesn't re-log. Reset per run alongside
+	 *  loggedCouplingFor. docs/PLAN-capture-window.md §6: this line is what would have shown "4167 Hz" for
+	 *  the auto-derived rate immediately, instead of requiring hand-decoded CSV timestamps to find it. */
+	let loggedProfileKey: string | null = null;
+	/** Whether this run has already warned that the firmware's achieved rate diverged from what was
+	 *  requested — once is enough; every capture repeating the same divergence would just be noise. */
+	let warnedAchievedRate = false;
 
 	/**
 	 * Every axis a G1 H2 move on the selected driver actually displaces, with travel limits AND the
@@ -550,9 +649,15 @@ export function useClosedLoopTuning(host: HostAdapter) {
 
 	// --- Recording ---
 	const canRecord = computed(() => !!selectedDriver.value && recordKeys.value.length > 0);
-	const capturePreview = computed(() => selectedDriver.value ? buildCaptureCommand(captureOptions()) : "");
+	// Shows the M956 too when vibration recording is armed, so the preview is what actually gets sent.
+	// A fixed placeholder filename keeps the preview stable rather than minting a new one every render.
+	const capturePreview = computed(() => selectedDriver.value
+		? buildCaptureCommand(captureOptions(armAccel(samples.value, effectiveSampleRate.value, "cl-<timestamp>.csv").alongside))
+		: "");
 
-	function captureOptions() {
+	/** @param alongside an already-built M956 to share the line with — see armAccel. The preview passes a
+	 *  representative one so what's shown is what gets sent, without minting a new filename per render. */
+	function captureOptions(alongside?: string) {
 		return {
 			driver: selectedDriver.value ?? "",
 			samples: samples.value,
@@ -561,10 +666,14 @@ export function useClosedLoopTuning(host: HostAdapter) {
 			variables: recordKeys.value.map((k) => CAPTURE_VARIABLES.find((v) => v.key === k)?.id ?? 0),
 			manoeuvre: moveMode.value === "step" ? 64 : 0,
 			move: moveMode.value === "custom" ? (customMove.value || undefined) : undefined,
+			alongside,
 		};
 	}
 
 	let runsAtStart = -1;
+	/** Armed accelerometer capture for the manual Record button, collected by the runs watcher below —
+	 *  the manual path is split across a command and a watcher, so this can't be a local. */
+	let pendingRecordAccel: PendingAccel | null = null;
 	async function record(): Promise<void> {
 		if (!canRecord.value) { return; }
 		if (moveMode.value === "custom" && !customMove.value) {
@@ -578,21 +687,42 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		if (!(await ensureAxisReady(coupledForRecord))) { return; }
 		runsAtStart = selectedBoard.value?.closedLoop?.runs ?? -1;
 		recording.value = true;
+		// Manual captures arm the accelerometer exactly like the tuning ones do — same line, same trigger.
+		// Without this, ticking "Record vibration" and then pressing Record would silently do nothing.
+		if (canRecordVibration.value && accelerometerBoard.value) { await ensureAccelRateKnown(accelerometerBoard.value); }
+		const armed = armAccel(samples.value, effectiveSampleRate.value);
+		pendingRecordAccel = armed.pending;
 		try {
-			const reply = await host.sendCode(buildCaptureCommand(captureOptions()), { log: false });
-			if (reply && reply.startsWith("Error:")) {
-				host.notify("error", "Closed Loop Tuning", reply);
-				recording.value = false;
+			const reply = await host.sendCode(buildCaptureCommand(captureOptions(armed.alongside)), { log: false });
+			if (reply && /error:|warning:/i.test(reply)) {
+				if (armed.alongside && armed.pending && isAccelOnlyError(reply)) {
+					armed.pending.armFailed = true;
+					accelRetryAfter = Date.now() + ACCEL_ARM_BACKOFF_MS;
+					noteAccelSoftFailure(`The accelerometer rejected this capture's M956 (${reply.trim()}).`);
+					// Fall through: the actual capture command (not M956) is what this reply would be
+					// about if it had failed — see isAccelOnlyError — so keep waiting for it as normal.
+				} else {
+					host.notify("error", "Closed Loop Tuning", reply);
+					recording.value = false;
+					pendingRecordAccel = null;
+				}
 			}
 		} catch (e) {
 			console.warn("[ClosedLoopTuning] record failed", e);
 			recording.value = false;
+			pendingRecordAccel = null;
 		}
 	}
 
 	watch(() => selectedBoard.value?.closedLoop?.runs, async (runs) => {
 		if (!recording.value || runs == null || runs === runsAtStart) { return; }
-		await loadLatestCapture();
+		const c = await loadLatestCapture();
+		const pending = pendingRecordAccel;
+		pendingRecordAccel = null;
+		// Clears the previous trace either way — see collectAccel. Without this a manual capture would sit
+		// next to the vibration chart from whatever ran before it, looking like it belonged to this move.
+		if (c) { await collectAccel(pending, c, effectiveSampleRate.value); }
+		else { accelCapture.value = null; lastVibration.value = null; }
 		recording.value = false;
 	});
 
@@ -619,9 +749,10 @@ export function useClosedLoopTuning(host: HostAdapter) {
 	}
 
 	/** Manual record path: load newest CSV and analyse it as a step response. */
-	async function loadLatestCapture(): Promise<void> {
+	async function loadLatestCapture(): Promise<ParsedCapture | null> {
 		const c = await loadLatestCsv();
 		if (c) { metrics.value = analyzeCapture(c, effectiveSampleRate.value); }
+		return c;
 	}
 
 	const availableViewVars = computed(() => CAPTURE_VARIABLES.filter((v) => capture.value && capture.value.columns[v.header]));
@@ -701,6 +832,20 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		return false;
 	}
 
+	/** Like waitForRuns, but for `boards[n].accelerometer.runs` on the accelerometer's OWN board — which
+	 *  is frequently not the board being tuned (docs/PLAN-accelerometer.md §5.3). */
+	async function waitForAccelRuns(boardAddress: number, startRuns: number, timeoutMs: number): Promise<boolean> {
+		const t0 = Date.now();
+		while (Date.now() - t0 < timeoutMs) {
+			if (autoCancel.value) { return false; }
+			const board = (host.model() as any)?.boards?.find((b: any) => b && b.canAddress === boardAddress);
+			const r = board?.accelerometer?.runs;
+			if (r != null && r !== startRuns) { return true; }
+			await delay(200);
+		}
+		return false;
+	}
+
 	const varIds = (keys: Array<string>) => keys.map((k) => CAPTURE_VARIABLES.find((v) => v.key === k)?.id ?? 0);
 
 	/** Every recordable variable — used for the auto-generated captures (wizard step, auto-tune's own
@@ -720,14 +865,28 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		if (viewKeys.value.length === 0) { viewKeys.value = defaults; }
 	}
 
-	/** Run a capture command (built directly, not from the user's manual settings), wait for it to finish, load the CSV. */
-	async function runCapture(opts: Parameters<typeof buildCaptureCommand>[0]): Promise<ParsedCapture | null> {
+	/**
+	 * Run a capture command (built directly, not from the user's manual settings), wait for it to finish,
+	 * load the CSV. `accel`, when given, is the accelerometer armed on the SAME line via `opts.alongside` —
+	 * passed through so an M956-only rejection (see isAccelOnlyError) can be handled as a vibration-only
+	 * problem, marking `accel.armFailed` and backing off, rather than failing the whole tuning capture that
+	 * the M569.5 part of this same line most likely still completed successfully.
+	 */
+	async function runCapture(opts: Parameters<typeof buildCaptureCommand>[0], accel?: PendingAccel | null): Promise<ParsedCapture | null> {
 		const startRuns = selectedBoard.value?.closedLoop?.runs ?? -1;
 		const reply = await host.sendCode(buildCaptureCommand(opts), { log: false });
-		if (reply && reply.startsWith("Error:")) {
-			host.notify("error", "Closed Loop Tuning", reply);
-			log(`Firmware rejected the capture: ${reply}`);
-			return null;
+		if (reply && /error:|warning:/i.test(reply)) {
+			if (opts.alongside && accel && isAccelOnlyError(reply)) {
+				accel.armFailed = true;
+				accelRetryAfter = Date.now() + ACCEL_ARM_BACKOFF_MS;
+				noteAccelSoftFailure(`The accelerometer rejected this capture's M956 (${reply.trim()}).`);
+				// Fall through: M569.5 and the move are not what errored (see isAccelOnlyError), so this
+				// capture almost certainly still ran — wait for it exactly as if nothing had gone wrong.
+			} else {
+				host.notify("error", "Closed Loop Tuning", reply);
+				log(`Firmware rejected the capture: ${reply}`);
+				return null;
+			}
 		}
 		const captureMs = opts.rate > 0 ? (opts.samples / opts.rate) * 1000 : 4000;
 		if (!(await waitForRuns(startRuns, captureMs + 8000))) { log("Timed out waiting for the capture to finish — is the driver calibrated and in closed loop?"); return null; }
@@ -834,9 +993,167 @@ export function useClosedLoopTuning(host: HostAdapter) {
 	 * `rateHz` is what was actually used, for the caller to pass to analysis so it matches what the
 	 * firmware was told to capture at.
 	 */
+	/** Floor for the wait below; a capture sized for a long move gets proportionally longer (see armAccel). */
+	const ACCEL_WAIT_MS = 8000;
+
+	/** Download + parse one accelerometer capture. Returns null on ANY problem — never throws into the
+	 *  tuning path (docs/PLAN-accelerometer.md §5.4). */
+	async function loadAccelCapture(filename: string): Promise<AccelCapture | null> {
+		const path = `${ACCEL_CAPTURE_DIR}/${filename}`;
+		try {
+			const text = await host.download(path);
+			const parsed = parseAccelCapture(text);
+			// Delete before any early return: the file exists either way, and the failure cases are exactly
+			// the ones that repeat on every capture of a long run and would otherwise pile up on the SD card.
+			await maybeDeleteCapture(host, path, deleteCapturesAfterRead.value);
+			if (parsed.failed) { log("Vibration: the accelerometer reported a failed start — no vibration data for this capture."); return null; }
+			if (parsed.rateHz == null) { log("Vibration: no rate in the accelerometer file's trailer — skipping frequency analysis for this capture."); return null; }
+			if (parsed.notes.length > 1) { log(`Vibration: ${parsed.notes.length - 1} unreadable row(s) in the accelerometer capture were dropped.`); }
+			return parsed;
+		} catch (e) {
+			console.warn("[ClosedLoopTuning] loadAccelCapture failed", e);
+			log("Vibration: couldn't read the accelerometer capture — continuing without it.");
+			return null;
+		}
+	}
+
+	/** One armed accelerometer capture, waiting to be collected — see armAccel/collectAccel. */
+	interface PendingAccel {
+		boardAddress: number;
+		file: string;
+		startRuns: number;
+		waitMs: number;
+		/** Set by the caller once it learns RRF rejected THIS pending's own M956 (see isAccelOnlyError) —
+		 *  collectAccel then skips straight to "no data" instead of waiting on a file that was never
+		 *  created and might otherwise be confused with a stale capture's file finishing later. */
+		armFailed?: boolean;
+	}
+
+	/**
+	 * Learns the accelerometer's real rate via one cheap, short, STANDALONE M956 — run once before the
+	 * first real capture of a session, instead of guessing. This is what lets accelSampleCount size every
+	 * REAL capture from a known rate rather than ACCEL_ASSUMED_RATE_HZ's guess, which is the direct fix for
+	 * a guess that's wrong in either direction: too low truncates the capture (a `coverage` this plugin can
+	 * only detect after the fact); too high makes the accelerometer collect for far longer than the tuning
+	 * move needs, and a second capture arriving while the first is still running is exactly what produces
+	 * the "M956: ... is already collecting data" failure this whole function exists to avoid. Best-effort:
+	 * any problem just leaves `lastAccelRateHz` null and callers fall back to the guess, same as before this
+	 * existed — never throws, never blocks vibration recording from working at all.
+	 */
+	async function ensureAccelRateKnown(board: AccelerometerInfo): Promise<void> {
+		if (lastAccelRateHz.value != null) { return; }
+		const PROBE_SAMPLES = 50; // just enough to reach the trailer; small so even a genuinely slow real rate returns quickly
+		const file = `probe-${Date.now()}.csv`;
+		const startRuns = board.runs;
+		try {
+			const reply = await host.sendCode(
+				buildAccelCaptureCommand({ device: `${board.boardAddress}.0`, samples: PROBE_SAMPLES, activate: 0, filename: file }),
+				{ log: false },
+			);
+			if (reply && /error:|warning:/i.test(reply)) {
+				log(`Vibration: couldn't measure the accelerometer's rate (${reply.trim()}) — sizing the first capture from a default guess instead.`);
+				accelRetryAfter = Date.now() + ACCEL_ARM_BACKOFF_MS;
+				return;
+			}
+			// Unlike the real capture's wait, this has no closed-loop move to size against — it has to
+			// tolerate a genuinely slow real rate (a handful of Hz), since not knowing that rate yet is
+			// the whole reason this function exists.
+			if (!(await waitForAccelRuns(board.boardAddress, startRuns, 15000))) {
+				log("Vibration: the accelerometer's rate probe didn't finish in time — sizing the first capture from a default guess instead.");
+				return;
+			}
+			const parsed = await loadAccelCapture(file);
+			if (parsed?.rateHz != null) {
+				lastAccelRateHz.value = parsed.rateHz;
+				log(`Vibration: measured the accelerometer's real rate at ${parsed.rateHz} Hz.`);
+			}
+		} catch (e) {
+			console.warn("[ClosedLoopTuning] ensureAccelRateKnown failed", e);
+		}
+	}
+
+	/**
+	 * Build the M956 to put on the same line as a closed-loop capture, when vibration recording is on and
+	 * usable. Returns the command plus what collectAccel() needs to pick the result up afterwards.
+	 * `alongside` is undefined whenever nothing should be armed, so every caller can pass it straight
+	 * through without branching. Callers should `await ensureAccelRateKnown(board)` first — this stays
+	 * synchronous so `capturePreview` (a computed) can call it without awaiting a probe round-trip.
+	 */
+	function armAccel(clSamples: number, clRateHz: number, file = `cl-${Date.now()}.csv`): { alongside?: string; pending: PendingAccel | null } {
+		const board = canRecordVibration.value ? accelerometerBoard.value : null;
+		if (!board) { return { alongside: undefined, pending: null }; }
+		if (Date.now() < accelRetryAfter) { return { alongside: undefined, pending: null }; }
+		// Once a real rate has been read back from a trailer, size against THAT; only ever falls back to
+		// the deliberately-high assumption if ensureAccelRateKnown's probe couldn't complete.
+		const rate = lastAccelRateHz.value ?? ACCEL_ASSUMED_RATE_HZ;
+		const samples = accelSampleCount(clSamples, clRateHz, rate);
+		return {
+			alongside: buildAccelCaptureCommand({ device: `${board.boardAddress}.0`, samples, activate: 0, filename: file }),
+			// The wait has to outlast the capture itself, which is longer than the move by ACCEL_WINDOW_MARGIN
+			// and longer still if the real rate is below the assumed one. Doubling the expected duration
+			// leaves room for the file write on top.
+			pending: { boardAddress: board.boardAddress, file, startRuns: board.runs, waitMs: Math.max(ACCEL_WAIT_MS, (samples / rate) * 2000 + 4000) },
+		};
+	}
+
+	/**
+	 * Collect an armed accelerometer capture and turn it into vibration metrics against the closed-loop
+	 * capture that ran alongside it. Always clears the previous run's chart data first — a stale trace
+	 * sitting next to a fresh closed-loop chart looks like it belongs to it. Never throws.
+	 */
+	async function collectAccel(pending: PendingAccel | null, cl: ParsedCapture, clRateHz: number): Promise<Vibration | undefined> {
+		accelCapture.value = null;
+		lastVibration.value = null;
+		if (!pending) { return undefined; }
+		if (pending.armFailed) { return undefined; } // RRF already told us nothing was captured — see isAccelOnlyError.
+
+		// The closed-loop file is already back by here, so the accelerometer's run counter has almost
+		// certainly advanced too — but wait explicitly rather than assume, then read it.
+		if (!(await waitForAccelRuns(pending.boardAddress, pending.startRuns, pending.waitMs))) {
+			// Latch immediately rather than counting up: the capture may still hold the accelerometer, and
+			// the next M956 shares its line with a closed-loop capture we must not put at risk.
+			if (!autoCancel.value) { disableAccel("the accelerometer capture didn't finish in time."); }
+			return undefined;
+		}
+		const parsed = await loadAccelCapture(pending.file);
+		if (!parsed) { noteAccelSoftFailure("The accelerometer capture failed to produce usable data"); return undefined; }
+		accelSoftFailures = 0;
+		lastAccelRateHz.value = parsed.rateHz;
+
+		const series = buildSeries(cl, clRateHz);
+		const seg = series ? segmentMove(series.target, series.time, clRateHz) : null;
+		if (!series || !seg) { return undefined; }
+		const vibration = computeVibration(parsed, series.time, seg.classes);
+		accelCapture.value = parsed;
+		lastVibration.value = vibration;
+		log(describeVibration(vibration, parsed));
+		return vibration;
+	}
+
+	/** The one-line vibration summary for the run log. Reports only regions that actually hold samples —
+	 *  an empty region's 0 g would otherwise read as "perfectly still" rather than "no data". */
+	function describeVibration(v: Vibration, parsed: AccelCapture): string {
+		const region = (name: string, r: typeof v.overall) => r.samples > 0 ? `${r.rmsG.toFixed(3)} g rms ${name}` : null;
+		const parts = [region("overall", v.overall), region("cruising", v.cruise), region("at rest", v.rest)].filter((p) => p != null);
+		let line = `Vibration: ${parts.join(", ")}`;
+		const d = v.overall;
+		if (d.dominantHz != null && d.dominantHzLow != null && d.dominantHzHigh != null) {
+			// Never the bare figure: at these rates the frequency is quantised into buckets wide enough to
+			// be mistaken for precision (vibration.ts MIN_LAG).
+			line += `, dominant ${d.dominantHz.toFixed(0)} Hz (${d.dominantHzLow.toFixed(0)}-${d.dominantHzHigh.toFixed(0)} Hz)`;
+		}
+		if (parsed.overflows > 0) { line += `, ${parsed.overflows} dropped samples`; }
+		if (v.coverage < VIBRATION_MIN_COVERAGE) {
+			line += `. The accelerometer only covered ${(v.coverage * 100).toFixed(0)}% of the capture, so the end of the move is missing`;
+		}
+		return `${line}.`;
+	}
+
 	interface RawCaptureResult {
 		capture: ParsedCapture;
 		rateHz: number;
+		/** Present only when vibration recording was on AND the accelerometer capture came back usable. */
+		vibration?: Vibration;
 	}
 
 	/**
@@ -857,9 +1174,27 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		const freshCoupled = coupledAxesForDriver();
 		if ("error" in freshCoupled) { log(`Tuning capture: ${freshCoupled.error}`); host.notify("error", "Closed Loop Tuning", freshCoupled.error); return null; }
 		const profile = planCaptureProfile(freshCoupled, avFeed.value, samples.value, sampleRate.value, marginMm.value, {
-			maxDistanceMm: avDistance.value, rateCeilingHz: captureRateCeiling.value,
+			maxDistanceMm: avDistance.value,
+			// Bandwidth-aware, not just the board's own rate ceiling: this capture records every available
+			// variable (ALL_CAPTURE_KEYS), and bandwidth is rate × columns — a rate the board could sustain
+			// with a handful of columns can still overrun its buffer with all 17 (docs/PLAN-capture-window.md
+			// §5, 10 of 82 real captures truncated this way).
+			rateCeilingHz: rateCeilingForCapture(selectedBoard.value?.shortName ?? null, ALL_CAPTURE_KEYS.length),
 		});
 		if ("error" in profile) { log(`Tuning capture: ${profile.error}`); host.notify("error", "Closed Loop Tuning", profile.error); return null; }
+
+		// Logged once per distinct profile, not once per capture — dozens of otherwise-identical lines is
+		// why the log is capped. This one line is the direct fix for a real forum report that needed a day
+		// of hand-decoded CSV timestamps to discover the auto-derived rate was 4167 Hz, not the UI's 2000
+		// (docs/PLAN-capture-window.md §6) — R IS honoured; auto mode just doesn't use the UI's rate box.
+		const profileKey = `${profile.samples}@${profile.sampleRateHz.toFixed(1)}/${profile.distance.toFixed(3)}`;
+		if (profileKey !== loggedProfileKey) {
+			loggedProfileKey = profileKey;
+			log(`Capture profile: ${profile.samples} samples @ ${profile.sampleRateHz.toFixed(0)} Hz `
+				+ `(${(profile.samples / profile.sampleRateHz).toFixed(3)} s window, ${profile.moveTimeS.toFixed(3)} s move, `
+				+ `${profile.restTimeS.toFixed(3)} s rest), ${profile.distance.toFixed(1)} mm at F${avFeed.value}`
+				+ `${profile.limitedBy ? `, limited by ${profile.limitedBy}` : ""}.`);
+		}
 
 		// Centre the MOVE on every coupled axis's own midpoint, not just the nominal one: pre-position ALL
 		// of them via one normal, soft-limit-respecting multi-axis G1 before the H2 tuning move — this is
@@ -882,21 +1217,53 @@ export function useClosedLoopTuning(host: HostAdapter) {
 
 		const signedDist = profile.sign * profile.distance;
 		ensureViewKeys(["measuredMotorSteps", "targetMotorSteps", "pidPTerm"]);
+
+		// Arm the accelerometer on the SAME line as the closed-loop capture and the move. Confirmed
+		// working on real hardware (docs/PLAN-accelerometer.md §12.1); both captures start together
+		// closely enough to share a t=0 (§12.2), and running both showed no measurable effect on the
+		// closed-loop data (§12.4).
+		if (canRecordVibration.value && accelerometerBoard.value) { await ensureAccelRateKnown(accelerometerBoard.value); }
+		const { alongside, pending } = armAccel(profile.samples, profile.sampleRateHz);
+
 		const c = await runCapture({
 			// `profile.samples`, not `samples.value` — the rate ceiling can reduce the effective count
 			// (see planCaptureProfile / CaptureProfile.samples); using the raw setting here would ask the
 			// firmware for more samples than the (now lower) rate can actually spread across this window.
 			driver: selectedDriver.value ?? "", samples: profile.samples, activate: 1, rate: profile.sampleRateHz,
-			variables: varIds(ALL_CAPTURE_KEYS), manoeuvre: 0,
+			variables: varIds(ALL_CAPTURE_KEYS), manoeuvre: 0, alongside,
 			move: `G91 G1 H2 ${axis}${signedDist.toFixed(3)} F${avFeed.value} G90`,
-		});
+		}, pending);
 		try { await host.sendCode(`G91 G1 H2 ${axis}${(-signedDist).toFixed(3)} F${avFeed.value} G90`, { log: false }); } catch { /* ignore return-move error */ }
-		return c ? { capture: c, rateHz: profile.sampleRateHz } : null;
+
+		// One-time sanity check per run: is the firmware actually sampling at what was requested? A
+		// divergence here is not necessarily wrong (a board's own clock can quantise the rate slightly),
+		// only worth a warning past 20% — see docs/PLAN-capture-window.md §6.
+		if (c && !warnedAchievedRate) {
+			const achieved = achievedRateHz(c);
+			if (achieved != null && Math.abs(achieved - profile.sampleRateHz) / profile.sampleRateHz > 0.2) {
+				warnedAchievedRate = true;
+				log(`Note: this board sampled at ~${achieved.toFixed(0)} Hz, not the requested ${profile.sampleRateHz.toFixed(0)} Hz. `
+					+ `This can be expected (e.g. the board quantises the rate) but affects how much rest time each capture actually gets.`);
+			}
+		}
+
+		// Only collect when the closed-loop capture itself came back — with no `c` there's nothing to
+		// correlate against, and waiting would just add this capture's timeout to an already-failed attempt.
+		// Either way the old trace goes: it belongs to a previous move, not this one.
+		if (!c) { accelCapture.value = null; lastVibration.value = null; return null; }
+		const vibration = await collectAccel(pending, c, profile.sampleRateHz);
+		return { capture: c, rateHz: profile.sampleRateHz, vibration };
 	}
 
 	async function captureSignal(): Promise<TuneSignal | null> {
 		const result = await captureRaw();
-		return result ? computeTuneSignal(result.capture, result.rateHz) : null;
+		if (!result) { return null; }
+		const signal = computeTuneSignal(result.capture, result.rateHz);
+		// Post-hoc attachment, same pattern as pTermSatDuty/restEffort elsewhere in this codebase —
+		// vibration is computed in captureRaw() (it needs the accelerometer capture, which computeTuneSignal
+		// has no reason to know about) and only needs to ride along on the result for the report/UI to see.
+		if (signal && result.vibration) { signal.vibration = result.vibration; }
+		return signal;
 	}
 
 	/** Final-verification grading: a fresh capture judged the same way the Step-5 evaluation panel does. */
@@ -991,6 +1358,8 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		// The coupling line is logged once per driver; this run just cleared the log it was written to, so
 		// re-arm it or the 2nd+ run on a driver produces a report with no kinematics context at all.
 		loggedCouplingFor = null;
+		loggedProfileKey = null;
+		warnedAchievedRate = false;
 		resetStageStates();
 		ensureViewKeys(["measuredMotorSteps", "targetMotorSteps", "currentError"]);
 		const totalCycles = Math.max(1, Math.round(cycles.value || 1));
@@ -1185,6 +1554,7 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		tuneMethod, estimatedMoves, identifyMethod, modelFitBackoff, seedRule, seedLambda,
 		medianOf, captureBudget, cycles, avDistance, avFeed, marginMm, axisTravelInfo,
 		stageStates, tuneSession, includeAllCsv, downloadTuningReport, dCeiling, D_MAX,
+		recordVibration, accelerometers, selectedAccelerometerAddress, accelCapture, accelDisabledReason, lastVibration,
 
 		// Manual capture & the shared chart.
 		samples, sampleRate, moveMode, customMove, recordKeys, canRecord, capturePreview, record,

@@ -32,6 +32,17 @@ describe("capture command", () => {
 		const cmd = buildCaptureCommand({ driver: "50.0", samples: 2000, activate: 1, rate: 0, variables: [2, 4, 8], manoeuvre: 0, move: "G91 G1 H2 X50 F6000 G90" });
 		expect(cmd).toBe("M569.5 P50.0 S2000 A1 R0 D14 V0 G91 G1 H2 X50 F6000 G90");
 	});
+	it("places an `alongside` command (e.g. arming an accelerometer) after V0 and before the move — confirmed working as one line on real hardware (docs/PLAN-accelerometer.md §12.1)", () => {
+		const cmd = buildCaptureCommand({
+			driver: "124.0", samples: 2000, activate: 1, rate: 1000, variables: [2, 4, 8, 32], manoeuvre: 0,
+			alongside: 'M956 P121.0 S1000 A0 F"t.csv"', move: "G91 G1 H2 X20 F6000 G90",
+		});
+		expect(cmd).toBe('M569.5 P124.0 S2000 A1 R1000 D46 V0 M956 P121.0 S1000 A0 F"t.csv" G91 G1 H2 X20 F6000 G90');
+	});
+	it("is byte-for-byte unchanged when `alongside` is omitted — the existing capture path must never regress", () => {
+		const withoutAlongside = { driver: "50.0", samples: 2000, activate: 1 as const, rate: 0, variables: [2, 4, 8], manoeuvre: 0, move: "G91 G1 H2 X50 F6000 G90" };
+		expect(buildCaptureCommand(withoutAlongside)).toBe("M569.5 P50.0 S2000 A1 R0 D14 V0 G91 G1 H2 X50 F6000 G90");
+	});
 });
 
 describe("calibration command", () => {

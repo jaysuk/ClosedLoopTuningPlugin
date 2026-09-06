@@ -9,9 +9,9 @@ import { describe, expect, it } from "vitest";
 
 import { parseCapture } from "../model/csv";
 import {
-	computeTuneSignal, medianSignal, oscillationAmplitude, oscillationPeriod, signalCost, signalDiverging,
-	signalUnstable, significantlyBetter, significantlyBetterForTerm, termAwareCost, withinNoise,
-	type TuneSignal,
+	comparableCost, computeTuneSignal, medianSignal, oscillationAmplitude, oscillationPeriod, signalCost,
+	signalCostNoEffort, signalDiverging, signalUnstable, significantlyBetter, significantlyBetterForTerm,
+	termAwareCost, withinNoise, type TuneSignal,
 } from "../model/signal";
 
 const FIXTURE_DIR = path.join(__dirname, "fixtures");
@@ -202,6 +202,50 @@ describe("signalCost", () => {
 	});
 });
 
+// docs/PLAN-capture-window.md §3: "contributes nothing" above is exactly the defect in a COMPARISON —
+// 0 is the best attainable value of the rest-effort term, so a capture whose tail could not be judged
+// outscores one that was measured and found perfectly settled. comparableCost/signalCostNoEffort fix
+// this by dropping the term from BOTH sides of a comparison whenever either one can't be judged.
+describe("signalCostNoEffort / comparableCost", () => {
+	// Real dithering capture vs. the SAME capture with only its tail marked unjudgeable — nothing
+	// physically different. These are exact measured numbers, not estimates: if either fails, the
+	// implementation drifted, not the fixture.
+	const dither = signalOf("hold-dither-i0.csv");
+	const unjudged: TuneSignal = { ...dither, restEffort: { ...dither.restEffort, restTailValid: false } };
+
+	it("does not let an unmeasurable rest tail outscore the very same capture measured", () => {
+		// The bug, pinned: on the full cost the unjudgeable copy looks better (lower) by the entire
+		// rest-effort term, purely because it can't be judged rather than because anything improved.
+		expect(signalCost(dither)).toBeCloseTo(0.5264, 3);
+		expect(signalCost(unjudged)).toBeCloseTo(0.3248, 3);
+		expect(signalCost(unjudged)).toBeLessThan(signalCost(dither));
+		// The fix: compared against each other, both are judged only on terms both actually have — equal.
+		const cost = comparableCost([dither, unjudged]);
+		expect(cost(unjudged)).toBeCloseTo(cost(dither), 10);
+	});
+
+	it("still uses the full cost when every candidate has a measurable tail", () => {
+		const settled = signalOf("hold-settled-i23.csv");
+		expect(comparableCost([dither, settled])).toBe(signalCost);
+	});
+
+	it("falls back to the effort-free cost as soon as ANY candidate is unjudgeable", () => {
+		const settled = signalOf("hold-settled-i23.csv");
+		expect(comparableCost([settled, unjudged])).toBe(signalCostNoEffort);
+	});
+
+	it("signalCostNoEffort matches signalCost when there is no rest-effort contribution to drop", () => {
+		const base = signalOf("move250-stable-best.csv");
+		const zeroRipple: TuneSignal = { ...base, restEffort: { ...base.restEffort, restTailValid: true, pTermRestRipple: 0 } };
+		expect(signalCostNoEffort(zeroRipple)).toBeCloseTo(signalCost(zeroRipple), 10);
+	});
+
+	it("is Infinity for an unstable capture, same as signalCost", () => {
+		const unstable = signalOf("move250-runaway.csv");
+		expect(signalCostNoEffort(unstable)).toBe(Infinity);
+	});
+});
+
 describe("significantlyBetter / withinNoise", () => {
 	it("says an unstable capture is never significantly better", () => {
 		const stable = signalOf("move250-stable-best.csv");
@@ -226,6 +270,16 @@ describe("significantlyBetter / withinNoise", () => {
 		const base: TuneSignal = sigLike(signalOf("move250-stable-best.csv"), { restNoise: 0.2 });
 		const tiny: TuneSignal = { ...base, stats: { ...base.stats, moveRms: base.stats.moveRms + 0.001 } };
 		expect(significantlyBetter(base, tiny)).toBe(false);
+	});
+
+	// docs/PLAN-capture-window.md §3 — the actual field bug: a real forum report of the same axis, same
+	// PID, same three-cycle auto-tune run producing wildly different results run to run. Both assertions
+	// here return TRUE before the comparableCost fix (verified against real data 2026-09-06) — that gap
+	// is the whole defect, and it's reached through exactly the functions autorun.ts/optimize.ts call.
+	it("does not accept a candidate that only 'improves' because its rest tail became unjudgeable", () => {
+		const dither = signalOf("hold-dither-i0.csv");
+		const unjudged: TuneSignal = { ...dither, restEffort: { ...dither.restEffort, restTailValid: false } };
+		expect(significantlyBetter(dither, unjudged)).toBe(false);
 	});
 });
 
@@ -256,6 +310,24 @@ describe("termAwareCost / significantlyBetterForTerm", () => {
 		const s2 = { ...base, pTermCruiseMean: 200, pTermAccelPeak: 220 };
 		expect(termAwareCost("p", s1)).toBeCloseTo(termAwareCost("p", s2), 6);
 		expect(termAwareCost("d", s1)).toBeCloseTo(termAwareCost("d", s2), 6);
+	});
+
+	it("defaults to signalCost as its base, same as before the `base` parameter existed", () => {
+		expect(termAwareCost("p", base)).toBeCloseTo(signalCost(base), 10);
+	});
+
+	it("folds a custom base cost in instead of signalCost when one is given", () => {
+		expect(termAwareCost("p", base, signalCostNoEffort)).toBeCloseTo(signalCostNoEffort(base), 10);
+	});
+
+	// docs/PLAN-capture-window.md §3 — significantlyBetterForTerm is what autorun.ts/optimize.ts's A/V
+	// probing actually calls (four sites), so this is the test that proves THAT path is fixed, not just
+	// the cost helpers underneath it. True before the comparableCost fix, same as significantlyBetter above.
+	it("does not accept a term probe that only 'improves' because its rest tail became unjudgeable", () => {
+		const dither = signalOf("hold-dither-i0.csv");
+		const unjudged: TuneSignal = { ...dither, restEffort: { ...dither.restEffort, restTailValid: false } };
+		expect(significantlyBetterForTerm("v", dither, unjudged)).toBe(false);
+		expect(significantlyBetterForTerm("a", dither, unjudged)).toBe(false);
 	});
 
 	it("regression: refuses to call a V change 'better' when it only nudges generic cost within noise while V's own target gets far worse (the runaway-V bug)", () => {

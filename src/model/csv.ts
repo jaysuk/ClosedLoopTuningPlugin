@@ -89,3 +89,26 @@ export function timeAxisSeconds(capture: ParsedCapture, sampleRateHz: number): A
 	const step = sampleRateHz > 0 ? 1 / sampleRateHz : 1;
 	return Array.from({ length: capture.rowCount }, (_, i) => i * step);
 }
+
+/**
+ * Rate the firmware actually sampled at, from the capture's own Timestamp column (ms) — median of the
+ * inter-sample gaps, not mean, so a handful of large gaps (e.g. right after the move, when the encoder
+ * ISR briefly stalls) can't drag the estimate down. Null when the column is missing or too short to judge.
+ *
+ * The requested rate passed into `buildCaptureCommand` is a REQUEST — RRF is free to derive its own
+ * (auto mode does exactly this, deliberately, in `planCaptureProfile`). This is what actually happened,
+ * for comparing against that request. See docs/PLAN-capture-window.md §6.
+ */
+export function achievedRateHz(capture: ParsedCapture): number | null {
+	const ts = column(capture, "Timestamp");
+	if (!ts || ts.length < 10) { return null; }
+	const gaps: Array<number> = [];
+	for (let i = 1; i < ts.length; i++) {
+		const dt = ts[i] - ts[i - 1];
+		if (Number.isFinite(dt) && dt > 0) { gaps.push(dt); }
+	}
+	if (gaps.length < 5) { return null; }
+	gaps.sort((a, b) => a - b);
+	const median = gaps[Math.floor(gaps.length / 2)];
+	return median > 0 ? 1000 / median : null;
+}

@@ -17,6 +17,7 @@ import { analyzeMove, buildSeries, computeRestEffort, P_TERM_RAIL, segmentMove, 
 import type { ParsedCapture } from "./csv";
 import { autocorrelationPeriod } from "./dsp";
 import { tuneStats, type TuneStats } from "./evaluate";
+import type { Vibration } from "./vibration";
 
 export interface TuneSignal {
 	/** Error statistics per move region (motor steps) — see evaluate.ts. */
@@ -42,6 +43,10 @@ export interface TuneSignal {
 	/** Standstill control-effort ripple (P/D/output) — see analysis.ts. Distinct from postMoveOsc
 	 *  above: that only counts RAILED hunting, this catches dither too small to ever rail. */
 	restEffort: RestEffort;
+	/** Accelerometer-measured vibration for this capture, when one was armed alongside it — see
+	 *  vibration.ts / docs/PLAN-accelerometer.md. Absent (not just invalid) when vibration recording was
+	 *  off or no accelerometer was available; never required by anything that reads a TuneSignal. */
+	vibration?: Vibration;
 }
 
 // Stability limits (exported for tests + transparency).
@@ -219,6 +224,37 @@ export function signalCost(s: TuneSignal): number {
 		+ COST_WEIGHT_REST_EFFORT * effortCost;
 }
 
+/**
+ * Whole-capture cost EXCLUDING the standstill rest-effort term — the same ordering `signalCost` gives when
+ * no candidate has a measurable rest tail.
+ *
+ * Exists because substituting 0 for an unmeasurable tail (which is what `signalCost` does) is not neutral
+ * in a COMPARISON: 0 is the best attainable value of that term, so a capture whose tail could not be
+ * judged outscores one that was measured and found perfectly settled. Verified against a real dithering
+ * capture (`hold-dither-i0.csv`): marking its own tail unjudgeable made `signalCost` read a 38% apparent
+ * improvement — well past `COST_RELATIVE_PLATEAU` — with nothing physically different about the capture.
+ * See docs/PLAN-capture-window.md §3.
+ */
+export function signalCostNoEffort(s: TuneSignal): number {
+	if (signalUnstable(s)) { return Infinity; }
+	const { stats } = s;
+	return stats.moveRms
+		+ COST_WEIGHT_OVERSHOOT * stats.settleOvershoot
+		+ COST_WEIGHT_BIAS * Math.abs(stats.restBias)
+		+ COST_WEIGHT_LAG * Math.abs(stats.cruiseLag)
+		+ COST_WEIGHT_RING * Math.max(0, stats.restRing - COST_RING_FREE);
+}
+
+/**
+ * The cost function to use when ranking `candidates` against each other: the full `signalCost` when every
+ * candidate has a measurable rest tail, and the effort-free variant when any of them does not. Ranking a
+ * mixed set on the full cost is what lets an unmeasurable capture win on a term it never earned — see
+ * `signalCostNoEffort`'s doc comment and docs/PLAN-capture-window.md §3.
+ */
+export function comparableCost(candidates: Array<TuneSignal>): (s: TuneSignal) => number {
+	return candidates.every((c) => c.restEffort.restTailValid) ? signalCost : signalCostNoEffort;
+}
+
 export const COST_RELATIVE_PLATEAU = 0.05;  // minimum fractional improvement to count as real
 export const COST_NOISE_K = 2;              // …or this many noise floors, whichever threshold is larger
 const COST_NOISE_FLOOR_MIN = 0.05;          // absolute floor (steps) when restNoise reads ~0
@@ -243,9 +279,11 @@ export function significantlyBetterBy(costFn: (s: TuneSignal) => number, prev: T
 	return improvement > threshold;
 }
 
-/** `significantlyBetterBy` against the whole-loop `signalCost` — the default comparator. */
+/** `significantlyBetterBy` against the whole-loop `signalCost` — the default comparator. Uses
+ *  `comparableCost` rather than `signalCost` directly so an unjudgeable rest tail on either side can't
+ *  manufacture an apparent improvement — see `signalCostNoEffort`. */
 export function significantlyBetter(prev: TuneSignal, cur: TuneSignal): boolean {
-	return significantlyBetterBy(signalCost, prev, cur);
+	return significantlyBetterBy(comparableCost([prev, cur]), prev, cur);
 }
 
 /** Neither attempt is a significant improvement over the other — treat them as tied. */
@@ -265,18 +303,22 @@ export function withinNoise(a: TuneSignal, b: TuneSignal): boolean {
 // metric is measured against, so a probe that makes a term's OWN target worse can't look like a win.
 const TERM_COST_WEIGHT = 2;
 
-export function termAwareCost(term: string, s: TuneSignal): number {
-	const base = signalCost(s);
-	if (!Number.isFinite(base)) { return base; }
-	if (term === "v") { return base + TERM_COST_WEIGHT * (Math.abs(s.pTermCruiseMean) / P_TERM_RAIL); }
-	if (term === "a") { return base + TERM_COST_WEIGHT * (s.pTermAccelPeak / P_TERM_RAIL); }
-	return base;
+/** @param base whole-loop cost to fold the term's own objective into — defaults to `signalCost` for a
+ *  single capture, but `significantlyBetterForTerm` passes `comparableCost([prev, cur])` so a pairwise
+ *  comparison can't be won by an unjudgeable rest tail (see `signalCostNoEffort`). */
+export function termAwareCost(term: string, s: TuneSignal, base: (x: TuneSignal) => number = signalCost): number {
+	const cost = base(s);
+	if (!Number.isFinite(cost)) { return cost; }
+	if (term === "v") { return cost + TERM_COST_WEIGHT * (Math.abs(s.pTermCruiseMean) / P_TERM_RAIL); }
+	if (term === "a") { return cost + TERM_COST_WEIGHT * (s.pTermAccelPeak / P_TERM_RAIL); }
+	return cost;
 }
 
 /** `significantlyBetterBy` against `termAwareCost` for the given term — use during refinement/package
  * optimisation so A/V can't drift on noise once their own real objective is at (or past) its optimum. */
 export function significantlyBetterForTerm(term: string, prev: TuneSignal, cur: TuneSignal): boolean {
-	return significantlyBetterBy((s) => termAwareCost(term, s), prev, cur);
+	const base = comparableCost([prev, cur]);
+	return significantlyBetterBy((s) => termAwareCost(term, s, base), prev, cur);
 }
 
 function median(values: Array<number>): number {
@@ -325,6 +367,10 @@ export function medianSignal(signals: Array<TuneSignal>): TuneSignal {
 			// and invalid measurements would itself be untrustworthy, so require most captures agree.
 			restTailValid: signals.filter((s) => s.restEffort.restTailValid).length * 2 > signals.length,
 		},
+		// Vibration is a report-only diagnostic overlay, never a decision input (docs/PLAN-accelerometer.md
+		// §11) — there's no meaningful way to "median" a whole region-split Vibration object across N
+		// repeated captures, so this just carries the first one that exists rather than combining them.
+		vibration: signals.find((s) => s.vibration)?.vibration,
 	};
 }
 
