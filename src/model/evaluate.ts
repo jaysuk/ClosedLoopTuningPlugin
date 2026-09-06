@@ -10,6 +10,7 @@
  */
 import { buildSeries, computeRestEffort, REST_EFFORT_RIPPLE_LIMIT, segmentMove } from "./analysis";
 import type { ParsedCapture } from "./csv";
+import type { Vibration } from "./vibration";
 
 export type Severity = "good" | "info" | "warn" | "bad";
 export type Grade = "excellent" | "good" | "fair" | "poor" | "unknown";
@@ -95,6 +96,23 @@ export const RING_WARN = 4;       // significant oscillation cycles after stop
 export const CRUISE_SPREAD_K = 3;
 const CRUISE_SPREAD_WARN_K = 6; // 2× the info-tier multiplier
 
+/**
+ * settle/tail RMS ratio above which post-move accelerometer vibration is called out. PROVISIONAL:
+ * measured 5.70x on a real ringing capture and 1.97x on a deliberately quiet one (n=2 — one positive, one
+ * negative), so this sits roughly midway. Report-only (see the `note` vs `add` distinction below), so a
+ * wrong call here costs a line of text, not a bad tune. See docs/PLAN-accelerometer.md §17.
+ */
+export const VIBRATION_RING_RATIO = 3.0;
+
+/**
+ * Minimum settled-tail RMS (g) before the ratio above is trusted. A ratio is only as meaningful as its
+ * denominator: a pathologically quiet tail would divide into an enormous, spurious ratio. Not reachable
+ * with real hardware — the quietest tail measured across four real captures was 0.0029 g with the motor
+ * off entirely — so this is a guard against a degenerate/stuck sensor channel, set an order of magnitude
+ * below that. See docs/PLAN-accelerometer.md §17.
+ */
+export const VIBRATION_TAIL_MIN_G = 0.0003;
+
 function mean(a: Array<number>): number { return a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0; }
 function std(a: Array<number>): number {
 	if (a.length < 2) { return 0; }
@@ -176,8 +194,14 @@ export function tuneStats(capture: ParsedCapture, sampleRateHz: number): TuneSta
 	};
 }
 
-/** Grade a capture and produce plain-language, actionable findings. */
-export function evaluateTune(capture: ParsedCapture, sampleRateHz: number): TuneEvaluation {
+/**
+ * Grade a capture and produce plain-language, actionable findings.
+ * @param vibration accelerometer measurements for this SAME capture, when one was armed alongside it
+ * (see vibration.ts / docs/PLAN-accelerometer.md). Optional and additive: every existing caller that
+ * omits it gets byte-identical behaviour to before this parameter existed — see the `note` vs `add`
+ * distinction below for how it stays report-only.
+ */
+export function evaluateTune(capture: ParsedCapture, sampleRateHz: number, vibration?: Vibration): TuneEvaluation {
 	const series = buildSeries(capture, sampleRateHz);
 	if (!series) {
 		return { grade: "unknown", score: 0, headline: "Couldn't read this capture — record Measured + Target Motor Steps.", findings: [], stats: empty };
@@ -187,6 +211,10 @@ export function evaluateTune(capture: ParsedCapture, sampleRateHz: number): Tune
 	let score = 100;
 	const penalise = (sev: Severity) => { score -= sev === "bad" ? 34 : sev === "warn" ? 15 : sev === "info" ? 3 : 0; };
 	const add = (f: Finding) => { findings.push(f); penalise(f.severity); };
+	/** Adds a finding that does NOT affect the score. For measurements from a sensor OUTSIDE the control
+	 *  loop — the accelerometer — which must never move an encoder-derived grade. `add` penalises; this
+	 *  deliberately does not. See docs/PLAN-accelerometer.md §17.4. */
+	const note = (f: Finding) => { findings.push(f); };
 
 	if (!s.moved) {
 		const sev: Severity = Math.abs(s.restBias) > REST_FAIR ? "bad" : Math.abs(s.restBias) > REST_GOOD ? "warn" : "good";
@@ -265,6 +293,29 @@ export function evaluateTune(capture: ParsedCapture, sampleRateHz: number): Tune
 			? ` A similar ${s.cruiseRing} cycles show up while cruising too — that pattern usually means a mechanical source (e.g. a leadscrew/ballscrew), not underdamping. More D is unlikely to help; check the mechanics before raising it further.`
 			: "";
 		add({ severity: "warn", title: "Rings after stopping", detail: `${s.restRing} oscillation cycles after the move stops — the loop is under-damped.${alsoAtSpeed}`, fix: "Lower P, or raise D (derivative)", term: "p", direction: "down" });
+	}
+
+	// 5b. Post-move vibration, from the accelerometer — measures the physical machine rather than the
+	// encoder's own position error, so it can catch ringing too small for the encoder to see at all (a
+	// real capture: restRing was 0 here while the accelerometer measured 5.7x its own settled level).
+	// Compares the capture against ITS OWN settled tail rather than a universal g threshold, which is what
+	// lets this work without per-machine calibration — see docs/PLAN-accelerometer.md §17.2. Report-only:
+	// uses `note`, never `add`, so this can never move the score or grade (§17.4, §11).
+	if (vibration?.valid && vibration.restSettle.samples > 0 && vibration.restTail.samples > 0
+		&& vibration.restTail.rmsG >= VIBRATION_TAIL_MIN_G) {
+		const ratio = vibration.restSettle.rmsG / vibration.restTail.rmsG;
+		if (ratio >= VIBRATION_RING_RATIO) {
+			const alsoEncoder = s.restRing > 0
+				? " The encoder sees this too."
+				: " The encoder's own error signal is too coarse to show this.";
+			note({
+				severity: "info",
+				title: "Vibration after stopping (accelerometer)",
+				detail: `${vibration.restSettle.rmsG.toFixed(3)} g measured just after the move stopped, `
+					+ `${ratio.toFixed(1)}x this machine's own settled level (${vibration.restTail.rmsG.toFixed(3)} g).`
+					+ alsoEncoder,
+			});
+		}
 	}
 
 	// 6. Encoder noise floor (informational, never penalised badly).

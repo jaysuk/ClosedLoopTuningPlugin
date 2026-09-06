@@ -16,12 +16,6 @@ import type { AccelCapture } from "./accelCsv";
 
 /** Same floor dsp.ts uses for its own peak acceptance — one convention, not two. */
 export const VIBRATION_MIN_STRENGTH = 0.4;
-/**
- * Two regions count as "the same frequency" within this relative tolerance. PROVISIONAL — invented, not
- * measured, because no real capture pair exists yet (docs/PLAN-accelerometer.md §12.5). Used only by the
- * (not yet implemented) evaluate.ts finding, never by a tuning decision.
- */
-export const VIBRATION_FREQ_MATCH = 0.15;
 
 /**
  * Shortest autocorrelation lag considered, which sets the highest reportable frequency at rateHz/3 —
@@ -34,6 +28,17 @@ export const MIN_LAG = 3;
 /** Below this fraction of the closed-loop capture's span, an accelerometer capture is short enough that
  *  whole regions can be missing — see `Vibration.coverage`. */
 export const VIBRATION_MIN_COVERAGE = 0.95;
+
+/** First 30% of the at-rest span — where post-move ringing lives if there is any. */
+export const REST_SETTLE_FRACTION = 0.30;
+/** Last 40% of the at-rest span — the machine's own settled floor, used as this capture's baseline. Real
+ *  hardware: two unrelated captures' tails agreed to within 4% of each other (0.0383 g vs 0.0370 g) —
+ *  see docs/PLAN-accelerometer.md §17.2 — which is what makes comparing settle against tail self-
+ *  calibrating instead of needing a universal threshold. */
+export const REST_TAIL_FRACTION = 0.40;
+/** Minimum at-rest samples before the settle/tail split is meaningful; below this both regions come back
+ *  empty rather than splitting a handful of samples into two meaningless slivers. */
+export const REST_SPLIT_MIN_SAMPLES = 60;
 
 export interface RegionVibration {
 	/** Combined per-axis RMS, in g: sqrt(Σ var(axis)). NOT the magnitude's RMS — see the module doc. */
@@ -59,6 +64,13 @@ export interface Vibration {
 	overall: RegionVibration;
 	cruise: RegionVibration;
 	rest: RegionVibration;
+	/** The at-rest span split in two, for comparing "just after the move stopped" against "settled".
+	 *  `restSettle` is the first REST_SETTLE_FRACTION of the rest span, `restTail` the last
+	 *  REST_TAIL_FRACTION. Both are `samples: 0` when the rest span is shorter than
+	 *  REST_SPLIT_MIN_SAMPLES — check before use, same contract as every other region (see
+	 *  RegionVibration.samples). See docs/PLAN-accelerometer.md §17. */
+	restSettle: RegionVibration;
+	restTail: RegionVibration;
 	rateHz: number | null;
 	overflows: number;
 	/** Highest frequency this capture could report at all (rateHz/MIN_LAG). Null when untimed. */
@@ -187,6 +199,7 @@ export function computeVibration(
 	if (capture.failed || series.length === 0 || total === 0 || rateHz == null) {
 		return {
 			overall: { ...EMPTY_REGION }, cruise: { ...EMPTY_REGION }, rest: { ...EMPTY_REGION },
+			restSettle: { ...EMPTY_REGION }, restTail: { ...EMPTY_REGION },
 			rateHz, overflows: capture.overflows, maxReportableHz: null, coverage: 0, valid: false,
 		};
 	}
@@ -218,10 +231,19 @@ export function computeVibration(
 	const [cFrom, cTo] = n > 0 ? span("cruise") : [0, 0];
 	const [rFrom, rTo] = n > 0 ? span("rest") : [0, 0];
 
+	// Split the rest span into "just after the move stopped" and "settled", so a capture can be compared
+	// against its OWN baseline instead of a universal threshold — see docs/PLAN-accelerometer.md §17.2.
+	const restLen = rTo - rFrom;
+	const splittable = restLen >= REST_SPLIT_MIN_SAMPLES;
+	const settleEnd = rFrom + Math.floor(restLen * REST_SETTLE_FRACTION);
+	const tailStart = rFrom + Math.floor(restLen * (1 - REST_TAIL_FRACTION));
+
 	return {
 		overall: regionStats(series, 0, total, rateHz),
 		cruise: regionStats(series, cFrom, cTo, rateHz),
 		rest: regionStats(series, rFrom, rTo, rateHz),
+		restSettle: splittable ? regionStats(series, rFrom, settleEnd, rateHz) : { ...EMPTY_REGION },
+		restTail: splittable ? regionStats(series, tailStart, rTo, rateHz) : { ...EMPTY_REGION },
 		...base,
 		valid: true,
 	};

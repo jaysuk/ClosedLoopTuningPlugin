@@ -1,12 +1,21 @@
 # Plan: accelerometer-based vibration measurement alongside closed-loop tuning
 
-**Status:** Phases 1, 2, 3, and 4 implemented, audited, and — after a real-hardware failure the day after
-shipping — fixed again (455 tests passing). `npm test`, a real DWC 3.7 typecheck + verify-build, and
-`check-ui36` (5/5 SFCs) all clean. Vibration recording is live end-to-end: settings, capture, chart, and
-report. Only Phase 3b (the evaluate.ts finding, blocked on §12.5) remains. Written 2026-09-05 from a user
-question ("could we use an accelerometer on the toolhead or motor to measure noise?"); audited the same
-day (§13); a real-hardware regression from that audit's own fix was found and corrected 2026-09-06 (§14)
-— read §14 before touching `ACCEL_ASSUMED_RATE_HZ` or the capture error-handling again.
+**Status:** All phases implemented, including Phase 3b (§17), which replaces §7.4's original design after
+frequency matching was tested against real data and rejected. **Nothing in this plan is outstanding.**
+484 tests pass (8 new for §17), DWC 3.7 typecheck clean. No `.vue` files changed, so `verify-build`/
+`check-ui36` were not re-run for this change; they are clean as of Phase 4/v2.6.0's own verification.
+
+Written 2026-09-05 from a user question ("could we use an accelerometer on the toolhead or motor to
+measure noise?"); audited the same day (§13); a real-hardware regression from that audit's own fix found
+and corrected 2026-09-06 (§14). Read §14 before touching `ACCEL_ASSUMED_RATE_HZ` or the capture
+error-handling.
+
+**§15 and §16 must be read together, in that order, before touching the frequency maths or §7.4.** §15
+concluded the ~200 Hz signal these captures show was a sensor artifact and §16 originally specified a fix
+for it; both were wrong, built on a capture labelled "idle" whose motor was still energised. §16 is now
+the correction: the sensor's real noise floor shows no periodicity, `VIBRATION_MIN_STRENGTH = 0.4` is
+correctly placed, and the 200 Hz is genuine motor vibration. §16.5 records how the mistake survived three
+rounds of internally-consistent checking, which is worth reading before trusting any similar analysis.
 
 **Audience:** written to be implemented directly. Every firmware claim in §1 was read out of the real
 RRF source in this repo's sibling checkout (`RRFBuild/RepRapFirmware`, 3.7.0-beta.1, commit `dc265c5`),
@@ -19,8 +28,9 @@ not from memory or documentation. §11 lists what NOT to do.
 | 1 | **A** detection, **C** parser | **DONE** — implemented, 11 tests passing. Do not rebuild. |
 | 3 | **E** metrics (the pure half) | **DONE** — implemented, 10 tests passing. Do not rebuild. |
 | 2 | **B** combined capture, **D** correlation | **DONE** — implemented in `m569.ts`/`useClosedLoopTuning.ts`, 8 new tests (2 unit + 6 integration against real hardware fixtures) passing. `npm test` and `DWC_DIR` typecheck both clean. Do not rebuild. |
-| 3b | **E**'s frequency-match threshold, the evaluate.ts finding | One real capture pair in hand (§12.2) — **blocked on a second pair** (§12.5) to calibrate a real tolerance, not just one clean match |
+| 3b | **E**'s evaluate.ts finding | **DONE** — implemented as §17's settle-vs-tail comparison (§7.4's original frequency-match design was rejected, §17.1). Do not rebuild. |
 | 4 | **F** UI + report | **DONE** — settings, chart, and report wiring implemented in both `.vue` files; `verify-build`/`check-ui36`/a real 3.6 build all clean. Do not rebuild. |
+| ~~16~~ | ~~Strength floor below the sensor's noise floor~~ | **RETRACTED — no such defect.** Built on a mislabelled capture; see §16. No code change needed. |
 
 Phases 1 and 3 are pure model code with no machine interaction and can be built and merged
 independently — they're useful on their own (a parser and metrics with tests) and de-risk the rest.
@@ -46,13 +56,38 @@ end to end: detection, capture, parsing, metrics, settings, chart, and report �
 - Every file under `src/__tests__/` matching `accel*`, `src/__tests__/fixtures/accel-2026-09-05/`, and
   the vibration-related additions to `m569.test.ts`/`report.test.ts`
 
-### What's left — Phase 3b only, and it's blocked on hardware
+### Nothing left to implement
 
-The only remaining work is §7.4 (the evaluate.ts finding) and it needs **§12.5 first**: a second real
-capture pair, ideally one with little or no real mechanical vibration, to prove the frequency-match
-detector doesn't fire on nothing. Do not implement §7.4 on the current invented `VIBRATION_FREQ_MATCH` —
-that repeats a mistake this plan's own §11 already calls out (the RP2350 ceiling and the D-ripple gate
-both waited for real numbers before shipping a gate).
+**§17 is done** — implemented 2026-09-06: `Vibration.restSettle`/`restTail` in `vibration.ts`,
+`evaluateTune`'s optional `vibration` parameter and non-scoring `note()` finding in `evaluate.ts`, wired
+through `useClosedLoopTuning.ts`'s `evaluateCapture()`. 8 new tests against real fixtures, all passing;
+`VIBRATION_FREQ_MATCH` deleted (unreferenced). Do not rebuild any of it.
+
+Two designs were tried and rejected before landing on §17's approach — §17.1 has the measurements, worth
+reading before assuming either would work if this area is touched again:
+- **§7.4's frequency matching.** The two sensors can't be compared on frequency at these sample rates.
+- **§16.4's directional asymmetry.** Recomputed with a metric that isn't broken, it doesn't separate the
+  cases; motor hum is directional too.
+
+An earlier §16 also specified a detection-threshold fix. **That was retracted** — it rested on a capture
+labelled "idle" whose motor was still energised. §16 explains why the threshold is already correct.
+
+### Background — how §7.4 got here
+
+§7.4 (the evaluate.ts finding) is still not implementable, but the reason has changed from "missing data"
+to "the design doesn't work". Four real captures (§16.2) show a ~200 Hz signal that appears whenever the
+motor is ENERGISED — present at standstill with the driver merely holding current, and growing with
+excitation — and vanishes entirely when the motor is off. It is real motor vibration, not sensor noise
+(§16 corrects §15 on that point). A cruise-vs-rest frequency match would therefore match at 200 Hz on
+almost any capture from an energised machine, which says nothing about whether that axis has a fault.
+
+**Read §16.3 and §16.4 before touching §7.4.** §16.4 records the better approach — per-axis directional
+asymmetry, since motor hum couples into the mount isotropically (measured 1.13–1.23 across axes) while a
+real resonance is directional (3.78) — along with the measurements behind it. That is a design decision
+plus an API change to `RegionVibration` (which today keeps only the strongest axis), not a threshold to
+plug in, and it is unvalidated beyond one sensor on one board. Do not implement §7.4 on the current
+invented `VIBRATION_FREQ_MATCH` regardless — that repeats a mistake this plan's own §11 already calls out
+(the RP2350 ceiling and the D-ripple gate both waited for real numbers before shipping a gate).
 
 **Read §7.4's audit note before designing it.** 0.15 is narrower than the measurement's own quantisation
 at these rates, so a ±15% match test would fire on adjacent frequency buckets by construction. The
@@ -975,9 +1010,11 @@ or specific to this axis/mount — worth another capture on a different axis to 
   than a systematic effect — though this is N=1 pair, not a proper variance study, so "no red flag" is
   the honest conclusion, not "proven safe". Both files saved as fixtures
   (`closed-loop.csv` / `closed-loop-baseline-no-accel.csv`) for the Phase 2/3b tests.
-- **§12.5** — one real pair with a clean, unambiguous frequency match is a good start, but a second pair
-  *without* a real mechanical signature (to confirm the detector doesn't fire on nothing) is needed before
-  `VIBRATION_FREQ_MATCH` stops being invented.
+- **§12.5 — ANSWERED, but not the way it was expected to be.** See §15: the second, deliberately-quiet
+  capture pair arrived 2026-09-06 and found a 200 Hz signal at rest even with nothing meaningfully
+  exciting the axis — but its per-axis SHAPE looks like sensor/electrical noise, not mechanical vibration,
+  unlike §12.2's original capture. **Phase 3b should not be implemented as designed until this is
+  resolved** — see §15's recommendation.
 
 ---
 
@@ -1112,3 +1149,434 @@ check) — consistent with the 2026-09-05 audit's finding 7, which already noted
 composable's wiring. Extracting `isAccelOnlyError` to a pure, tested function was a small step toward
 narrowing that gap for the highest-stakes piece of it; the rest remains a real gap if this area needs
 touching again.
+
+---
+
+## 15. §12.5 follow-up, 2026-09-06: a persistent ~200 Hz signal  ⚠️ PARTLY SUPERSEDED BY §16
+
+> **Read §16 first.** This section's measurements are sound, but its central conclusion — that the ~200 Hz
+> signal is a sensor/electrical artifact — is **wrong**. It was inferred from a capture labelled "idle"
+> whose motor was in fact still energised and vibrating. A genuinely idle capture shows no periodicity at
+> all. The 200 Hz is real motor vibration. §16 has the correction and the corrected numbers; what remains
+> valid here is the per-axis asymmetry observation, which §16.4 builds on.
+
+A second capture pair arrived, deliberately planned to be quiet: a short (5 mm), slow (F600) move on the
+same driver, specifically to check whether the frequency-match detector §7.4 depends on would stay quiet
+with nothing much exciting the axis. It didn't stay quiet, and the reason why is more useful than a clean
+"no vibration" result would have been.
+
+**What the implemented pipeline reported** (`computeVibration` run against the real files, not by eye):
+
+| | rest region |
+|---|---|
+| samples | 1185 |
+| rmsG | 0.0509 g |
+| dominantHz | **200 Hz** (bucket 177.8–228.6 Hz) |
+| strength | 0.400 — exactly at `VIBRATION_MIN_STRENGTH` |
+
+Coverage was 1.0 (the accelerometer spanned the whole capture) and the cruise region had only 2 samples
+(the move was too short/slow to have a meaningful constant-velocity phase) — so this pair can't test the
+cruise-vs-rest MATCH directly, but it answered a more fundamental question first: **is 200 Hz at rest a
+real, move-specific signature, or is it there regardless?**
+
+**The same 200 Hz bucket that §12.2's original (genuinely vibrating) capture found is present here too**,
+in a capture with an order of magnitude less real excitation (rest RMS 0.051 g here vs 0.125 g there).
+Coincidence at n=2 was the first suspicion — MIN_LAG's coarse quantisation at 800 Hz only has a handful of
+reachable buckets (266.7/200/160/...), so two unrelated signals landing in the same one isn't shocking on
+its own. Per-axis autocorrelation breaks the tie:
+
+```
+                        lag 4 (200 Hz) correlation, rest region
+                X        Y        Z
+ORIGINAL (§12.2, real vibration):   0.70     0.32     0.61   <- clearly directional (X >> Y)
+QUIET (this capture):               0.40     0.35     0.40   <- nearly IDENTICAL on all three axes
+```
+
+The original capture's 200 Hz is markedly stronger on X than Y — consistent with a real mechanical mode
+that has a preferred direction, which is what an actual resonance, a loose belt, or motor cogging would
+look like. The quiet capture's 200 Hz is close to identical in magnitude on X, Y, AND Z, and all three
+axes also share a matching negative lag-5 dip (-0.31/-0.28/-0.33). Three independently-mounted
+accelerometer axes moving in near-lockstep at a specific frequency, with almost no real mechanical
+excitation present to drive them, is the signature of a COMMON-MODE artifact — something shared across
+all three channels equally (an ADC/decimation ripple internal to the sensor, or electrical
+interference/PWM coupling into all three readings alike) — not a direction-specific physical resonance.
+
+**This means §7.4's design, as written, is not safe to implement yet.** A frequency-bucket-overlap check
+between cruise and rest would very plausibly fire on this ~200 Hz floor on almost every capture from this
+hardware, real vibration or not — which is a worse outcome than not shipping the finding at all: it would
+tell a user their machine has a mechanical problem when what actually matched was sensor noise.
+
+**⚠️ The paragraph that used to sit here claimed an idle capture had CONFIRMED the artifact. It did not —
+that capture's motor was still energised. See §16 for the correction.** With a genuinely idle machine the
+detector reports nothing at all, so the 200 Hz is real motor vibration, not sensor noise, and no code
+change is needed.
+
+What survives from this section is the per-axis observation: motor hum couples into the mount
+isotropically (max/min 1.13–1.23 across axes) while a real axis resonance is directional (3.78). §16.4
+builds the recommendation for §7.4 on that, with a physical explanation rather than the mistaken
+artifact one.
+
+Fixtures for this section's captures are listed in §16.6, correctly labelled.
+
+---
+
+## 16. RETRACTED — the "sensor noise floor" was a mislabelled capture
+
+**An earlier version of this section claimed `VIBRATION_MIN_STRENGTH = 0.4` sat below the sensor's own
+noise floor and specified a fix raising it to 0.55. That was wrong. There is no defect, and no code change
+is needed.** It is left here as a correction rather than deleted, because the reasoning failure is worth
+not repeating.
+
+### 16.1 What happened
+
+The §15 analysis rested on a capture labelled "idle". It wasn't — the motor was still energised and
+audibly vibrating when it was taken. A genuinely idle capture (motor off) was taken immediately after and
+settles it:
+
+| | motor energised, at standstill | **genuinely idle (motor off)** |
+|---|---|---|
+| overall RMS | 0.0139 g | **0.0029 g** |
+| per-axis sd | 0.0072 / 0.0096 / 0.0070 g | **0.0016 / 0.0016 / 0.0017 g** |
+| shipped code reports | 200 Hz, strength 0.435 | **`null`, strength 0.000** |
+| lag-4 correlation, per axis | 0.354 / 0.393 / 0.435 | **−0.022 / 0.026 / −0.050** |
+| strongest local max anywhere | 0.435 @ 200 Hz | **0.098 @ ~1 Hz** (slow drift) |
+
+Both captures are healthy readings of the same sensor in the same orientation (identical means to four
+decimals, gravity magnitude 0.9901 g, 38–46 distinct values per axis — live data, not a stuck channel).
+
+**The sensor's true noise floor produces no detectable periodicity at all.** `VIBRATION_MIN_STRENGTH = 0.4`
+is correctly positioned: comfortably above the real floor (~0.098, and that at ~1 Hz drift, nowhere near
+200 Hz) and below every real signal measured. The shipped v2.6.0 behaviour is right as it stands.
+
+### 16.2 What the 200 Hz actually is
+
+Not a sensor artifact — **real vibration from the energised motor**, present whenever the driver is holding
+current, and growing with excitation:
+
+| state | 200 Hz strength | rest RMS | axis spread (max/min) |
+|---|---|---|---|
+| motor off | none detected | 0.003 g | — |
+| motor energised, standstill | 0.435 | 0.014 g | 1.23 (isotropic) |
+| quiet move, at rest | 0.400 | 0.051 g | 1.13 (isotropic) |
+| vibrating move, at rest | 0.685 | 0.125 g | 3.78 (**directional**) |
+
+That is a coherent physical picture: the closed-loop driver's current regulation makes the motor buzz at a
+characteristic ~200 Hz whenever energised, shaking the whole mount fairly evenly in all directions; a real
+axis resonance adds energy at the same frequency but with a clear directional preference.
+
+### 16.3 What this means for §7.4 (Phase 3b)
+
+Still blocked, but for a better-understood and more legitimate reason than §15 gave.
+
+The original worry ("the detector fires on sensor noise") is **disproven** — with the machine genuinely
+idle, the detector correctly reports nothing. The remaining worry is real but different: a cruise-vs-rest
+frequency match would match at 200 Hz because *the motor hums at 200 Hz whenever it is energised*, which is
+not the same thing as "this axis has a mechanical fault". A finding built on frequency agreement alone
+would therefore fire on almost any capture from an energised machine.
+
+**§16.4's directional-asymmetry approach survives this correction and is strengthened by it.** It now has a
+clean physical justification rather than just an empirical one: motor hum couples into the mount
+isotropically (measured 1.13–1.23), a real axis resonance is directional (measured 3.78). That is a
+distinction worth detecting, and it is exactly what the current single-value `RegionVibration` throws away.
+
+### 16.4 The approach worth taking, if §7.4 is revisited  ⚠️ SUPERSEDED BY §17.1 — DO NOT IMPLEMENT
+
+> This subsection recommended per-axis directional asymmetry as the discriminator, on correlation ratios
+> of 1.13–1.23 vs 3.78. **That metric was broken** — a correlation can go negative, making a max/min ratio
+> meaningless. Recomputed with per-axis RMS (always positive), directionality does NOT separate the cases:
+> 2.98 for real vibration vs 1.99 for the quiet capture, and motor hum is itself directional (1.39),
+> because the largest axis is simply the one the motor drives. §17.1 has the full table. §17 uses a
+> settle-vs-tail magnitude comparison instead, which does separate cleanly and is self-calibrating.
+
+Expose per-axis results from `regionStats` (today it picks the strongest axis and discards the other two)
+and key the finding on the strong/weak axis ratio rather than on frequency agreement. Measured separation:
+1.13–1.23 for motor hum vs 3.78 for real vibration — roughly twice as sharp as any absolute strength
+threshold, and it needs no per-sensor calibration.
+
+This is an API change to `RegionVibration`, not a threshold tweak. **n=4 captures, one sensor, one board —
+promising, not proven.** Do not implement it without more data, and specifically not without at least one
+capture from a different machine/mount to check the isotropy claim generalises.
+
+### 16.5 The lesson
+
+Three sections of analysis (§15 and the original §16) were built on one mislabelled input, and the error
+survived because every downstream check was internally consistent — the maths was right, the replica
+matched the shipped code 6/6, the synthetic tests all passed. None of that could catch a wrong premise.
+
+The one check that would have caught it early: **the energised "idle" capture had 5× the RMS of a truly
+still sensor (0.0139 g vs 0.0029 g).** That was visible in the very first analysis and was not questioned,
+because the conclusion it pointed to ("something is vibrating") was the thing being assumed away. Sanity
+-check the input against physical expectation before building on it — 0.014 g is not what "nothing is
+moving" looks like.
+
+### 16.6 Fixtures
+
+All four captures are saved, correctly labelled this time:
+- `accel-2026-09-05/{closed-loop,accelerometer}.csv` — the original vibrating pair (§12.2)
+- `accel-2026-09-05/closed-loop-baseline-no-accel.csv` — same move, no M956 (§12.4)
+- `accel-2026-09-06-quiet/{closed-loop,accelerometer}.csv` — deliberately quiet move
+- `accel-2026-09-06-motor-energised/accelerometer.csv` — standstill, motor energised (**not** idle)
+- `accel-2026-09-06-idle/accelerometer.csv` — genuinely idle, motor off. No closed-loop counterpart.
+
+---
+
+## 17. Phase 3b, redesigned  ✅ DONE
+
+**Status: implemented 2026-09-06.** Written after the §15/§16 investigation and implemented the same day.
+This **replaced §7.4's design entirely** — frequency matching was tested against real data and does not
+work (§17.1). What replaced it is simpler, self-calibrating, and needs no cross-sensor comparison.
+
+Every number below came from running the shipped code against the four real captures in §16.6.
+
+### 17.1 Two designs tested and rejected, with the evidence
+
+**Rejected: frequency matching (the original §7.4).** The premise was that if the encoder's ringing
+frequency matches the accelerometer's dominant frequency, the ringing is confirmed mechanical. Measured on
+the one genuinely-vibrating capture:
+
+```
+encoder    oscPeriod 0.00400 s  ->  250.0 Hz
+accelerometer  dominantHz 200 Hz  [bucket 177.8 - 228.6 Hz]
+```
+
+They disagree, and neither figure is precise enough for the disagreement to mean anything:
+- The accelerometer's frequency is coarsely lag-quantised — at 800 Hz the only reachable values near the
+  signal are 266.7 / 200 / 160 Hz.
+- The encoder's comes from zero-crossings of a sub-step error signal (peak 0.31 of ONE motor step) whose
+  half-cycle gaps in that window ranged from 0.001 s to 0.041 s — implying anything from 12 Hz to 521 Hz.
+  The single "period" it reports is a mean over wildly inconsistent gaps.
+
+Two sensors, sampling at different rates, cannot be compared on frequency at this resolution. **Do not
+revive this approach without much higher sample rates on both sides.**
+
+**Rejected: directional asymmetry (§16.4's own recommendation).** §16.4 proposed using per-axis asymmetry,
+based on correlation ratios of 1.13–1.23 (motor hum) vs 3.78 (real vibration). That metric is broken: a
+correlation can go negative, making a max/min ratio meaningless — one window produced "0.62", which is
+impossible for a ratio of a maximum to a minimum. Recomputed with per-axis **RMS**, which is always
+positive and physically meaningful:
+
+| capture | window | X | Y | Z | max/min |
+|---|---|---|---|---|---|
+| vibrating | settle | 0.1126 | 0.1774 | 0.0595 | 2.98 |
+| vibrating | tail | 0.0150 | 0.0313 | 0.0161 | 2.09 |
+| quiet | settle | 0.0344 | 0.0575 | 0.0288 | 1.99 |
+| quiet | tail | 0.0196 | 0.0245 | 0.0196 | 1.25 |
+| motor energised, standstill | whole | 0.0072 | 0.0096 | 0.0070 | 1.39 |
+| motor off | whole | 0.0017 | 0.0016 | 0.0017 | 1.05 |
+
+Directionality does **not** separate the cases: 2.98 (real) vs 1.99 (quiet) overlap, and the vibrating
+capture's own quiet tail (2.09) scores higher than the quiet capture's active settle (1.99). The reason is
+visible in the table — the Y axis is the largest in *every* row, including motor hum at standstill, because
+that is simply the axis the motor drives. Hum is directional too. **§16.4 is superseded by this section.**
+
+### 17.2 What does work: the capture's own settled tail as its baseline
+
+Split the at-rest span into the **settle** window (right after the move stops) and the **tail** (once
+settled), and compare them. Measured:
+
+| capture | settle RMS | tail RMS | **settle/tail** |
+|---|---|---|---|
+| vibrating | 0.2184 g | 0.0383 g | **5.70×** |
+| quiet | 0.0729 g | 0.0370 g | **1.97×** |
+
+The two tails agree closely (0.0383 vs 0.0370 g) despite completely different moves — that is the same
+machine's own settled floor, measured twice, and it is what makes this self-calibrating. No universal g
+threshold, no cross-sensor comparison, no per-machine configuration.
+
+**This is also the most valuable thing the accelerometer has shown so far**: on the vibrating capture the
+encoder's own `restRing` is **0** — the loop's error signal is too coarse (sub-step) to see the ringing at
+all, while the accelerometer measures it at 5.7× the settled level. That is the accelerometer earning its
+place: reporting real mechanical behaviour the encoder structurally cannot see.
+
+### 17.3 The API change
+
+`Vibration` needs the at-rest span split. In `src/model/vibration.ts`:
+
+```ts
+export interface Vibration {
+	overall: RegionVibration;
+	cruise: RegionVibration;
+	rest: RegionVibration;
+	/** The at-rest span split in two, for comparing "just after the move stopped" against "settled".
+	 *  `settle` is the first REST_SETTLE_FRACTION of the rest span, `tail` the last REST_TAIL_FRACTION.
+	 *  Both are `samples: 0` when the rest span is too short to split meaningfully — check before use,
+	 *  same contract as every other region (see RegionVibration.samples). */
+	restSettle: RegionVibration;
+	restTail: RegionVibration;
+	rateHz: number | null;
+	overflows: number;
+	maxReportableHz: number | null;
+	coverage: number;
+	valid: boolean;
+}
+
+/** First 30% of the at-rest span — where post-move ringing lives if there is any. */
+export const REST_SETTLE_FRACTION = 0.30;
+/** Last 40% of the at-rest span — the machine's own settled floor, used as this capture's baseline. */
+export const REST_TAIL_FRACTION = 0.40;
+/** Minimum at-rest samples before the split is meaningful; below this both regions come back empty. */
+export const REST_SPLIT_MIN_SAMPLES = 60;
+```
+
+`computeVibration` already computes the rest span; add the two sub-spans from it using the existing
+`regionStats`. Nothing else in the file changes.
+
+### 17.4 The finding — and how it stays report-only
+
+**`evaluateTune`'s `add()` penalises the score for every finding** (`bad` −34, `warn` −15, `info` −3), so
+adding a finding is NOT report-only. This is exactly why §7.4 originally said "append to an existing
+finding, never add one". That constraint is sound and must be preserved — but the finding it wanted to
+append to (`Rings after stopping`, gated on `restRing > 0`) **does not fire on the one capture where the
+accelerometer proves there is real ringing.** Appending is therefore useless here.
+
+Resolve it by adding a non-scoring channel, not by penalising:
+
+```ts
+// In evaluateTune, alongside the existing `add`:
+/** Adds a finding that does NOT affect the score. For measurements from a sensor OUTSIDE the control
+ *  loop — the accelerometer — which must never move an encoder-derived grade. `add` penalises; this
+ *  deliberately does not. See docs/PLAN-accelerometer.md §17.4. */
+const note = (f: Finding) => { findings.push(f); };
+```
+
+Then, gated on vibration being present and usable:
+
+```ts
+// Report-only: never changes severity, score, term or direction (docs/PLAN-accelerometer.md §11, §17.4).
+if (v?.valid && v.restSettle.samples > 0 && v.restTail.samples > 0 && v.restTail.rmsG > 0) {
+	const ratio = v.restSettle.rmsG / v.restTail.rmsG;
+	if (ratio >= VIBRATION_RING_RATIO) {
+		const alsoEncoder = s.restRing > 0
+			? " The encoder sees this too."
+			: " The encoder's own error signal is too coarse to show this.";
+		note({
+			severity: "info",
+			title: "Vibration after stopping (accelerometer)",
+			detail: `${v.restSettle.rmsG.toFixed(3)} g measured just after the move stopped, `
+				+ `${ratio.toFixed(1)}x this machine's own settled level (${v.restTail.rmsG.toFixed(3)} g).`
+				+ alsoEncoder,
+		});
+	}
+}
+```
+
+`evaluateTune` must accept the `Vibration` — it currently takes `(capture, sampleRateHz)`. Add an optional
+third parameter rather than changing the existing signature:
+
+```ts
+export function evaluateTune(capture: ParsedCapture, sampleRateHz: number, vibration?: Vibration): TuneEvaluation
+```
+
+Only `useClosedLoopTuning.ts`'s evaluation call site passes it; every other caller keeps working unchanged.
+
+```ts
+/** settle/tail RMS ratio above which post-move vibration is called out. PROVISIONAL: measured 5.70x on a
+ *  real ringing capture and 1.97x on a deliberately quiet one (n=2 — one positive, one negative), so this
+ *  sits roughly midway. Report-only, so a wrong call costs a line of text, not a bad tune. */
+export const VIBRATION_RING_RATIO = 3.0;
+```
+
+### 17.5 Tests
+
+```ts
+it("splits the at-rest span and measures the settled tail as its own baseline", () => {
+	// Real vibrating fixture — exact measured values, not estimates.
+	expect(v.restSettle.rmsG).toBeCloseTo(0.2184, 3);
+	expect(v.restTail.rmsG).toBeCloseTo(0.0383, 3);
+});
+
+it("reports both regions empty when the rest span is too short to split", () => {
+	// Guard against a short capture (see §14's capture-window work) producing a meaningless ratio.
+	expect(shortRest.restSettle.samples).toBe(0);
+	expect(shortRest.restTail.samples).toBe(0);
+});
+
+it("calls out post-move vibration the encoder cannot see", () => {
+	const ev = evaluateTune(vibratingCl, 1000, vibration);
+	const f = ev.findings.find((x) => x.title === "Vibration after stopping (accelerometer)");
+	expect(f).toBeDefined();
+	expect(f!.detail).toContain("5.7x");
+	expect(f!.detail).toContain("too coarse");   // restRing is 0 on this capture
+});
+
+it("does NOT fire on the quiet capture (1.97x, below the ratio)", () => {
+	const ev = evaluateTune(quietCl, 1000, quietVibration);
+	expect(ev.findings.some((x) => x.title.includes("accelerometer"))).toBe(false);
+});
+
+// The safety property this whole design turns on.
+it("leaves the score and grade byte-identical whether vibration is supplied or not", () => {
+	const without = evaluateTune(vibratingCl, 1000);
+	const with_ = evaluateTune(vibratingCl, 1000, vibration);
+	expect(with_.score).toBe(without.score);
+	expect(with_.grade).toBe(without.grade);
+	// …and the only difference in findings is the added informational one.
+	expect(with_.findings.length).toBe(without.findings.length + 1);
+});
+```
+
+### 17.6 Non-goals
+
+- **Do not let this touch the score, grade, `fix`, `term` or `direction`.** The accelerometer is outside
+  the control loop; an encoder-derived grade must not move because of it. The test above pins this.
+- **Do not revive frequency matching** (§17.1) or **directional asymmetry** (§17.1) without much better
+  data than exists — both were tested and rejected on measurements, not opinion.
+- **Do not feed vibration into `signalCost` or any tuning decision.** Unchanged from §11.
+- **`VIBRATION_FREQ_MATCH` should be deleted in this change.** Verified 2026-09-06: it is referenced
+  nowhere in code — only its own definition in `vibration.ts:24`, plus one passing mention in a comment in
+  `accelIntegration.test.ts:72`. It exists solely for §7.4's rejected design. Remove the constant and
+  reword that comment; leaving an invented, unused threshold behind is how it gets picked up later as if
+  it meant something.
+
+### 17.7 Confidence, stated plainly
+
+The mechanism is solid: comparing a capture against its own settled tail is self-calibrating and the two
+independent tails agreed to within 4%. The **threshold** is n=2 — one positive (5.70×), one negative
+(1.97×). The gap is wide, and the consequence of a wrong call is one informational line of text, which is
+why shipping on n=2 is defensible here where it would not be for anything touching a tuning decision.
+
+Revisit `VIBRATION_RING_RATIO` once more captures exist, particularly from a different machine.
+
+### 17.8 Verification
+
+```
+npm test
+DWC_DIR="C:/Users/live/Documents/Github/DuetWebControl" npm run typecheck
+```
+No `.vue` changes are strictly required — the finding renders through the existing findings list. If the
+UI is touched at all, `verify-build` and `check-ui36` become mandatory.
+
+**Do not commit to `main` and do not push** without being asked.
+
+### 17.9 Implementation note
+
+Built as specified in §17.2-§17.4. Wired into **both** evaluation paths:
+- `evaluateCapture()` — the final-verification grading used by auto-tune, which reaches the downloaded
+  report via `tuneSession.evaluation`.
+- The reactive `evaluation` computed — the live on-screen panel.
+
+> **Corrected after audit.** The first implementation deliberately skipped the reactive computed, on the
+> stated grounds that `capture.value` and `lastVibration` could desync because "loading an arbitrary
+> capture from a file does not touch `lastVibration`." **That path does not exist.** There is exactly one
+> assignment to `capture.value` (`loadLatestCsv`, line ~739), reached from exactly two callers, both
+> immediately after this plugin's own M569.5 capture completes — the file even documents that invariant.
+> Skipping the computed made the finding invisible in the panel users actually look at, for a risk that
+> was never real. `collectAccel` also clears `lastVibration` on entry, so the only transient is a brief
+> window where it is null (absent, never mismatched). Both paths now pass it.
+
+11 tests, all against the real fixtures in §16.6 (no synthetic data) — final numbers:
+- Settle/tail ratios: 5.70× (vibrating) and 1.97× (quiet), both pinned exactly.
+- The two captures' settled tails agreed to within 4% of each other, tested explicitly — the property
+  that makes this self-calibrating.
+- The short-rest-span guard, `evaluateTune`'s score/grade invariance with vibration supplied vs omitted,
+  and the omitted/undefined/invalid-vibration no-throw path.
+- **`planCorrections` produces byte-identical output with and without the finding.** It is already
+  excluded twice over (no `term`/`direction`, and severity `info` not warn/bad), but nothing else locked
+  that in — giving this finding a `term` later (e.g. "which axis is shaking") is a plausible enhancement
+  that would otherwise silently start feeding accelerometer data into real PID corrections.
+- A degenerate near-zero tail (`VIBRATION_TAIL_MIN_G`) refuses to produce a ratio rather than dividing
+  into an enormous spurious one. Not reachable with real hardware — the quietest real tail measured was
+  0.0029 g, motor off — but the guard was `> 0`, which only excluded exactly zero.
+- The finding survives the report's JSON round-trip with score and grade unchanged.
+
+`npm test`: 487 passed. `DWC_DIR` typecheck: clean. No `.vue` files touched.

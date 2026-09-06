@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { buildSeries, computeRestEffort, segmentMove } from "../model/analysis";
 import { parseCapture } from "../model/csv";
 import { computeTuneSignal } from "../model/signal";
+import { evaluateTune } from "../model/evaluate";
 import { parseAccelCapture } from "../model/accelCsv";
 import { computeVibration } from "../model/vibration";
 import {
@@ -134,6 +135,30 @@ describe("shapeCapturesForDownload", () => {
 		const metrics = shaped.metrics as typeof signal;
 		expect(metrics.vibration).toEqual(vibration);
 		expect(metrics.vibration!.overall.dominantHz).toBe(200);
+	});
+});
+
+// docs/PLAN-accelerometer.md §17: the accelerometer's finding reaches the user through the downloaded
+// report's `state.evaluation`, which `downloadTuningReport` passes through by spreading `tuneSession`
+// (only `captures` is reshaped). This pins that the finding — and critically the UNCHANGED score/grade
+// alongside it — survives that path intact and is plain JSON-serialisable data.
+describe("evaluation in the downloaded report", () => {
+	it("carries the accelerometer finding through report shaping without altering score or grade", () => {
+		const cl = load("accel-2026-09-05/closed-loop.csv");
+		const accel = parseAccelCapture(readFileSync(path.join(FIXTURE_DIR, "accel-2026-09-05", "accelerometer.csv"), "utf8"));
+		const series = buildSeries(cl, 1000)!;
+		const seg = segmentMove(series.target, series.time, 1000);
+		const vibration = computeVibration(accel, series.time, seg.classes);
+
+		const withVibration = evaluateTune(cl, 1000, vibration);
+		const without = evaluateTune(cl, 1000);
+		expect(withVibration.findings.some((f) => f.title.includes("accelerometer"))).toBe(true);
+
+		// The report spreads the session wholesale; a JSON round-trip is what actually reaches the file.
+		const roundTripped = JSON.parse(JSON.stringify(withVibration)) as typeof withVibration;
+		expect(roundTripped.findings.some((f) => f.title.includes("accelerometer"))).toBe(true);
+		expect(roundTripped.score).toBe(without.score);
+		expect(roundTripped.grade).toBe(without.grade);
 	});
 });
 

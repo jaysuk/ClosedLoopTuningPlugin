@@ -296,8 +296,19 @@ export function useClosedLoopTuning(host: HostAdapter) {
 	const aboutOpen = ref(false);
 	const manualPanels = ref<number | undefined>(undefined);
 
-	/** Automatic plain-language verdict on the most recent capture (see model/evaluate.ts). */
-	const evaluation = computed<TuneEvaluation | null>(() => capture.value ? evaluateTune(capture.value, sampleRate.value) : null);
+	/**
+	 * Automatic plain-language verdict on the most recent capture (see model/evaluate.ts).
+	 *
+	 * `lastVibration` is safe to pair with `capture.value` here: there is exactly ONE assignment to
+	 * `capture.value` (in `loadLatestCsv`), reached only immediately after this plugin's own M569.5
+	 * capture completes — there is no path that loads an arbitrary/older capture — and `collectAccel`
+	 * clears `lastVibration` on entry, so the only transient is a brief window where it is null (absent,
+	 * never mismatched) while the accelerometer file is still being read. Report-only either way: the
+	 * vibration can only add an informational finding, never move the score or grade (evaluate.ts's
+	 * `note` vs `add`). Declared later in this file, but this getter only runs after setup completes.
+	 */
+	const evaluation = computed<TuneEvaluation | null>(
+		() => capture.value ? evaluateTune(capture.value, sampleRate.value, lastVibration.value ?? undefined) : null);
 	const gradeIcon = computed(() => {
 		switch (evaluation.value?.grade) {
 			case "excellent": return "mdi-star-circle";
@@ -1266,10 +1277,13 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		return signal;
 	}
 
-	/** Final-verification grading: a fresh capture judged the same way the Step-5 evaluation panel does. */
+	/** Final-verification grading: a fresh capture judged the same way the Step-5 evaluation panel does.
+	 *  Passes `result.vibration` (from the SAME capture, when vibration recording was on) so a real
+	 *  post-move-vibration finding can appear — see docs/PLAN-accelerometer.md §17. Report-only: it can
+	 *  never change the score or grade, only add an informational line. */
 	async function evaluateCapture(): Promise<TuneEvaluation | null> {
 		const result = await captureRaw();
-		return result ? evaluateTune(result.capture, result.rateHz) : null;
+		return result ? evaluateTune(result.capture, result.rateHz, result.vibration) : null;
 	}
 
 	function log(line: string): void {
