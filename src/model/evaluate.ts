@@ -8,7 +8,9 @@
  * to change and the direction, mirroring the auto-tuner's own logic:
  *   bias at rest → I · lag at steady speed → V · spikes in accel/decel → A · overshoot → D · ringing → P↓/D↑
  */
-import { buildSeries, computeRestEffort, REST_EFFORT_RIPPLE_LIMIT, segmentMove } from "./analysis";
+import {
+	buildSeries, computeRestEffort, REST_EFFORT_RIPPLE_LIMIT, REST_TAIL_FRACTION, REST_TAIL_MIN_SAMPLES, segmentMove,
+} from "./analysis";
 import type { ParsedCapture } from "./csv";
 import type { Vibration } from "./vibration";
 
@@ -31,8 +33,17 @@ export interface Finding {
 export interface TuneStats {
 	/** Mean signed error while the motor is stopped (the standing offset). */
 	restBias: number;
-	/** Std-dev of error while stopped (encoder noise floor). */
+	/** Std-dev of error over the SETTLED TAIL of the rest window (see REST_TAIL_FRACTION/
+	 *  REST_TAIL_MIN_SAMPLES) — the machine's actual encoder noise floor, not inflated by the settling
+	 *  transient right after the move stops. What "Encoder noise floor" reports, and what scales the
+	 *  cruise-wander gate and cost-comparison noise floor. docs/PLAN-capture-integrity.md §3. */
 	restNoise: number;
+	/** Std-dev of error over the WHOLE rest window, settling transient included. Deliberately kept
+	 *  separate from `restNoise`: this is what gates `restRing`/`cruiseRing` and the Ku/Tu oscillation-
+	 *  period search (signal.ts) — both are zero-crossing oscillation detectors, and a tail-based
+	 *  (smaller) floor there would make ordinary settling itself count as "louder than the noise floor",
+	 *  changing how much ringing it takes to register as ringing. docs/PLAN-capture-integrity.md §3. */
+	restNoiseFull: number;
 	/** Significant oscillation cycles after the motor stops (ringing). */
 	restRing: number;
 	/**
@@ -138,8 +149,8 @@ function ringCount(err: Array<number>, threshold: number): number {
 }
 
 const empty: TuneStats = {
-	restBias: 0, restNoise: 0, restRing: 0, cruiseRing: 0, settleOvershoot: 0, cruiseLag: 0, cruiseSpread: 0,
-	accelPeak: 0, movePeak: 0, moveRms: 0, cruiseSamples: 0, restSamples: 0, moved: false,
+	restBias: 0, restNoise: 0, restNoiseFull: 0, restRing: 0, cruiseRing: 0, settleOvershoot: 0, cruiseLag: 0,
+	cruiseSpread: 0, accelPeak: 0, movePeak: 0, moveRms: 0, cruiseSamples: 0, restSamples: 0, moved: false,
 };
 
 /** Compute the per-region error statistics from a capture. */
@@ -153,9 +164,13 @@ export function tuneStats(capture: ParsedCapture, sampleRateHz: number): TuneSta
 	// Shared segmentation (analysis.ts) — the same classes the tuning signal and move analysis use.
 	const seg = segmentMove(target, time, sampleRateHz);
 	if (!seg.moved) {
-		// No commanded motion — judge the standing error only.
+		// No commanded motion — judge the standing error only. No settling transient to separate out here
+		// (nothing moved to settle from), so restNoise/restNoiseFull are deliberately the same value.
 		const restNoise = std(error);
-		return { ...empty, restBias: mean(error), restNoise, restRing: ringCount(error, Math.max(0.3, 3 * restNoise)), restSamples: n };
+		return {
+			...empty, restBias: mean(error), restNoise, restNoiseFull: restNoise,
+			restRing: ringCount(error, Math.max(0.3, 3 * restNoise)), restSamples: n,
+		};
 	}
 	const moveDir = Math.sign(target[n - 1] - target[0]) || 1;
 
@@ -172,7 +187,22 @@ export function tuneStats(capture: ParsedCapture, sampleRateHz: number): TuneSta
 		else if (c === "accel") { accelErr.push(e); }
 	}
 
-	const restNoise = std(restErr);
+	// Ring detection keeps using the FULL rest window's std — unchanged behaviour, since a lower
+	// tail-based floor here would make ordinary settling/ringing itself count as "louder than the noise
+	// floor" and change how much ringing it takes to trigger a finding.
+	const restNoiseFull = std(restErr);
+	const ringThreshold = Math.max(0.3, 3 * restNoiseFull);
+	// The REPORTED/GATING noise floor comes from the settled TAIL only, not the whole rest window: measured
+	// on real reports, the whole-window figure reached 4.08 steps on a 1000 PPR encoder (~0.05 step/count)
+	// and was still described to the user as "normal for the encoder resolution" — it was actually the
+	// settling transient and ringing, averaged in. This also scales the cruise-wander gate
+	// (CRUISE_SPREAD_K), so an inflated floor was hiding real oscillation. Same tail concept
+	// computeRestEffort already uses (REST_TAIL_FRACTION/REST_TAIL_MIN_SAMPLES from analysis.ts). Falls
+	// back to the full-window value when the tail is too short to judge — never lets restNoise go to (or
+	// stay near) 0, which would make every noise-scaled gate fire. See docs/PLAN-capture-integrity.md §3.
+	const tailLen = Math.min(restErr.length, Math.max(REST_TAIL_MIN_SAMPLES, Math.floor(restErr.length * REST_TAIL_FRACTION)));
+	const restTail = restErr.slice(restErr.length - tailLen);
+	const restNoise = restTail.length >= REST_TAIL_MIN_SAMPLES ? std(restTail) : restNoiseFull;
 	// Overshoot: the worst error (in the move direction) in the first slice after the motor stops.
 	const settleWindow = restErr.slice(0, Math.max(3, Math.round(restErr.length * 0.25)));
 	const settleOvershoot = settleWindow.reduce((mx, e) => (moveDir * e > 0 ? Math.max(mx, Math.abs(e)) : mx), 0);
@@ -180,8 +210,9 @@ export function tuneStats(capture: ParsedCapture, sampleRateHz: number): TuneSta
 	return {
 		restBias: mean(restErr),
 		restNoise,
-		restRing: ringCount(restErr, Math.max(0.3, 3 * restNoise)),
-		cruiseRing: ringCount(cruiseErr, Math.max(0.3, 3 * restNoise)),
+		restNoiseFull,
+		restRing: ringCount(restErr, ringThreshold),
+		cruiseRing: ringCount(cruiseErr, ringThreshold),
 		settleOvershoot,
 		cruiseLag: mean(cruiseErr),
 		cruiseSpread: std(cruiseErr),

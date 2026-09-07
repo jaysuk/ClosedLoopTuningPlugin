@@ -14,8 +14,8 @@ import type { TuneEvaluation, TuneStats } from "../model/evaluate";
 
 function stats(over: Partial<TuneStats> = {}): TuneStats {
 	return {
-		restBias: 0, restNoise: 0.05, restRing: 0, cruiseRing: 0, settleOvershoot: 0, cruiseLag: 0, cruiseSpread: 0,
-		accelPeak: 0, movePeak: 5, moveRms: 1, cruiseSamples: 10, restSamples: 10, moved: true,
+		restBias: 0, restNoise: 0.05, restNoiseFull: 0.05, restRing: 0, cruiseRing: 0, settleOvershoot: 0, cruiseLag: 0,
+		cruiseSpread: 0, accelPeak: 0, movePeak: 5, moveRms: 1, cruiseSamples: 10, restSamples: 10, moved: true,
 		...over,
 	};
 }

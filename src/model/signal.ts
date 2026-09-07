@@ -119,6 +119,18 @@ export function computeTuneSignal(capture: ParsedCapture, sampleRateHz: number):
 	const error = measured.map((m, i) => m - target[i]);
 
 	const stats = tuneStats(capture, sampleRateHz);
+	// A capture that never reached rest measures NOTHING about settling: restBias/restNoise/restRing/
+	// settleOvershoot all fall out of empty arrays as 0 — the best attainable value of each — so such a
+	// capture outscores every real one on four of signalCost's six terms. Measured on a real report: an
+	// A-term capture with restSamples 0 scored a finite 3.0094 and its value became the run's final A.
+	// Rejecting returns null, which captureMedian already retries (CAPTURE_RETRIES) — see
+	// docs/PLAN-capture-integrity.md §1.
+	//
+	// NOT the same as rejecting truncated captures, which docs/PLAN-capture-window.md §7 explicitly
+	// forbids and which this must not become: truncated captures with real rest data are perfectly
+	// usable (this same report has them with 95-988 rest samples) and are deliberately still accepted.
+	// The condition is "no at-rest data at all", never "the firmware flagged Data lost".
+	if (stats.moved && stats.restSamples === 0) { return null; }
 	// P-term effort metrics; zeros when the capture didn't record the PID P term.
 	const move = analyzeMove(capture, sampleRateHz);
 
@@ -134,7 +146,11 @@ export function computeTuneSignal(capture: ParsedCapture, sampleRateHz: number):
 	// the measurement a Ku/Tu ultimate-gain search needs.
 	const seg = segmentMove(target, time, sampleRateHz);
 	const oscStart = seg.moved ? seg.lastMoving + 1 : 0;
-	const oscThreshold = Math.max(0.3, 3 * stats.restNoise);
+	// restNoiseFull, NOT restNoise: this gates a zero-crossing oscillation detector, structurally the same
+	// job as evaluate.ts's restRing/cruiseRing gate — a tail-based (smaller) floor here would make ordinary
+	// settling itself register as "oscillation" and corrupt the Ku/Tu period this feeds into. See
+	// evaluate.ts's TuneStats.restNoiseFull doc comment and docs/PLAN-capture-integrity.md §3.
+	const oscThreshold = Math.max(0.3, 3 * stats.restNoiseFull);
 	let oscPeriod = oscillationPeriod(error, time, oscStart, n, oscThreshold);
 	// Second chance: a small, decaying oscillation can have a clear periodic shape without ever
 	// completing enough full-amplitude half-cycles to clear the zero-crossing gate above. Autocorrelation
@@ -337,6 +353,7 @@ export function medianSignal(signals: Array<TuneSignal>): TuneSignal {
 		stats: {
 			restBias: stat((s) => s.restBias),
 			restNoise: stat((s) => s.restNoise),
+			restNoiseFull: stat((s) => s.restNoiseFull),
 			restRing: stat((s) => s.restRing),
 			cruiseRing: stat((s) => s.cruiseRing),
 			settleOvershoot: stat((s) => s.settleOvershoot),

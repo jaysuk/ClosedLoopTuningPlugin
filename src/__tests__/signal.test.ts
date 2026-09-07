@@ -8,6 +8,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { parseCapture } from "../model/csv";
+import { tuneStats } from "../model/evaluate";
 import {
 	comparableCost, computeTuneSignal, medianSignal, oscillationAmplitude, oscillationPeriod, signalCost,
 	signalCostNoEffort, signalDiverging, signalUnstable, significantlyBetter, significantlyBetterForTerm,
@@ -43,14 +44,66 @@ describe("computeTuneSignal — capture validation", () => {
 	});
 
 	it("still accepts a real, fully-numeric capture at the sample-count floor", () => {
+		// Target flattens for the last 10 rows (a rest phase) — without one, this collides with the
+		// "no at-rest data" rejection below, which is a different thing than the sample-count floor this
+		// test exists to check. A target that never stops moving isn't what MIN_CAPTURE_SAMPLES is about.
 		const header = "Sample,Timestamp,Measured Motor Steps,Target Motor Steps,PID P Term\n";
-		const rows = Array.from({ length: 60 }, (_, i) => `${i},${i * 0.5},${i * 0.1},${i * 0.1},0`);
+		const rows = Array.from({ length: 60 }, (_, i) => {
+			const t = i < 50 ? i * 0.1 : 5.0;
+			return `${i},${i * 0.5},${t},${t},0`;
+		});
 		const capture = parseCapture(header + rows.join("\n"));
 		expect(computeTuneSignal(capture, 2000)).not.toBeNull();
 	});
 
-	it("accepts a capture RRF cut short with a trailing 'Data lost' line — the rows that DID arrive are still valid, not NaN-poisoned", () => {
-		expect(computeTuneSignal(load("hold-truncated-datalost.csv"), 2000)).not.toBeNull();
+	it("a capture RRF cut short with a trailing 'Data lost' line parses cleanly — no NaN-poisoning", () => {
+		// This fixture is truncated before the move ever reaches rest (target is still climbing on the
+		// last row before "Data lost"), so it's correctly rejected below — but for the RIGHT reason (no
+		// rest data), not because "Data lost" corrupted the rows that DID arrive into NaN. Confirm that
+		// distinction directly: the parsed capture and its stats are clean, finite numbers.
+		const capture = load("hold-truncated-datalost.csv");
+		expect(capture.truncated).toBe(true);
+		const stats = tuneStats(capture, 2000);
+		for (const v of Object.values(stats)) {
+			if (typeof v === "number") { expect(Number.isFinite(v)).toBe(true); }
+		}
+	});
+
+	it("rejects that same capture for having no at-rest data — it was cut short before the move settled", () => {
+		const capture = load("hold-truncated-datalost.csv");
+		const stats = tuneStats(capture, 2000);
+		expect(stats.moved).toBe(true);
+		expect(stats.restSamples).toBe(0); // the real-world precondition §1's fix exists for
+		expect(computeTuneSignal(capture, 2000)).toBeNull();
+	});
+
+	// docs/PLAN-capture-integrity.md §1 — a real forum report: a truncated capture with restSamples=0
+	// had EVERY rest-derived metric (restBias/restNoise/restRing/settleOvershoot) read as a perfect
+	// zero — the best attainable value of each — and its value became the run's final accepted A term.
+	it("rejects a capture that never reached rest — it can measure nothing about settling", () => {
+		// A move that fills the whole capture: target still climbing at the last sample, so segmentMove
+		// classes nothing as "rest".
+		const header = "Sample,Timestamp,Measured Motor Steps,Target Motor Steps,PID P Term\n";
+		const rows = Array.from({ length: 200 }, (_, i) => `${i},${i},${i * 2},${i * 2 + 0.1},5`).join("\n");
+		const capture = parseCapture(header + rows + "\n");
+		const stats = tuneStats(capture, 1000);
+		expect(stats.moved).toBe(true);
+		expect(stats.restSamples).toBe(0);       // the precondition this guards
+		expect(computeTuneSignal(capture, 1000)).toBeNull();
+	});
+
+	it("still accepts a SHORT capture that does have at-rest data (truncation is not the criterion)", () => {
+		// docs/PLAN-capture-window.md §7: truncated-but-usable captures must keep working. Target moves
+		// for the first 40 rows then flattens for the last 20 — a real, if short, rest region.
+		const header = "Sample,Timestamp,Measured Motor Steps,Target Motor Steps,PID P Term\n";
+		const rows = Array.from({ length: 60 }, (_, i) => {
+			const t = i < 40 ? i * 0.1 : 4.0;
+			return `${i},${i},${t},${t},0`;
+		});
+		const capture = parseCapture(header + rows.join("\n") + "\n");
+		const stats = tuneStats(capture, 1000);
+		expect(stats.restSamples).toBeGreaterThan(0);
+		expect(computeTuneSignal(capture, 1000)).not.toBeNull();
 	});
 });
 

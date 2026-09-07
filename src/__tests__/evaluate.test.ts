@@ -180,6 +180,41 @@ describe("evaluateTune", () => {
 	});
 });
 
+// docs/PLAN-capture-integrity.md §3 — a real forum report: restNoise measured over the whole rest window
+// reached 4.08 steps on a 1000 PPR encoder (~0.05 step/count) and was still described as "normal for the
+// encoder resolution", because it was actually the settling transient/ringing being averaged in.
+describe("tuneStats — restNoise measures the settled tail, not the settling transient", () => {
+	// restRingAmplitude's burst occupies only the first BURST_LEN=6 samples of the rest region, then the
+	// rest of it is flat (no noise/bias) — exactly the "rings then quiet" shape this fix is about.
+	it("measures the noise floor from the settled tail, not the settling transient", () => {
+		const s = tuneStats(moveCapture({ restRingAmplitude: 1.0 }), 1000);
+		// The tail is well past the 6-sample burst — genuinely flat/no-noise by this fixture's construction.
+		expect(s.restNoise).toBe(0);
+	});
+
+	it("still counts ringing — the ring gate is not softened by the lower floor", () => {
+		const s = tuneStats(moveCapture({ restRingAmplitude: 1.0 }), 1000);
+		expect(s.restRing).toBeGreaterThan(0);
+	});
+
+	it("falls back to the whole window when the rest tail is too short to judge", () => {
+		// A rest region shorter than REST_TAIL_MIN_SAMPLES (25): restNoise must not silently become 0
+		// (which would make every noise-scaled gate, e.g. cruise-spread, fire on nothing).
+		const header = "Sample,Timestamp,Measured Motor Steps,Target Motor Steps,PID P Term\n";
+		const moveRows = Array.from({ length: 40 }, (_, i) => `${i},${i},${i * 0.1},${i * 0.1},0`);
+		const restRows = Array.from({ length: 10 }, (_, i) => {
+			const t = 4.0;
+			const e = i % 2 === 0 ? 0.2 : -0.2; // real, nonzero rest noise
+			return `${40 + i},${40 + i},${(t + e).toFixed(3)},${t},0`;
+		});
+		const capture = parseCapture(header + [...moveRows, ...restRows].join("\n") + "\n");
+		const stats = tuneStats(capture, 1000);
+		expect(stats.restSamples).toBeGreaterThan(0);
+		expect(stats.restSamples).toBeLessThan(25); // below REST_TAIL_MIN_SAMPLES — triggers the fallback
+		expect(stats.restNoise).toBeGreaterThan(0);
+	});
+});
+
 describe("cruise-phase ripple context (report-only, docs/PLAN-v2.4-feedback.md §2.3)", () => {
 	it("computes cruiseRing alongside restRing", () => {
 		const s = tuneStats(moveCapture({ restRingAmplitude: 1.0, cruiseRingAmplitude: 1.0 }), 1000);
@@ -208,8 +243,23 @@ describe("cruise-phase ripple context (report-only, docs/PLAN-v2.4-feedback.md �
 		expect(bothFinding.direction).toBe(restOnlyFinding.direction);
 		expect(bothFinding.detail).toMatch(/mechanical/i);
 		expect(ringingBoth.findings.filter((x) => x.title === "Rings after stopping")).toHaveLength(1);
-		// The extended text costs nothing extra — same score as the rest-only case (same severity, same
-		// number of findings triggered by this capture shape).
-		expect(ringingBoth.score).toBe(ringingAtRestOnly.score);
+	});
+
+	// docs/PLAN-capture-integrity.md §3: this fixture's cruiseRingAmplitude burst (real amplitude-1.0
+	// oscillation on 6 of 120 cruise samples) also legitimately clears the cruise-wander gate on its own —
+	// unrelated to the "Rings after stopping" text/severity/term/direction checks above, all of which
+	// still hold unchanged (confirmed there). Before §3's fix this was masked: restNoise was measured over
+	// the WHOLE rest window, which the restRingAmplitude burst inflated, so the (noise-scaled, floorless)
+	// cruise-wander gate never tripped. That inflated floor hiding a real cruise oscillation is exactly the
+	// bug §3 fixes — so the score dropping here (a new "Cruise error wanders" finding, unrelated to the
+	// ring-context text) is the fix working, not a regression. Confirmed even with a small (0.05) realistic
+	// noise floor added — this isn't a synthetic zero-noise artifact, the injected burst is genuinely big
+	// enough to be real cruise wander.
+	it("a real cruise-phase oscillation is now flagged in its own right, not masked by an inflated rest-noise floor", () => {
+		const ringingAtRestOnly = evaluateTune(moveCapture({ restRingAmplitude: 1.0 }), 1000);
+		const ringingBoth = evaluateTune(moveCapture({ restRingAmplitude: 1.0, cruiseRingAmplitude: 1.0 }), 1000);
+		expect(ringingBoth.findings.some((f) => f.title === "Cruise error wanders")).toBe(true);
+		expect(ringingAtRestOnly.findings.some((f) => f.title === "Cruise error wanders")).toBe(false);
+		expect(ringingBoth.score).toBeLessThan(ringingAtRestOnly.score);
 	});
 });

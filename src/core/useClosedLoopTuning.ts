@@ -548,6 +548,12 @@ export function useClosedLoopTuning(host: HostAdapter) {
 	 *  loggedCouplingFor. docs/PLAN-capture-window.md §6: this line is what would have shown "4167 Hz" for
 	 *  the auto-derived rate immediately, instead of requiring hand-decoded CSV timestamps to find it. */
 	let loggedProfileKey: string | null = null;
+	/** Last literal capture command actually logged (see captureRaw) — the profile line above says what
+	 *  was RESOLVED, this says what was actually SENT (including the M956 sharing its line, if armed).
+	 *  Requested by a field report that needed CSV-timestamp archaeology to establish the rate; this
+	 *  answers that in one line. The per-capture filename is normalised out of the key so this logs once
+	 *  per run, not once per capture. docs/PLAN-capture-integrity.md §5. */
+	let loggedCommandKey: string | null = null;
 	/** Whether this run has already warned that the firmware's achieved rate diverged from what was
 	 *  requested — once is enough; every capture repeating the same divergence would just be noise. */
 	let warnedAchievedRate = false;
@@ -1236,14 +1242,30 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		if (canRecordVibration.value && accelerometerBoard.value) { await ensureAccelRateKnown(accelerometerBoard.value); }
 		const { alongside, pending } = armAccel(profile.samples, profile.sampleRateHz);
 
-		const c = await runCapture({
+		// Built ONCE and reused for both the logged command and the actual sendCode call below — building
+		// it twice risked the logged text drifting from what was really sent, which would be worse than
+		// not logging it at all.
+		const captureOpts: Parameters<typeof buildCaptureCommand>[0] = {
 			// `profile.samples`, not `samples.value` — the rate ceiling can reduce the effective count
 			// (see planCaptureProfile / CaptureProfile.samples); using the raw setting here would ask the
 			// firmware for more samples than the (now lower) rate can actually spread across this window.
 			driver: selectedDriver.value ?? "", samples: profile.samples, activate: 1, rate: profile.sampleRateHz,
 			variables: varIds(ALL_CAPTURE_KEYS), manoeuvre: 0, alongside,
 			move: `G91 G1 H2 ${axis}${signedDist.toFixed(3)} F${avFeed.value} G90`,
-		}, pending);
+		};
+
+		// Log the literal command once per distinct shape — the profile line above says what was
+		// RESOLVED, this says what was actually SENT (M956 included, when armed). docs/PLAN-capture-
+		// integrity.md §5. The per-capture filename is normalised out of the dedupe key so this logs once
+		// per run, not once per capture.
+		const commandText = buildCaptureCommand(captureOpts);
+		const commandKey = commandText.replace(/F"[^"]*"/g, 'F"…"');
+		if (commandKey !== loggedCommandKey) {
+			loggedCommandKey = commandKey;
+			log(`Capture command: ${commandKey}`);
+		}
+
+		const c = await runCapture(captureOpts, pending);
 		try { await host.sendCode(`G91 G1 H2 ${axis}${(-signedDist).toFixed(3)} F${avFeed.value} G90`, { log: false }); } catch { /* ignore return-move error */ }
 
 		// One-time sanity check per run: is the firmware actually sampling at what was requested? A
@@ -1373,6 +1395,7 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		// re-arm it or the 2nd+ run on a driver produces a report with no kinematics context at all.
 		loggedCouplingFor = null;
 		loggedProfileKey = null;
+		loggedCommandKey = null;
 		warnedAchievedRate = false;
 		resetStageStates();
 		ensureViewKeys(["measuredMotorSteps", "targetMotorSteps", "currentError"]);
@@ -1395,7 +1418,9 @@ export function useClosedLoopTuning(host: HostAdapter) {
 			result = await runAutoTuneCore(buildTuneEffects(), { ...pid }, runOptions);
 			Object.assign(pid, result.pid);
 			if (result.ok) {
-				const gradeNote = result.evaluation ? ` Final grade: ${result.evaluation.grade} (${result.evaluation.score}/100).` : "";
+				const gradeNote = result.evaluation
+					? ` Final grade: ${result.evaluation.grade} (${result.evaluation.score}/100).`
+					: " Final verification did not produce a valid capture — no final grade for these values.";
 				autoStatus.value = `Auto-tune complete — P=${pid.p} D=${pid.d} I=${pid.i} A=${pid.a} V=${pid.v}.${gradeNote}`;
 				host.notify("success", "Closed Loop Tuning", autoStatus.value + " Review the evaluation, then save to config.g.");
 			} else {
@@ -1418,7 +1443,12 @@ export function useClosedLoopTuning(host: HostAdapter) {
 				tuneSession.value.finishedAt = new Date().toISOString();
 				tuneSession.value.finalPid = { ...pid };
 				tuneSession.value.log = [...sessionLog];
-				tuneSession.value.evaluation = result?.evaluation ?? evaluation.value;
+				// No fallback: when final verification couldn't produce a grade (e.g. the firmware rejected the
+				// capture outright), showing the PREVIOUS capture's evaluation presents a score for a PID that
+				// was never verified — measured on a real report, an I=875 refine capture's numbers were shown
+				// against a completely different finalPid. "No final score" is the honest answer.
+				// docs/PLAN-capture-integrity.md §2.
+				tuneSession.value.evaluation = result?.evaluation ?? null;
 				tuneSession.value.ku = result?.ku;
 				tuneSession.value.tu = result?.tu;
 				tuneSession.value.preflightActions = result?.preflightActions;
