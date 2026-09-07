@@ -1,6 +1,6 @@
 {
   "name": "closed-loop-tuning",
-  "version": "2.6.1",
+  "version": "2.6.2",
   "description": "Tune and visualise a Duet closed-loop driver: mode + calibration control, guided PID tuning, automatic step-response analysis — a Duet Web Control 3.7 plugin.",
   "private": true,
   "license": "GPL-3.0-or-later",
