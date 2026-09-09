@@ -206,8 +206,16 @@ export function analyzeStep(series: CaptureSeries): StepMetrics {
 	return { stepSize, riseTime, overshootPct, settlingTime, steadyStateError, peakError, rmsError, oscillations, hasStep: true, pTermSatDuty: 0, restEffort: EMPTY_REST_EFFORT };
 }
 
-/** |PID P term| at or above this is actuator saturation — the firmware clamps the term around ±256. */
+/** |PID P term| at or above this is actuator saturation — a deliberate margin below the firmware's own
+ *  clamp (see `P_TERM_CLAMP`), so a near-clip sample still counts as saturated. Do not "correct" this to
+ *  the clamp value — it would make `satDuty()` stricter and break existing rail detections. */
 export const P_TERM_RAIL = 250;
+
+/** The firmware's actual P-term clamp, measured directly: max |PID P Term| across 777,536 field-capture
+ *  samples (2026-09 tester reports) was exactly 256.0, with none above. Use this only where the true
+ *  physical limit is needed (the relay describing-function's saturation half-amplitude) — everywhere
+ *  else that reasons about "saturated" as a detection concept, P_TERM_RAIL's margin is intentional. */
+export const P_TERM_CLAMP = 256;
 
 /** Fraction of finite samples with a railed (saturated) PID P term. */
 export function satDuty(pterm: Array<number>): number {

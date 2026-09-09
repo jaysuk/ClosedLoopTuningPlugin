@@ -498,7 +498,7 @@ describe("runAutoTune — relay-feedback identification (identifyMethod: 'relay'
 		const { effects, log } = fakeEffects({ applyPid, captureSignal });
 		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true, identifyMethod: "relay" });
 		expect(result.ok).toBe(true);
-		const expectedKu = (4 * 250) / (Math.PI * 2); // P_TERM_RAIL=250
+		const expectedKu = (4 * 256) / (Math.PI * 2); // P_TERM_CLAMP=256 — the relay's real saturation half-amplitude, not the P_TERM_RAIL=250 detection margin (docs/PLAN-rail-detection.md §4)
 		expect(result.ku).toBeCloseTo(expectedKu, 5);
 		expect(result.tu).toBe(0.04);
 		expect(log.some((l) => l.includes("Relay feedback: found Ku="))).toBe(true);

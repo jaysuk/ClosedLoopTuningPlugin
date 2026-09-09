@@ -14,12 +14,18 @@ pre-existing and was simply invisible until the tester produced enough repeat ru
 
 ### Status as of 2026-09-09
 
-- **§1, §2, §3 — IMPLEMENTED and verified.** 500 tests pass (494 + 6 new), `vitest run --typecheck`
-  clean, `DWC_DIR` typecheck passes. No `.vue` touched. **Not committed** — awaiting review.
+- **§1, §2, §3 — DONE, committed `04e271d`.** 500 tests pass (494 + 6 new), `vitest run --typecheck`
+  clean, `DWC_DIR` typecheck passes. No `.vue` touched.
 - **§1.4 — DEFERRED by Jay's decision.** Land §1.3's confirmation alone so the field tester's next
   report is unambiguous evidence about which change worked. Do not bundle the threshold move.
-- **§4 — TO DO, Jay approved it as a separate commit.** This is the remaining work.
-- **§6 — decided: report only, never auto-change the tune.** Scoped as its own follow-up plan.
+- **§4 — DONE, separate commit as decided.** Added `P_TERM_CLAMP = 256` to `analysis.ts` (doc comment
+  records the 777,536-sample field measurement it's based on); used only at `autorun.ts`'s relay Ku
+  formula. `P_TERM_RAIL` stays exactly where it was everywhere else (`satDuty`, the oscillation gate,
+  `signalUnstable`, cost normalisation, chart bounds) — untouched. `autorun.test.ts:501`'s expectation
+  updated to `4*256` with a comment explaining why. 500 tests pass, both typechecks clean, no `.vue`
+  touched. Nothing left in this plan.
+- **§6 — decided: report only, never auto-change the tune.** Scoped as its own follow-up plan, not
+  started.
 
 ### Deviation from this plan, made during implementation (§2)
 

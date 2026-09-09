@@ -36,7 +36,7 @@
  * Every side effect (sending G-code, capturing, waiting, logging) is injected via `TuneEffects`, so this
  * module has no DWC/Vue import and is fully deterministic to test.
  */
-import { P_TERM_RAIL } from "./analysis";
+import { P_TERM_CLAMP } from "./analysis";
 import {
 	AUTOTUNE_SEQUENCE, AUTOTUNE_SIGNAL_SEQUENCE, describeMetrics, interpolateVZero, P_MAX,
 	type Attempt, type SignalAttempt, type SignalStrategy, type TermStrategy,
@@ -74,7 +74,7 @@ export type SeedRule = "tyreus-luyben" | "zn-classic" | "amigo";
  *    Physically inapplicable to a sufficiently well-damped plant (see modelfit.ts's own docs) — falls
  *    back to the conservative ramp when no oscillation is ever found, same as always.
  *  - "relay": Åström–Hägglund relay feedback — jump straight to a fixed high P so the P-term saturates
- *    (behaving like an on/off relay bounded at ±P_TERM_RAIL) and read Ku off the resulting bounded limit
+ *    (behaving like an on/off relay bounded at ±P_TERM_CLAMP) and read Ku off the resulting bounded limit
  *    cycle via the describing-function formula `Ku = 4d/(πa)`. Usually faster (no ramp) and inherently
  *    bounded (the "relay" amplitude is the actuator's own known saturation limit, not a gain pushed
  *    toward instability) — but needs a genuine bounded oscillation, not a true runaway, to be valid.
@@ -258,12 +258,13 @@ const RELAY_ABANDON_STEPS = 200;
 /**
  * Åström–Hägglund relay-feedback identification: one capture at a fixed high P (I=D=A=V=0) intended to
  * saturate the P-term, then read Ku/Tu off the resulting bounded limit cycle instead of ramping toward
- * instability. Ku = 4d/(πa) (d = the known saturation half-amplitude `P_TERM_RAIL`, a = the oscillation's
- * peak error amplitude, measured on the REST window after the commanded move ends — not the whole
- * capture, which is dominated by the commanded move's own transient at this deliberately undamped P and
- * would otherwise trip a "runaway" veto on every genuine relay experiment). Null (falls back to the
- * continuous-cycling ramp) when the capture fails, the error is genuinely unbounded, or no clean
- * oscillation is found at rest at all.
+ * instability. Ku = 4d/(πa) (d = the known saturation half-amplitude `P_TERM_CLAMP` — the relay's real
+ * physical throw, not the lower detection margin `P_TERM_RAIL` used elsewhere to declare "saturated";
+ * a = the oscillation's peak error amplitude, measured on the REST window after the commanded move
+ * ends — not the whole capture, which is dominated by the commanded move's own transient at this
+ * deliberately undamped P and would otherwise trip a "runaway" veto on every genuine relay experiment).
+ * Null (falls back to the continuous-cycling ramp) when the capture fails, the error is genuinely
+ * unbounded, or no clean oscillation is found at rest at all.
  */
 async function identifyRelay(effects: TuneEffects, medianOf: number): Promise<{ ku: number; tu: number } | null> {
 	await effects.applyPid({ p: RELAY_IDENT_P, i: 0, d: 0, v: 0, a: 0 });
@@ -279,7 +280,7 @@ async function identifyRelay(effects: TuneEffects, medianOf: number): Promise<{ 
 		effects.log("Relay feedback: no clean sustained oscillation found at rest — falling back to the conservative ramp.");
 		return null;
 	}
-	const ku = (4 * P_TERM_RAIL) / (Math.PI * signal.oscAmplitude);
+	const ku = (4 * P_TERM_CLAMP) / (Math.PI * signal.oscAmplitude);
 	effects.log(`Relay feedback: found Ku=${ku.toFixed(1)}, Tu=${(signal.oscPeriod * 1000).toFixed(0)} ms (amplitude ${signal.oscAmplitude.toFixed(2)} step, P=${RELAY_IDENT_P}).`);
 	return { ku, tu: signal.oscPeriod };
 }
