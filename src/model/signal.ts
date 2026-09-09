@@ -394,7 +394,7 @@ export function medianSignal(signals: Array<TuneSignal>): TuneSignal {
 /** One-line summary for the auto-tune log. Includes `cruise-P` (pTermCruiseMean) — the actual quantity
  * V's decision is based on — so a V ramp/solve's log is legible instead of only showing `lag`, which
  * tracks it but isn't the number being judged. */
-export function describeSignal(s: TuneSignal): string {
+export function describeSignal(s: TuneSignal, opts: { alwaysShowSat?: boolean } = {}): string {
 	const parts = [
 		`rms ${s.stats.moveRms.toFixed(2)}`,
 		`bias ${s.stats.restBias.toFixed(2)}`,
@@ -403,7 +403,11 @@ export function describeSignal(s: TuneSignal): string {
 		`accel pk ${s.pTermAccelPeak.toFixed(0)}`,
 		`cruise-P ${s.pTermCruiseMean.toFixed(1)}`,
 	];
-	if (s.pTermSatDuty > 0.01) { parts.push(`sat ${(s.pTermSatDuty * 100).toFixed(0)}%`); }
+	// The model-fit ramp decides on sat duty, so its log lines must distinguish "0%" from "not shown"
+	// — the default elision below made a 0% reading and a 1.4% one look identical in a field report,
+	// which is what made docs/PLAN-rail-detection.md §1 hard to diagnose. One decimal, always printed.
+	if (opts.alwaysShowSat) { parts.push(`sat ${(s.pTermSatDuty * 100).toFixed(1)}%`); }
+	else if (s.pTermSatDuty > 0.01) { parts.push(`sat ${(s.pTermSatDuty * 100).toFixed(0)}%`); }
 	if (s.postMoveOsc > 0) { parts.push(`${s.postMoveOsc} hunt`); }
 	if (s.stats.restRing > 0) { parts.push(`${s.stats.restRing} ring`); }
 	// Standstill P-term ripple (see analysis.ts computeRestEffort) — only shown when measured, so a

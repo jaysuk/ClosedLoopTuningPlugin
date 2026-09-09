@@ -114,6 +114,18 @@ export async function identifyModelFitP(
 ): Promise<ModelFitPOutcome> {
 	let value = SEED_START;
 	const attempts: Array<SignalAttempt> = [];
+	const railThreshold = MODEL_FIT_ACCEL_FRACTION * P_TERM_RAIL;
+	/** Back off from the last clean reading. Call with `attempts` already holding only clean entries. */
+	const unstableBackoff = (atValue: number): ModelFitPOutcome => {
+		const lastClean = attempts.length ? attempts[attempts.length - 1].value : null;
+		if (lastClean != null) {
+			const pStar = round(backoff * lastClean);
+			effects.log(`Model fit: P=${atValue} went unstable — using the last clean reading (P=${lastClean}) as rail onset, backing off ${(backoff * 100).toFixed(0)}% to P*=${pStar}.`);
+			return { result: { pRailOnset: lastClean, pStar, basis: "unstable-backoff" }, attempts };
+		}
+		effects.log("Model fit: went unstable before any clean reading.");
+		return { result: null, attempts };
+	};
 	for (let k = 0; k < MODEL_FIT_MAX_ATTEMPTS; k++) {
 		if (effects.isCancelled()) { return { result: null, attempts }; }
 		await effects.applyPid({ p: value, i: 0, d: 0, v: 0, a: 0 });
@@ -121,22 +133,40 @@ export async function identifyModelFitP(
 		effects.status(`Model fit: ramping P=${value} toward the effort rail…`);
 		const signal = await captureMedian(effects, medianOf);
 		if (!signal) { effects.log("Model fit: capture failed."); return { result: null, attempts }; }
-		effects.log(`Model fit: P=${value} → ${describeSignal(signal)}`);
-		if (signalUnstable(signal)) {
-			const lastClean = attempts.length ? attempts[attempts.length - 1].value : null;
-			if (lastClean != null) {
-				const pStar = round(backoff * lastClean);
-				effects.log(`Model fit: P=${value} went unstable — using the last clean reading (P=${lastClean}) as rail onset, backing off ${(backoff * 100).toFixed(0)}% to P*=${pStar}.`);
-				return { result: { pRailOnset: lastClean, pStar, basis: "unstable-backoff" }, attempts };
-			}
-			effects.log("Model fit: went unstable before any clean reading.");
-			return { result: null, attempts };
-		}
+		effects.log(`Model fit: P=${value} → ${describeSignal(signal, { alwaysShowSat: true })}`);
+		if (signalUnstable(signal)) { return unstableBackoff(value); }
 		attempts.push({ value, signal });
-		if (signal.pTermAccelPeak >= MODEL_FIT_ACCEL_FRACTION * P_TERM_RAIL || signal.pTermSatDuty >= MODEL_FIT_SAT_ONSET) {
+
+		/** Declare the rail here. Also flags the degenerate case where it lands on the seed itself. */
+		const railAt = (s: TuneSignal): ModelFitPOutcome => {
 			const pStar = round(backoff * value);
-			effects.log(`Model fit: rail onset at P=${value} (accel P-term ${signal.pTermAccelPeak.toFixed(0)}/${P_TERM_RAIL}, sat ${(signal.pTermSatDuty * 100).toFixed(0)}%) — backing off ${(backoff * 100).toFixed(0)}% to P*=${pStar}.`);
+			effects.log(`Model fit: rail onset at P=${value} (accel P-term ${s.pTermAccelPeak.toFixed(0)}/${P_TERM_RAIL}, sat ${(s.pTermSatDuty * 100).toFixed(0)}%) — backing off ${(backoff * 100).toFixed(0)}% to P*=${pStar}.`);
+			if (value === SEED_START) {
+				effects.log(`Model fit: that rail is at the seed P=${SEED_START}, so P*=${pStar} is ${(backoff * 100).toFixed(0)}% of the seed rather than anything measured about this axis — the tuning move is likely too aggressive for it (try a lower feedrate).`);
+			}
 			return { result: { pRailOnset: value, pStar, basis: "rail" }, attempts };
+		};
+
+		// Saturation duty is STRONG evidence — samples really are pinned at the clamp — so it stands on
+		// its own reading. The accel PEAK is weak evidence: a single-capture statistic whose run-to-run
+		// spread is wider than the threshold's own margin (field 2026-09: 212-219 at one P on one
+		// unchanged profile, against a threshold of 212.5), and a false rail here ENDS identification,
+		// collapsing P* to backoff x SEED_START. So peak-alone must be confirmed before it is believed.
+		// See docs/PLAN-rail-detection.md §1.
+		if (signal.pTermSatDuty >= MODEL_FIT_SAT_ONSET) { return railAt(signal); }
+		if (signal.pTermAccelPeak >= railThreshold) {
+			effects.log(`Model fit: P=${value} accel P-term ${signal.pTermAccelPeak.toFixed(0)} reached the rail fraction but nothing is saturating (sat ${(signal.pTermSatDuty * 100).toFixed(1)}%) — re-measuring to confirm.`);
+			const confirm = await captureMedian(effects, medianOf);
+			if (!confirm) { effects.log("Model fit: confirmation capture failed."); return { result: null, attempts }; }
+			effects.log(`Model fit: P=${value} (confirm) → ${describeSignal(confirm, { alwaysShowSat: true })}`);
+			// Record the confirming read, not the lower or the median of the pair: it is the reading the
+			// ramp acts on, so the extrapolation tail stays consistent with the decision made here.
+			attempts[attempts.length - 1] = { value, signal: confirm };
+			if (signalUnstable(confirm)) { attempts.pop(); return unstableBackoff(value); }
+			if (confirm.pTermAccelPeak >= railThreshold || confirm.pTermSatDuty >= MODEL_FIT_SAT_ONSET) {
+				return railAt(confirm);
+			}
+			effects.log(`Model fit: not confirmed (accel P-term ${confirm.pTermAccelPeak.toFixed(0)}) — treating P=${value} as clean and continuing the ramp.`);
 		}
 		if (value >= P_MAX) { break; }
 		value = Math.min(nextRampValue(value), P_MAX);

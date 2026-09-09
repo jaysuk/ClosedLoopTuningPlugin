@@ -9,7 +9,7 @@ import {
 	extrapolateRailOnset, identifyModelFitP, isSignificantDelta, MODEL_FIT_BACKOFF_DEFAULT,
 	restNoiseToPTermFloor, runModelFitIdentification, solveFeedForwardTerm, solveZeroCrossing,
 } from "../model/modelfit";
-import type { TuneSignal } from "../model/signal";
+import { RUNAWAY_STEPS, type TuneSignal } from "../model/signal";
 
 function stats(over: Partial<TuneStats> = {}): TuneStats {
 	return {
@@ -194,6 +194,86 @@ describe("identifyModelFitP", () => {
 		const { result, attempts } = await identifyModelFitP(effects, 1, 0.65);
 		expect(result).toBeNull();
 		expect(attempts).toEqual([]);
+	});
+
+	// --- Rail confirmation (docs/PLAN-rail-detection.md §1) -------------------------------------
+	// The accel PEAK alone is weak evidence: on one unchanged field profile it read 212-219 at the SAME
+	// P, against a threshold of 212.5, while nothing was saturating. Believing it ends identification
+	// and collapses P* to backoff x SEED_START, so it must be re-measured first. Saturation duty is
+	// strong evidence (samples really are pinned at the clamp) and still stands on a single reading.
+
+	it("regression (field 2026-09): a lone accel-peak crossing at the seed is re-measured, not believed", async () => {
+		let n = 0;
+		const captureSignal = vi.fn(async () => {
+			n++;
+			// First probe at the seed reads 216 (> 212.5) with nothing saturating — the false rail that
+			// cost four field runs an 11x-too-low P. Every later read sits well clear of the threshold.
+			return n === 1 ? sig({ pTermAccelPeak: 216, pTermSatDuty: 0 }) : sig({ pTermAccelPeak: 120, pTermSatDuty: 0 });
+		});
+		let lastAppliedP = 0;
+		const applyPid = vi.fn(async (p: PidConfig) => { lastAppliedP = Math.max(lastAppliedP, p.p); });
+		const { effects, log } = fakeEffects({ applyPid, captureSignal });
+		const { result } = await identifyModelFitP(effects, 1, 0.65);
+		expect(result).not.toBeNull();
+		expect(result!.basis).not.toBe("rail");
+		// The bug's signature: rail declared at the seed, so P* collapses to 0.65 x SEED_START = 19.5,
+		// a number derived purely from the seed constant with nothing measured about the axis in it.
+		expect(result!.pStar).not.toBeCloseTo(19.5, 1);
+		expect(lastAppliedP).toBeGreaterThan(30); // the ramp carried on past the seed
+		expect(log.some((l) => l.includes("re-measuring to confirm"))).toBe(true);
+		expect(log.some((l) => l.includes("not confirmed"))).toBe(true);
+	});
+
+	it("accepts an accel-peak rail once a second capture at the same P confirms it", async () => {
+		let lastAppliedP = 0;
+		const applyPid = vi.fn(async (p: PidConfig) => { lastAppliedP = p.p; });
+		const captureSignal = vi.fn(async () => sig({ pTermAccelPeak: lastAppliedP >= 110 ? 220 : 100, pTermSatDuty: 0 }));
+		const { effects } = fakeEffects({ applyPid, captureSignal });
+		const { result } = await identifyModelFitP(effects, 1, 0.65);
+		expect(result!.basis).toBe("rail");
+		expect(result!.pRailOnset).toBe(110);
+		expect(result!.pStar).toBeCloseTo(71.5, 1);
+	});
+
+	it("rails on saturation duty without spending a confirmation capture", async () => {
+		const captureSignal = vi.fn(async () => sig({ pTermAccelPeak: 256, pTermSatDuty: 0.04 }));
+		const { effects, log } = fakeEffects({ captureSignal });
+		const { result } = await identifyModelFitP(effects, 1, 0.65);
+		expect(result!.basis).toBe("rail");
+		expect(result!.pRailOnset).toBe(30);
+		expect(captureSignal).toHaveBeenCalledTimes(1); // strong evidence — believed on one reading
+		expect(log.some((l) => l.includes("re-measuring to confirm"))).toBe(false);
+	});
+
+	it("flags a rail that lands on the seed as seed-derived rather than measured (§2)", async () => {
+		const captureSignal = vi.fn(async () => sig({ pTermAccelPeak: 256, pTermSatDuty: 0.04 }));
+		const { effects, log } = fakeEffects({ captureSignal });
+		await identifyModelFitP(effects, 1, 0.65);
+		expect(log.some((l) => l.includes("at the seed P=30") && l.includes("lower feedrate"))).toBe(true);
+	});
+
+	it("returns a null result when the confirmation capture itself fails", async () => {
+		let n = 0;
+		const captureSignal = vi.fn(async () => { n++; return n === 1 ? sig({ pTermAccelPeak: 216, pTermSatDuty: 0 }) : null; });
+		const { effects } = fakeEffects({ captureSignal });
+		const { result, attempts } = await identifyModelFitP(effects, 1, 0.65);
+		expect(result).toBeNull();
+		expect(attempts).toHaveLength(1); // the probe that triggered the confirmation is kept
+	});
+
+	it("backs off from the last clean reading when the confirmation comes back unstable", async () => {
+		let n = 0;
+		const captureSignal = vi.fn(async () => {
+			n++;
+			if (n === 1) { return sig({ pTermAccelPeak: 100, pTermSatDuty: 0 }); }        // P=30, clean
+			if (n === 2) { return sig({ pTermAccelPeak: 216, pTermSatDuty: 0 }); }        // P=50, triggers confirm
+			return sig({ pTermAccelPeak: 216, pTermSatDuty: 0, stats: { movePeak: RUNAWAY_STEPS } }); // confirm: unstable
+		});
+		const { effects } = fakeEffects({ captureSignal });
+		const { result } = await identifyModelFitP(effects, 1, 0.65);
+		expect(result!.basis).toBe("unstable-backoff");
+		expect(result!.pRailOnset).toBe(30);   // the unstable P=50 is discarded, not kept as the onset
+		expect(result!.pStar).toBeCloseTo(19.5, 1);
 	});
 });
 
