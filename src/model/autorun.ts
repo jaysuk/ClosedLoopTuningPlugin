@@ -50,12 +50,12 @@ import {
 } from "./signal";
 import {
 	captureMedian, clampTerm, nextBackoff, ROUND_DP, SEED_START, SETTLE_DELAY_MS, verifyAccepted, ZERO_START,
-	type AutoRunAttempt, type TuneEffects,
+	type AutoRunAttempt, type EnvelopeCheck, type TuneEffects,
 } from "./tuneShared";
 import type { PidTerm } from "./wizard";
 
 export type {
-	AutoRunAttempt, StageId, StageState, TuneEffects,
+	AutoRunAttempt, EnvelopeCheck, StageId, StageState, TuneEffects,
 } from "./tuneShared";
 export {
 	captureMedian, clampTerm, nextBackoff, SETTLE_DELAY_MS, TERM_MAX, verifyAccepted, ZERO_START,
@@ -133,6 +133,10 @@ export interface AutoRunResult {
 	/** Ultimate gain/period found during seeding, when it succeeded. */
 	ku?: number;
 	tu?: number;
+	/** Whether the finished tune still holds (no saturation) at the axis's own configured max feed —
+	 *  undefined when there was nothing to check (extruder, or an unresolvable coupling) or the check
+	 *  capture itself failed. Report-only: never fed back into `pid`. See docs/PLAN-envelope-check.md. */
+	envelopeCheck?: EnvelopeCheck;
 	/** Calibration moves actually run during preflight (empty if the driver was already tracking). */
 	preflightActions?: Array<string>;
 	/** Final verification grade (axis drivers only; undefined if verification couldn't run). */
@@ -902,5 +906,24 @@ export async function runAutoTune(effects: TuneEffects, startPid: PidConfig, opt
 		effects.log(`Final verification skipped: ${e instanceof Error ? e.message : String(e)}`);
 		effects.onStage?.("verify", "failed");
 	}
-	return { ok: true, pid, attempts, ku, tu, preflightActions, evaluation };
+
+	// Runs every time (docs/PLAN-envelope-check.md, decision A), not only when verification graded
+	// below "good" — a tune that grades well on the moderate profile identification uses can still be
+	// the one that saturates hardest at speed (the same P=30 that peaks well under the rail at F24000
+	// genuinely clips at F36000 in the field data that motivated this check). Report-only: a null
+	// result (nothing to check, or the check capture itself failed) is not a run failure.
+	let envelopeCheck: EnvelopeCheck | undefined;
+	try {
+		const check = await effects.checkEnvelope();
+		if (check) {
+			envelopeCheck = check;
+			effects.log(check.holds
+				? `Envelope check: holds at the axis's configured max (F${check.feedMmPerMin.toFixed(0)}, sat ${(check.satDuty * 100).toFixed(1)}%).`
+				: `Envelope check: does NOT hold at the axis's configured max (F${check.feedMmPerMin.toFixed(0)}, sat ${(check.satDuty * 100).toFixed(1)}%) — this tune may saturate if the machine is driven to its configured M203/M201 limits.`);
+		}
+	} catch (e) {
+		effects.log(`Envelope check skipped: ${e instanceof Error ? e.message : String(e)}`);
+	}
+
+	return { ok: true, pid, attempts, ku, tu, preflightActions, evaluation, envelopeCheck };
 }

@@ -32,7 +32,7 @@
  * tuning X as moving only X — missing a real 1:1 coupling to Y, leaving Y completely unbounds-checked.
  */
 
-const COUPLING_EPSILON = 1e-6;
+export const COUPLING_EPSILON = 1e-6;
 
 /** Kinematics whose motor→Cartesian relationship is genuinely non-linear — no matrix exists to reason
  * about, so a G1 H2 tuning move's Cartesian effect can't be computed at all. Exact RRF KinematicsName

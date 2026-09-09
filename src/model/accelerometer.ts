@@ -32,8 +32,21 @@ export function findAccelerometers(model: unknown): Array<AccelerometerInfo> {
 }
 
 export interface AccelCaptureOptions {
-	/** The accelerometer's own device id for M956 P (e.g. "121.0"). */
+	/**
+	 * The accelerometer's own device id for M956 P (e.g. "121.0") — RRF < 3.7.0-rc.1 ONLY. Ignored (P0
+	 * sent instead) when `useAccelNumberAddressing` is true.
+	 */
 	device: string;
+	/**
+	 * RRF 3.7.0-rc.1 restructured M955/M956: P changed from a DriverId that also routed the command over
+	 * CAN, to a small accelerometer INDEX (currently must be 0 — only one accelerometer is supported at a
+	 * time) that carries no routing information at all. Routing is now implicit, remembered by the board
+	 * from its own M955 config. Sending the old DriverId-shaped P on rc.1+ fails with "parameter 'P' too
+	 * high" once RRF's integer parser truncates it at the decimal point. See
+	 * docs/PLAN-rc1-accelerometer-addressing.md — this was read from the firmware source diff, not
+	 * verified against real rc.1 hardware.
+	 */
+	useAccelNumberAddressing?: boolean;
 	samples: number;
 	/**
 	 * Nominally 0 = start immediately, 1 = on the next move. In RRF 3.7 the value is parsed and then
@@ -83,7 +96,8 @@ export function accelSampleCount(
 }
 
 export function buildAccelCaptureCommand(opts: AccelCaptureOptions): string {
-	const parts = [`M956 P${opts.device}`, `S${opts.samples}`, `A${opts.activate}`];
+	const p = opts.useAccelNumberAddressing ? "0" : opts.device;
+	const parts = [`M956 P${p}`, `S${opts.samples}`, `A${opts.activate}`];
 	for (const axis of opts.axes ?? []) { parts.push(axis); }
 	if (opts.filename) { parts.push(`F"${opts.filename}"`); }
 	return parts.join(" ");

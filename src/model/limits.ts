@@ -6,6 +6,7 @@
  * while still coupled to the machine, these helpers are the only thing standing between a tuning move
  * and the frame.
  */
+import { COUPLING_EPSILON } from "./kinematics";
 
 export interface AxisLimits {
 	letter: string;
@@ -305,6 +306,33 @@ const AUTO_MIN_DISTANCE_MM = 5;              // auto mode: a small absolute floo
  *    at `AUTO_RATE_FLOOR_HZ`; if even that floor can't stretch `samples` across the window, the move
  *    shrinks instead of losing resolution.
  */
+export interface EnvelopeSpeedInput {
+	letter: string;
+	/** mm of this axis's Cartesian travel per 1 mm of the tuned motor's H2 travel (see kinematics.ts). */
+	perUnit: number;
+	/** This axis's own configured max speed, mm/s (RRF M203). */
+	speedMmPerS: number;
+}
+
+/**
+ * Motor-space feed (mm/min) at which the FIRST coupled axis to reach its own configured M203 does so —
+ * the speed at which a G1 H2 tuning move's real-world Cartesian speed first touches any coupled axis's
+ * configured ceiling. On a Cartesian machine there is exactly one coupled axis with perUnit=1, so this
+ * reduces to that axis's own M203. On CoreXY (and other CoreKinematics) the tuned axis's own perUnit is
+ * NOT 1.0 — a field capture showed 0.5/-0.5 on both coupled axes — so either one's configured max can be
+ * the real limiting factor, not just the nominal tuned axis's own M203. Same "every coupled axis's own
+ * limit, take the conservative one" reasoning `planCoupledCenteredMove` already applies to distance,
+ * applied here to speed. null when no axis has a non-negligible coupling (nothing to check against).
+ * See docs/PLAN-envelope-check.md.
+ */
+export function envelopeFeedMmPerMin(axes: Array<EnvelopeSpeedInput>): number | null {
+	const candidates = axes
+		.filter((a) => Math.abs(a.perUnit) > COUPLING_EPSILON && a.speedMmPerS > 0)
+		.map((a) => a.speedMmPerS / Math.abs(a.perUnit));
+	if (!candidates.length) { return null; }
+	return 60 * Math.min(...candidates);
+}
+
 export function planCaptureProfile(
 	axes: Array<CoupledAxisLimits>,
 	feedMmPerMin: number,

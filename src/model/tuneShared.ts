@@ -12,6 +12,26 @@ import type { PidConfig } from "./m569";
 import { medianSignal, signalUnstable, type TuneSignal } from "./signal";
 import type { PidTerm } from "./wizard";
 
+/**
+ * Result of a validation capture at the axis's own configured max (M203/M201) — a different question
+ * from identification's rail search, which deliberately runs at a MODERATE profile so the ramp has
+ * unsaturated headroom to measure anything (see docs/PLAN-rail-detection.md §6.2: a profile aggressive
+ * enough to already saturate the seed gives model-fit nothing to ramp through). This checks, after
+ * identification is done, whether the result it found still holds once the axis is pushed to what it's
+ * actually configured to do. Report-only by design — never feeds back into the tune itself (§6.4).
+ */
+export interface EnvelopeCheck {
+	/** Motor-space feed the check capture ran at, mm/min — the speed at which the first coupled axis to
+	 *  reach ITS OWN configured M203 does so (see docs/PLAN-envelope-check.md, "the feed conversion needs
+	 *  every coupled axis, not just the tuned one"). */
+	feedMmPerMin: number;
+	/** Saturation duty measured at that feed. */
+	satDuty: number;
+	/** True when satDuty stays below MODEL_FIT_SAT_ONSET — the same "saturating" line model-fit's own
+	 *  ramp already uses, reused here rather than inventing a second threshold for the same question. */
+	holds: boolean;
+}
+
 export interface TuneEffects {
 	/** Send the PID values to the driver. */
 	applyPid(pid: PidConfig): Promise<void>;
@@ -31,6 +51,16 @@ export interface TuneEffects {
 	runCalibration(moveId: number): Promise<string>;
 	/** One fresh capture, graded with `evaluateTune` (final verification only). Null if it fails. */
 	evaluateCapture(): Promise<TuneEvaluation | null>;
+	/**
+	 * One validation capture at the axis's own configured max feed/accel (final verification only,
+	 * after a successful run). Null if it fails OR if there is no axis to check (extruders, or a
+	 * kinematics the coupling math can't resolve) — a null result is not logged as a failure by the
+	 * caller, since "nothing to check" and "the check itself failed" both just mean "no fact to report".
+	 * Implementations should measure saturation duty and build the result via modelfit.ts's
+	 * `evaluateEnvelope` rather than deciding `holds` themselves — keeps the one threshold judgment in
+	 * one tested place.
+	 */
+	checkEnvelope(): Promise<EnvelopeCheck | null>;
 	log(line: string): void;
 	status(line: string): void;
 	/** Notified after every capture that feeds a decision (session recording, wizard-step highlighting). */

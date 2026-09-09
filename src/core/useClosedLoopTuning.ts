@@ -35,26 +35,28 @@ import {
 	parsePidReply, type CalibrationMove, type EncoderType, type LoopMode, type PidConfig,
 } from "../model/m569";
 import { achievedRateHz, parseCapture, type ParsedCapture } from "../model/csv";
-import { analyzeCapture, buildSeries, segmentMove, type StepMetrics } from "../model/analysis";
+import { analyzeCapture, analyzeMove, buildSeries, segmentMove, type StepMetrics } from "../model/analysis";
 import {
-	CENTER_TOLERANCE_MM, CENTERING_FEED_MM_MIN, DEFAULT_MARGIN_MM,
+	CENTER_TOLERANCE_MM, CENTERING_FEED_MM_MIN, DEFAULT_MARGIN_MM, envelopeFeedMmPerMin,
 	getAxisLimits, midpoint, planCaptureProfile, planCoupledSymmetricMove, rateCeilingForBoard,
 	rateCeilingForCapture, type CoupledAxisLimits,
 } from "../model/limits";
 import { resolveMotionCoupling } from "../model/kinematics";
+import { evaluateEnvelope } from "../model/modelfit";
 import { WIZARD_STEPS, type Recommendation } from "../model/wizard";
 import { D_MAX } from "../model/autotune";
 import {
 	ACCEL_ASSUMED_RATE_HZ, accelSampleCount, buildAccelCaptureCommand, findAccelerometers, isAccelOnlyError,
 	type AccelerometerInfo,
 } from "../model/accelerometer";
+import { firmwareAtLeast } from "../model/firmwareVersion";
 import { parseAccelCapture, type AccelCapture } from "../model/accelCsv";
 import { computeVibration, VIBRATION_MIN_COVERAGE, type Vibration } from "../model/vibration";
 import { computeTuneSignal, type TuneSignal } from "../model/signal";
 import {
 	runAutoTune as runAutoTuneCore,
-	type AutoRunOptions, type AutoRunResult, type IdentifyMethod, type SeedRule, type StageId, type StageState,
-	type TuneEffects, type TuneMethod,
+	type AutoRunOptions, type AutoRunResult, type EnvelopeCheck, type IdentifyMethod, type SeedRule,
+	type StageId, type StageState, type TuneEffects, type TuneMethod,
 } from "../model/autorun";
 import { downsampleCapture, isNotableCapture, shapeCapturesForDownload, slimModelForReport, type ReportCapture } from "../model/report";
 import { applying, applyUpdateNow, checking, dismissCurrentUpdate, pendingReload, runUpdateCheck, setUpdateChecksEnabled, updateChecksEnabled, updateState } from "../updateCheck";
@@ -340,6 +342,9 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		captures: Array<SessionCapture>; evaluation?: TuneEvaluation | null;
 		/** Ultimate gain/period found during Ku/Tu seeding, when it succeeded. */
 		ku?: number; tu?: number;
+		/** Whether the tune holds (no saturation) at the axis's own configured max — report-only, never
+		 *  fed back into the tune. See docs/PLAN-envelope-check.md. */
+		envelopeCheck?: EnvelopeCheck;
 		/** Calibration moves (M569.6 V-ids) actually run during preflight. */
 		preflightActions?: Array<string>;
 		/** True if the run failed/was cancelled and the pre-run PID snapshot was restored. */
@@ -432,6 +437,17 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		const addr = parseInt(selectedDriver.value.split(".")[0]);
 		return (host.model() as any).boards?.find((b: any) => b && b.canAddress === addr) ?? null;
 	});
+
+	/**
+	 * RRF 3.7.0-rc.1 restructured M956's P from a DriverId (which also routed the command over CAN) to a
+	 * small accelerometer index carrying no routing information at all — see
+	 * docs/PLAN-rc1-accelerometer-addressing.md. The relevant firmware is `boards[0]`, the board DWC is
+	 * actually connected to and which parses the M956 text — NOT `selectedBoard` (the tuned driver's own
+	 * board) and NOT the accelerometer's own board (`accelerometerBoard`, below): this codebase's own
+	 * existing comments already note the accelerometer is often on a different board from either of those.
+	 */
+	const useAccelNumberAddressing = computed(() =>
+		firmwareAtLeast((host.model() as any).boards?.[0]?.firmwareVersion, "3.7.0-rc.1"));
 
 	// --- Accelerometer / vibration (docs/PLAN-accelerometer.md §5, §8) ---
 	const accelerometers = computed(() => findAccelerometers(host.model()));
@@ -736,8 +752,10 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		const c = await loadLatestCapture();
 		const pending = pendingRecordAccel;
 		pendingRecordAccel = null;
-		// Clears the previous trace either way — see collectAccel. Without this a manual capture would sit
-		// next to the vibration chart from whatever ran before it, looking like it belonged to this move.
+		// A manual record is a one-off, deliberate user action, not a background retry loop (unlike
+		// captureRaw's own auto-tune path, which stopped doing this — see the comment there) — so it's
+		// worth clearing here on failure: without it, a failed manual capture would leave the OLD trace
+		// sitting next to whatever's now shown, looking like it belongs to this move.
 		if (c) { await collectAccel(pending, c, effectiveSampleRate.value); }
 		else { accelCapture.value = null; lastVibration.value = null; }
 		recording.value = false;
@@ -1064,7 +1082,10 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		const startRuns = board.runs;
 		try {
 			const reply = await host.sendCode(
-				buildAccelCaptureCommand({ device: `${board.boardAddress}.0`, samples: PROBE_SAMPLES, activate: 0, filename: file }),
+				buildAccelCaptureCommand({
+					device: `${board.boardAddress}.0`, useAccelNumberAddressing: useAccelNumberAddressing.value,
+					samples: PROBE_SAMPLES, activate: 0, filename: file,
+				}),
 				{ log: false },
 			);
 			if (reply && /error:|warning:/i.test(reply)) {
@@ -1105,7 +1126,10 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		const rate = lastAccelRateHz.value ?? ACCEL_ASSUMED_RATE_HZ;
 		const samples = accelSampleCount(clSamples, clRateHz, rate);
 		return {
-			alongside: buildAccelCaptureCommand({ device: `${board.boardAddress}.0`, samples, activate: 0, filename: file }),
+			alongside: buildAccelCaptureCommand({
+				device: `${board.boardAddress}.0`, useAccelNumberAddressing: useAccelNumberAddressing.value,
+				samples, activate: 0, filename: file,
+			}),
 			// The wait has to outlast the capture itself, which is longer than the move by ACCEL_WINDOW_MARGIN
 			// and longer still if the real rate is below the assumed one. Doubling the expected duration
 			// leaves room for the file write on top.
@@ -1115,12 +1139,20 @@ export function useClosedLoopTuning(host: HostAdapter) {
 
 	/**
 	 * Collect an armed accelerometer capture and turn it into vibration metrics against the closed-loop
-	 * capture that ran alongside it. Always clears the previous run's chart data first — a stale trace
-	 * sitting next to a fresh closed-loop chart looks like it belongs to it. Never throws.
+	 * capture that ran alongside it. Never throws.
+	 *
+	 * Deliberately does NOT clear the chart on every call (it used to, unconditionally, before this ran
+	 * anything async) — an auto-tune run makes dozens of these calls, most of them retries or intermediate
+	 * decision captures, and `VibrationChart`'s row is `v-if="accelCapture"`, so nulling it out ahead of a
+	 * handful of awaited steps destroyed and recreated the whole chart component on every single one: the
+	 * "charts going blank and refilling" a real run visibly showed. The chart component itself is left
+	 * showing the last SUCCESSFULLY collected vibration reading until a new one is ready to replace it —
+	 * that's a real, if momentarily slightly stale, reading from this same run and axis, which is far less
+	 * misleading than a flashing "no data" placeholder on every attempt. The one-time reset a fresh run
+	 * genuinely needs (so a previous run/axis's trace doesn't linger) happens once, at `runAutoTune`'s
+	 * start, not here.
 	 */
 	async function collectAccel(pending: PendingAccel | null, cl: ParsedCapture, clRateHz: number): Promise<Vibration | undefined> {
-		accelCapture.value = null;
-		lastVibration.value = null;
 		if (!pending) { return undefined; }
 		if (pending.armFailed) { return undefined; } // RRF already told us nothing was captured — see isAccelOnlyError.
 
@@ -1174,11 +1206,18 @@ export function useClosedLoopTuning(host: HostAdapter) {
 	}
 
 	/**
-	 * The unified trapezoid-move capture, shared by `captureSignal` (tuning decisions → TuneSignal) and
-	 * `evaluateCapture` (final-verification grading → TuneEvaluation) so both analyse the exact same kind
+	 * The unified trapezoid-move capture, shared by `captureSignal` (tuning decisions → TuneSignal),
+	 * `evaluateCapture` (final-verification grading → TuneEvaluation), and `checkEnvelope` (validation at
+	 * the axis's own configured max, docs/PLAN-envelope-check.md) so all three analyse the exact same kind
 	 * of move instead of duplicating the move-planning/execution logic.
+	 *
+	 * `feedOverrideMmPerMin` is for `checkEnvelope` only — when given, it replaces `avFeed.value`
+	 * everywhere below AND the move is auto-sized (no `maxDistanceMm`) rather than reusing the user's own
+	 * `avDistance` setting, which is a manual cap on the ORDINARY tuning move and has no bearing on what
+	 * distance an envelope check at a different feed should use.
 	 */
-	async function captureRaw(): Promise<RawCaptureResult | null> {
+	async function captureRaw(feedOverrideMmPerMin?: number): Promise<RawCaptureResult | null> {
+		const feed = feedOverrideMmPerMin ?? avFeed.value;
 		const axisObj = axisForDriver();
 		const axis = axisObj?.letter ?? null;
 		if (!axis) { host.notify("warning", "Closed Loop Tuning", "Signal-based tuning needs the driver's axis — skipped."); return null; }
@@ -1190,8 +1229,8 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		if (!(await ensureAxisReady(coupled, { centerToMid: false }))) { return null; }
 		const freshCoupled = coupledAxesForDriver();
 		if ("error" in freshCoupled) { log(`Tuning capture: ${freshCoupled.error}`); host.notify("error", "Closed Loop Tuning", freshCoupled.error); return null; }
-		const profile = planCaptureProfile(freshCoupled, avFeed.value, samples.value, sampleRate.value, marginMm.value, {
-			maxDistanceMm: avDistance.value,
+		const profile = planCaptureProfile(freshCoupled, feed, samples.value, sampleRate.value, marginMm.value, {
+			maxDistanceMm: feedOverrideMmPerMin == null ? avDistance.value : undefined,
 			// Bandwidth-aware, not just the board's own rate ceiling: this capture records every available
 			// variable (ALL_CAPTURE_KEYS), and bandwidth is rate × columns — a rate the board could sustain
 			// with a handful of columns can still overrun its buffer with all 17 (docs/PLAN-capture-window.md
@@ -1204,12 +1243,15 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		// why the log is capped. This one line is the direct fix for a real forum report that needed a day
 		// of hand-decoded CSV timestamps to discover the auto-derived rate was 4167 Hz, not the UI's 2000
 		// (docs/PLAN-capture-window.md §6) — R IS honoured; auto mode just doesn't use the UI's rate box.
-		const profileKey = `${profile.samples}@${profile.sampleRateHz.toFixed(1)}/${profile.distance.toFixed(3)}`;
+		// Feed is part of the key (not just samples/rate/distance) since checkEnvelope's override can
+		// otherwise land on a profile shape identical to the ordinary tuning move's and get silently
+		// suppressed, hiding the very feed difference this whole log line exists to make visible.
+		const profileKey = `${profile.samples}@${profile.sampleRateHz.toFixed(1)}/${profile.distance.toFixed(3)}/F${feed}`;
 		if (profileKey !== loggedProfileKey) {
 			loggedProfileKey = profileKey;
 			log(`Capture profile: ${profile.samples} samples @ ${profile.sampleRateHz.toFixed(0)} Hz `
 				+ `(${(profile.samples / profile.sampleRateHz).toFixed(3)} s window, ${profile.moveTimeS.toFixed(3)} s move, `
-				+ `${profile.restTimeS.toFixed(3)} s rest), ${profile.distance.toFixed(1)} mm at F${avFeed.value}`
+				+ `${profile.restTimeS.toFixed(3)} s rest), ${profile.distance.toFixed(1)} mm at F${feed}`
 				+ `${profile.limitedBy ? `, limited by ${profile.limitedBy}` : ""}.`);
 		}
 
@@ -1251,7 +1293,7 @@ export function useClosedLoopTuning(host: HostAdapter) {
 			// firmware for more samples than the (now lower) rate can actually spread across this window.
 			driver: selectedDriver.value ?? "", samples: profile.samples, activate: 1, rate: profile.sampleRateHz,
 			variables: varIds(ALL_CAPTURE_KEYS), manoeuvre: 0, alongside,
-			move: `G91 G1 H2 ${axis}${signedDist.toFixed(3)} F${avFeed.value} G90`,
+			move: `G91 G1 H2 ${axis}${signedDist.toFixed(3)} F${feed} G90`,
 		};
 
 		// Log the literal command once per distinct shape — the profile line above says what was
@@ -1266,7 +1308,7 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		}
 
 		const c = await runCapture(captureOpts, pending);
-		try { await host.sendCode(`G91 G1 H2 ${axis}${(-signedDist).toFixed(3)} F${avFeed.value} G90`, { log: false }); } catch { /* ignore return-move error */ }
+		try { await host.sendCode(`G91 G1 H2 ${axis}${(-signedDist).toFixed(3)} F${feed} G90`, { log: false }); } catch { /* ignore return-move error */ }
 
 		// One-time sanity check per run: is the firmware actually sampling at what was requested? A
 		// divergence here is not necessarily wrong (a board's own clock can quantise the rate slightly),
@@ -1282,8 +1324,12 @@ export function useClosedLoopTuning(host: HostAdapter) {
 
 		// Only collect when the closed-loop capture itself came back — with no `c` there's nothing to
 		// correlate against, and waiting would just add this capture's timeout to an already-failed attempt.
-		// Either way the old trace goes: it belongs to a previous move, not this one.
-		if (!c) { accelCapture.value = null; lastVibration.value = null; return null; }
+		// Deliberately does NOT clear the vibration chart here: this runs on every failed/retried attempt
+		// (the common case in a real run — field reports show 5-12 per run), and clearing on each one is
+		// exactly the flicker collectAccel's own doc comment describes — nulling the chart ahead of the
+		// NEXT successful capture's data, destroying and recreating VibrationChart every time. A failed
+		// attempt produced no new data, so the last real reading stays exactly as valid as it was.
+		if (!c) { return null; }
 		const vibration = await collectAccel(pending, c, profile.sampleRateHz);
 		return { capture: c, rateHz: profile.sampleRateHz, vibration };
 	}
@@ -1306,6 +1352,38 @@ export function useClosedLoopTuning(host: HostAdapter) {
 	async function evaluateCapture(): Promise<TuneEvaluation | null> {
 		const result = await captureRaw();
 		return result ? evaluateTune(result.capture, result.rateHz, result.vibration) : null;
+	}
+
+	/**
+	 * Validation capture at the axis's own configured max (M203/M201), run once after a successful tune
+	 * regardless of grade (docs/PLAN-envelope-check.md, decision A) — a tune that grades well on the
+	 * moderate profile identification uses can still be the one that saturates hardest at speed. Null
+	 * when there's nothing to check (extruder, unresolvable kinematics, or no coupled axis has both a
+	 * non-negligible coupling AND a configured speed) or the check capture itself fails — both cases mean
+	 * "no fact to report", not a run failure (see the try/catch around this call in autorun.ts).
+	 */
+	async function checkEnvelope(): Promise<EnvelopeCheck | null> {
+		const axis = axisForDriver();
+		if (!axis?.letter) { return null; } // extruder — no axis to check
+		const index = axisIndexForDriver();
+		if (index === null) { return null; }
+		const axes = (host.model() as any).move?.axes ?? [];
+		const kinematics = (host.model() as any).move?.kinematics;
+		const coupling = resolveMotionCoupling(kinematics, axes, index);
+		if ("error" in coupling) { log(`Envelope check: ${coupling.error}`); return null; }
+		const speedInputs = coupling.effects.map((e) => ({
+			letter: e.letter, perUnit: e.perUnit, speedMmPerS: Number(axes[e.index]?.speed) || 0,
+		}));
+		const feedMmPerMin = envelopeFeedMmPerMin(speedInputs);
+		if (feedMmPerMin == null) {
+			log("Envelope check: no coupled axis has both a real coupling and a configured M203 — skipped.");
+			return null;
+		}
+		const result = await captureRaw(feedMmPerMin);
+		if (!result) { return null; }
+		const move = analyzeMove(result.capture, result.rateHz);
+		if (!move) { return null; }
+		return evaluateEnvelope(feedMmPerMin, move.pTermSatDuty);
 	}
 
 	function log(line: string): void {
@@ -1334,6 +1412,7 @@ export function useClosedLoopTuning(host: HostAdapter) {
 			captureStep,
 			runCalibration: runCalibrationSilent,
 			evaluateCapture,
+			checkEnvelope,
 			ensureReady: async () => {
 				// The step/signal captures only move in closed/assisted loop, and the board can come up in
 				// open loop after a reboot/reload. Uses the corrected mode command (D only — never S, which
@@ -1398,6 +1477,11 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		loggedCommandKey = null;
 		warnedAchievedRate = false;
 		resetStageStates();
+		// Once, here — not on every capture during the run (see the comments on collectAccel and
+		// captureRaw's own `if (!c)` branch). A fresh run's FIRST vibration reading should still replace
+		// whatever a PREVIOUS run/axis left showing, so this one reset stays; it just doesn't repeat.
+		accelCapture.value = null;
+		lastVibration.value = null;
 		ensureViewKeys(["measuredMotorSteps", "targetMotorSteps", "currentError"]);
 		const totalCycles = Math.max(1, Math.round(cycles.value || 1));
 		const hasAxis = hasAxisSelected.value;
@@ -1451,6 +1535,7 @@ export function useClosedLoopTuning(host: HostAdapter) {
 				tuneSession.value.evaluation = result?.evaluation ?? null;
 				tuneSession.value.ku = result?.ku;
 				tuneSession.value.tu = result?.tu;
+				tuneSession.value.envelopeCheck = result?.envelopeCheck;
 				tuneSession.value.preflightActions = result?.preflightActions;
 				tuneSession.value.restored = result?.restored;
 			}

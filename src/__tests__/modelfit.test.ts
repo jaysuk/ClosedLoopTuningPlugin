@@ -6,8 +6,8 @@ import { P_MAX } from "../model/autotune";
 import type { TuneEvaluation, TuneStats } from "../model/evaluate";
 import type { PidConfig } from "../model/m569";
 import {
-	extrapolateRailOnset, identifyModelFitP, isSignificantDelta, MODEL_FIT_BACKOFF_DEFAULT,
-	restNoiseToPTermFloor, runModelFitIdentification, solveFeedForwardTerm, solveZeroCrossing,
+	evaluateEnvelope, extrapolateRailOnset, identifyModelFitP, isSignificantDelta, MODEL_FIT_BACKOFF_DEFAULT,
+	MODEL_FIT_SAT_ONSET, restNoiseToPTermFloor, runModelFitIdentification, solveFeedForwardTerm, solveZeroCrossing,
 } from "../model/modelfit";
 import { RUNAWAY_STEPS, type TuneSignal } from "../model/signal";
 
@@ -38,6 +38,7 @@ function fakeEffects(over: Partial<TuneEffects> = {}): { effects: TuneEffects; l
 		captureStep: vi.fn(async () => null),
 		runCalibration: vi.fn(async () => "ok"),
 		evaluateCapture: vi.fn(async (): Promise<TuneEvaluation | null> => null),
+		checkEnvelope: vi.fn(async () => null),
 		ensureReady: vi.fn(async () => true),
 		log: (line: string) => log.push(line),
 		status: () => {},
@@ -74,6 +75,22 @@ describe("isSignificantDelta", () => {
 describe("restNoiseToPTermFloor", () => {
 	it("scales step noise by the P gain (P-term ≈ P × error)", () => {
 		expect(restNoiseToPTermFloor(0.08, 110)).toBeCloseTo(8.8, 5);
+	});
+});
+
+describe("evaluateEnvelope (docs/PLAN-envelope-check.md)", () => {
+	it("holds when satDuty stays below MODEL_FIT_SAT_ONSET", () => {
+		const r = evaluateEnvelope(36000, MODEL_FIT_SAT_ONSET / 2);
+		expect(r).toEqual({ feedMmPerMin: 36000, satDuty: MODEL_FIT_SAT_ONSET / 2, holds: true });
+	});
+
+	it("does not hold once satDuty reaches the same threshold model-fit's own ramp uses", () => {
+		const r = evaluateEnvelope(36000, MODEL_FIT_SAT_ONSET);
+		expect(r.holds).toBe(false);
+	});
+
+	it("does not hold well above the threshold", () => {
+		expect(evaluateEnvelope(36000, 0.2).holds).toBe(false);
 	});
 });
 

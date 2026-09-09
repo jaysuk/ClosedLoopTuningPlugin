@@ -1,5 +1,5 @@
 <template>
-	<v-container fluid class="pa-2">
+	<v-container fluid :class="['pa-2', 'd-flex', 'flex-column', { 'dwc-page-fill': mdAndUp }]">
 		<v-alert v-if="updateBanner" type="info" variant="tonal" density="compact" class="mb-3">
 			{{ updateBanner }}
 			<template #append>
@@ -399,12 +399,19 @@
 			</template>
 		</v-stepper>
 
-		<!-- Persistent results: chart + analysis from the most recent capture. align="start" stops
-			 Vuetify's default row-stretch from inflating the chart column (which has a fixed, content-sized
-			 height) to match the right column's often-taller stack of cards — without it, the chart card's
-			 fill-height grows to fill that mismatch as visible blank space below the chart. -->
+		<!-- Persistent results: chart + analysis from the most recent capture, plus the vibration chart below
+			 it. This is the part of the page that grows/shrinks to fill whatever height is left below the
+			 wizard above (flex: 1 1 auto + min-height: 0, so it can shrink below its content) and scrolls
+			 WITHIN itself rather than the whole page scrolling — dwc-page-fill is on the outer <v-container>
+			 instead of here, since that class is anchored to the full viewport height alone and would
+			 overflow off the bottom of the screen if applied to a section with other content stacked above
+			 it. md+ only (see the mdAndUp comment on the script side) — on a small screen this is a plain
+			 block and the page scrolls normally, same as before this change. -->
+		<div class="results-fill" :class="{ 'results-fill--active': mdAndUp }">
+		<!-- align="start" stops Vuetify's default row-stretch from inflating the chart column (which sizes
+			 to its own available height, not fixed content) to match the right column's stack of cards. -->
 		<v-row dense class="mt-1" align="start">
-			<v-col cols="12" md="9">
+			<v-col cols="12" md="9" class="results-chart-col">
 				<CaptureChart :capture="capture" :overlay="overlayCapture" :selected-keys="viewKeys" :sample-rate="sampleRate" :raw-text="rawText" />
 			</v-col>
 			<v-col cols="12" md="3">
@@ -432,6 +439,20 @@
 								</div>
 							</v-list-item>
 						</v-list>
+					</v-card-text>
+				</v-card>
+				<v-card v-if="tuneSession?.envelopeCheck" class="mb-2" :variant="tuneSession.envelopeCheck.holds ? 'flat' : 'tonal'" :color="tuneSession.envelopeCheck.holds ? undefined : 'warning'">
+					<v-card-text class="py-3">
+						<div class="d-flex align-center mb-1">
+							<v-icon class="mr-2" :color="tuneSession.envelopeCheck.holds ? 'success' : 'warning'">{{ tuneSession.envelopeCheck.holds ? "mdi-check-circle" : "mdi-alert" }}</v-icon>
+							<span class="text-subtitle-1">{{ tuneSession.envelopeCheck.holds ? "Holds at the machine's configured max" : "Saturates at the machine's configured max" }}</span>
+							<v-spacer />
+							<HelpTip class="ml-1" text="A validation capture at the axis's own configured M203/M201 (its true speed/acceleration ceiling) — separate from the moderate profile identification itself used, which deliberately stays below saturation so the ramp has something to measure. Report-only: never changes the tuned values, only tells you whether they still hold once the machine is driven to what it's actually configured to do. If your slicer's real print speeds are well below the configured M203/M201, this checks a stricter limit than you'll ever actually reach." />
+						</div>
+						<div class="text-body-2 cl-on-grade">
+							Checked at F{{ tuneSession.envelopeCheck.feedMmPerMin.toFixed(0) }} — {{ (tuneSession.envelopeCheck.satDuty * 100).toFixed(1) }}% saturation duty.
+							<template v-if="!tuneSession.envelopeCheck.holds">This tune may need a lower P (or more V/A feed-forward) if the machine is ever driven to its configured M203/M201 limits.</template>
+						</div>
 					</v-card-text>
 				</v-card>
 				<v-card class="mb-2">
@@ -476,6 +497,7 @@
 				<VibrationChart :capture="accelCapture" :vibration="lastVibration" />
 			</v-col>
 		</v-row>
+		</div>
 
 		<v-dialog v-model="confirmOpen" max-width="460">
 			<v-card>
@@ -522,6 +544,7 @@
  * compatible (see docs/PLAN-dwc36-backport.md §6).
  */
 import { nextTick, ref, watch } from "vue";
+import { useDisplay } from "vuetify";
 
 import { AboutDialog, HelpTip } from "dwc-plugin-runtime";
 
@@ -556,6 +579,15 @@ const {
 	aboutOpen, aboutDescription, aboutExtraActions,
 } = useClosedLoopTuning(createHost());
 
+// dwc-page-fill (see the template) is anchored to viewport height alone, so it only makes sense on the
+// element that IS the page — the results section below has real content (banners, the wizard) stacked
+// above it, so it can't carry the class itself without overflowing off the bottom of the screen. Instead
+// the whole page becomes a flex column with the class, the wizard stays at its natural height, and only
+// the results section is flex/scroll (see the "results-fill" comment in the template). mdAndUp-gated,
+// same as DWC's own InputShaping plugin: on a small screen the wizard alone can exceed the viewport, and
+// forcing a fixed page height would squeeze it rather than removing whitespace.
+const { mdAndUp } = useDisplay();
+
 // The auto-tune log's scroll position is a view concern, so it lives here rather than in the shared
 // composable (which never touches the DOM). `ref="autoLogEl"` binds to this ref on both Vue
 // generations — Vue 2.7's setSetupRef assigns into a <script setup> ref exactly as Vue 3 does.
@@ -569,6 +601,24 @@ watch(() => autoLog.value.length, () => {
 </script>
 
 <style scoped>
+/* Active only when the outer page is dwc-page-fill (md+, see the mdAndUp comment in the script) — this
+   is the section that grows/shrinks to fill whatever's left below the wizard, and scrolls within itself
+   rather than the whole page scrolling. min-height: 0 overrides flex's default min-height: auto, which
+   would otherwise refuse to let this shrink below its own content and defeat the whole point. */
+.results-fill--active {
+	flex: 1 1 auto;
+	min-height: 0;
+	overflow-y: auto;
+}
+/* Lets CaptureChart's own flex-fill (see CaptureChart.vue) size against this column's REAL available
+   height instead of the column just growing to whatever the chart wants — same min-height: 0 reason. */
+.results-chart-col {
+	display: flex;
+	min-height: 0;
+}
+.results-chart-col > :deep(.v-card) {
+	width: 100%;
+}
 .cl-var {
 	flex: 0 0 50%;
 }

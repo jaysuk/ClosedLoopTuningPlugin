@@ -1,12 +1,12 @@
 <template>
-	<v-card class="fill-height">
+	<v-card class="fill-height chart-card">
 		<v-card-title class="d-flex align-center py-2">
 			<v-icon class="mr-2">mdi-chart-line</v-icon>
 			Data chart
 			<v-spacer />
 			<v-btn size="small" variant="text" prepend-icon="mdi-download" :disabled="!capture" @click="exportCsv">Export CSV</v-btn>
 		</v-card-title>
-		<v-card-text>
+		<v-card-text class="chart-card-text">
 			<div v-if="!capture" class="text-medium-emphasis text-center py-12">Record or select a capture to plot it here.</div>
 			<div v-show="capture" class="chart-wrap"><canvas ref="canvas"></canvas></div>
 		</v-card-text>
@@ -146,9 +146,26 @@ onBeforeUnmount(() => { chart?.destroy(); chart = null; });
 </script>
 
 <style scoped>
+/* Real flex-fill against whatever height the surrounding page actually gives this card (see
+   .results-fill--active / .results-chart-col in ClosedLoopTuning.vue), replacing a `calc(100vh - 540px)`
+   that hardcoded a guess of everything else on the page's combined height — a guess that drifted every
+   time a card was added/removed above or beside the chart (most recently the envelope-check card),
+   which is the actual mechanism behind the "whitespace below the chart" reports. min-height: 320px is
+   kept as a floor: below that, .results-fill--active's own overflow-y: auto takes over instead of the
+   chart shrinking to something unusable. */
+.chart-card {
+	display: flex;
+	flex-direction: column;
+}
+.chart-card-text {
+	flex: 1 1 auto;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+}
 .chart-wrap {
 	position: relative;
-	height: calc(100vh - 540px);
+	flex: 1 1 auto;
 	min-height: 320px;
 }
 </style>

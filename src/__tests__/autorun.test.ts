@@ -50,6 +50,7 @@ function fakeEffects(over: Partial<TuneEffects> = {}): { effects: TuneEffects; l
 		captureStep: vi.fn(async () => GOOD_STEP),
 		runCalibration: vi.fn(async () => "ok"),
 		evaluateCapture: vi.fn(async () => null),
+		checkEnvelope: vi.fn(async () => null),
 		ensureReady: vi.fn(async () => true),
 		log: (line: string) => log.push(line),
 		status: () => {},
@@ -683,6 +684,65 @@ describe("runAutoTune — final verification", () => {
 		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
 		expect(result.ok).toBe(true);
 		expect(result.evaluation).toBeUndefined();
+	});
+});
+
+describe("runAutoTune — envelope check (docs/PLAN-envelope-check.md)", () => {
+	it("carries a holding result through to AutoRunResult and logs it", async () => {
+		const checkEnvelope = vi.fn(async () => ({ feedMmPerMin: 36000, satDuty: 0.001, holds: true }));
+		const { effects, log } = fakeEffects({ checkEnvelope });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
+		expect(result.ok).toBe(true);
+		expect(result.envelopeCheck).toEqual({ feedMmPerMin: 36000, satDuty: 0.001, holds: true });
+		expect(checkEnvelope).toHaveBeenCalledTimes(1);
+		expect(log.some((l) => l.includes("Envelope check: holds"))).toBe(true);
+	});
+
+	it("carries a non-holding result through and logs it as a warning, without touching the tuned pid", async () => {
+		// Same tuning inputs (a converging signal), differing only in what checkEnvelope reports — proves
+		// a failing envelope check (docs/PLAN-rail-detection.md §6.4 / PLAN-envelope-check.md decision: it
+		// is report-only) does not perturb the P the run already converged on, whatever that value is.
+		const captureSignal = vi.fn(async () => sig({ stats: { moveRms: Math.max(0.05, 20 / Math.max(1, 100)), restNoise: 0.05 } }));
+		const holding = fakeEffects({ captureSignal, checkEnvelope: vi.fn(async () => ({ feedMmPerMin: 36000, satDuty: 0, holds: true })) });
+		const failing = fakeEffects({ captureSignal, checkEnvelope: vi.fn(async () => ({ feedMmPerMin: 36000, satDuty: 0.05, holds: false })) });
+		const holdingResult = await runAutoTune(holding.effects, basePid(), { cycles: 1, hasAxis: true });
+		const failingResult = await runAutoTune(failing.effects, basePid(), { cycles: 1, hasAxis: true });
+		expect(failingResult.ok).toBe(true);
+		expect(failingResult.envelopeCheck?.holds).toBe(false);
+		expect(failing.log.some((l) => l.includes("does NOT hold"))).toBe(true);
+		expect(failingResult.pid).toEqual(holdingResult.pid);
+	});
+
+	it("leaves envelopeCheck undefined and doesn't fail the run when there is nothing to check", async () => {
+		const checkEnvelope = vi.fn(async () => null);
+		const { effects } = fakeEffects({ checkEnvelope });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
+		expect(result.ok).toBe(true);
+		expect(result.envelopeCheck).toBeUndefined();
+	});
+
+	it("doesn't fail the run when the check itself throws", async () => {
+		const checkEnvelope = vi.fn(async () => { throw new Error("capture pipeline error"); });
+		const { effects, log } = fakeEffects({ checkEnvelope });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
+		expect(result.ok).toBe(true);
+		expect(result.envelopeCheck).toBeUndefined();
+		expect(log.some((l) => l.includes("Envelope check skipped"))).toBe(true);
+	});
+
+	it("still runs when the run itself needed a correction pass during final verification", async () => {
+		let call = 0;
+		const evaluateCapture = vi.fn(async () => {
+			call++;
+			return call === 1
+				? evaluation({ grade: "fair", score: 60, findings: [{ severity: "warn", title: "x", detail: "x", term: "d", direction: "up" }] })
+				: evaluation({ grade: "good", score: 85 });
+		});
+		const checkEnvelope = vi.fn(async () => ({ feedMmPerMin: 24000, satDuty: 0, holds: true }));
+		const { effects } = fakeEffects({ evaluateCapture, checkEnvelope });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
+		expect(result.ok).toBe(true);
+		expect(result.envelopeCheck?.holds).toBe(true);
 	});
 });
 

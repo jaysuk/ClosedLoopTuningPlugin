@@ -35,6 +35,7 @@ function fakeEffects(over: Partial<TuneEffects> = {}): { effects: TuneEffects; l
 		captureStep: vi.fn(async () => null),
 		runCalibration: vi.fn(async () => "ok"),
 		evaluateCapture: vi.fn(async (): Promise<TuneEvaluation | null> => null),
+		checkEnvelope: vi.fn(async () => null),
 		ensureReady: vi.fn(async () => true),
 		log: (line: string) => log.push(line),
 		status: () => {},

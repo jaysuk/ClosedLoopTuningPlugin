@@ -34,7 +34,8 @@ import { P_MAX, type SignalAttempt } from "./autotune";
 import type { PidConfig } from "./m569";
 import { comparableCost, describeSignal, signalUnstable, type TuneSignal } from "./signal";
 import {
-	captureMedian, clampTerm, SEED_START, SETTLE_DELAY_MS, verifyAccepted, type TuneEffects,
+	captureMedian, clampTerm, SEED_START, SETTLE_DELAY_MS, verifyAccepted,
+	type EnvelopeCheck, type TuneEffects,
 } from "./tuneShared";
 
 function round(v: number, dp = 2): number {
@@ -56,6 +57,16 @@ export const MODEL_FIT_BACKOFF_DEFAULT = 0.65;
 /** Saturation duty at/above this is rail onset too — a single-capture accel PEAK is noisy run-to-run
  * (the same P read 256 one day and 180 the next on the same machine), so sat duty backs it up. */
 export const MODEL_FIT_SAT_ONSET = 0.02;
+
+/**
+ * Interpret a validation capture's saturation duty against MODEL_FIT_SAT_ONSET — the same "the loop is
+ * saturating" line the ramp above already uses, reused rather than inventing a second threshold for the
+ * same underlying question (docs/PLAN-envelope-check.md, decision D). Pure so the judgment call lives in
+ * one tested place; the host adapter only needs to measure satDuty, not decide what it means.
+ */
+export function evaluateEnvelope(feedMmPerMin: number, satDuty: number): EnvelopeCheck {
+	return { feedMmPerMin, satDuty, holds: satDuty < MODEL_FIT_SAT_ONSET };
+}
 /** Enough geometric-ramp steps to go from SEED_START all the way to P_MAX (30 → … → 600 is 13 steps).
  * The previous budget of 10 expired at P=335.7 — provably one-to-two steps short of a real machine's
  * rail (~369, trend-extrapolated from its own accel-pk readings 89 → 105 → 180). */

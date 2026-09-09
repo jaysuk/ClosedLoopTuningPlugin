@@ -2,8 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
 	AUTO_MOVE_CAP_MM, AUTO_REST_MIN_S, AUTO_RATE_CEILING_HZ, AUTO_RATE_FLOOR_HZ, AUTO_VALUE_RATE_CEILING,
-	getAxisLimits, midpoint, planCaptureProfile, planCenteredMove, rateCeilingForBoard, rateCeilingForCapture,
-	planCoupledCenteredMove, planCoupledSymmetricMove, planSymmetricMove, type CoupledAxisLimits,
+	envelopeFeedMmPerMin, getAxisLimits, midpoint, planCaptureProfile, planCenteredMove, rateCeilingForBoard,
+	rateCeilingForCapture, planCoupledCenteredMove, planCoupledSymmetricMove, planSymmetricMove,
+	type CoupledAxisLimits,
 } from "../model/limits";
 
 describe("getAxisLimits", () => {
@@ -412,5 +413,44 @@ describe("coupled kinematics (CoreXY etc.)", () => {
 		const plan = planCoupledSymmetricMove([tinyX, wideY], 50, 2, 10);
 		expect(plan).toHaveProperty("error");
 		expect((plan as { error: string }).error).toContain("X:");
+	});
+});
+
+describe("envelopeFeedMmPerMin (docs/PLAN-envelope-check.md)", () => {
+	it("reduces to a single Cartesian axis's own M203 on an unlinked (perUnit=1) machine", () => {
+		expect(envelopeFeedMmPerMin([{ letter: "Y", perUnit: 1, speedMmPerS: 300 }])).toBe(300 * 60);
+	});
+
+	it("picks the coupled axis that reaches ITS OWN configured max first, not the tuned axis's own perUnit=1 entry", () => {
+		// CoreXY field shape: tuning Y moves X by +0.5 and Y by -0.5 per mm of motor travel. X's own M203
+		// (200 mm/s) is reached at a higher motor feed than Y's (300 mm/s) once each is divided by its
+		// own 0.5 coupling — X is the limiting axis here even though it isn't the nominal tuned one.
+		const feed = envelopeFeedMmPerMin([
+			{ letter: "X", perUnit: 0.5, speedMmPerS: 200 },
+			{ letter: "Y", perUnit: -0.5, speedMmPerS: 300 },
+		]);
+		// X: 200 / 0.5 = 400 mm/s: Y: 300 / 0.5 = 600 mm/s -> X limits first, at 400 mm/s = 24000 mm/min.
+		expect(feed).toBe(400 * 60);
+	});
+
+	it("ignores an axis with negligible coupling to the tuned motor", () => {
+		const feed = envelopeFeedMmPerMin([
+			{ letter: "Y", perUnit: 1, speedMmPerS: 300 },
+			{ letter: "Z", perUnit: 0, speedMmPerS: 5 }, // not actually coupled — must not drag the feed down to near zero
+		]);
+		expect(feed).toBe(300 * 60);
+	});
+
+	it("returns null when nothing is meaningfully coupled", () => {
+		expect(envelopeFeedMmPerMin([])).toBeNull();
+		expect(envelopeFeedMmPerMin([{ letter: "Z", perUnit: 0, speedMmPerS: 5 }])).toBeNull();
+	});
+
+	it("ignores an axis with no configured speed (0) rather than letting it force the feed to zero", () => {
+		const feed = envelopeFeedMmPerMin([
+			{ letter: "Y", perUnit: 1, speedMmPerS: 300 },
+			{ letter: "X", perUnit: 1, speedMmPerS: 0 },
+		]);
+		expect(feed).toBe(300 * 60);
 	});
 });

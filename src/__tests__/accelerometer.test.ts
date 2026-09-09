@@ -45,6 +45,25 @@ describe("buildAccelCaptureCommand", () => {
 	it("supports activate:1 (on next move)", () => {
 		expect(buildAccelCaptureCommand({ device: "0.0", samples: 500, activate: 1 })).toBe("M956 P0.0 S500 A1");
 	});
+
+	// docs/PLAN-rc1-accelerometer-addressing.md: RRF 3.7.0-rc.1 changed M956's P from a DriverId (which
+	// also routed the command over CAN) to a small accelerometer index that carries no routing meaning at
+	// all (must be 0 — only one accelerometer is supported today). Sending the old DriverId-shaped P on
+	// rc.1+ fails once RRF's integer parser truncates it at the decimal point and the range check rejects
+	// the result ("parameter 'P' too high").
+	it("sends P0, not the DriverId, when useAccelNumberAddressing is set", () => {
+		expect(buildAccelCaptureCommand({ device: "121.0", useAccelNumberAddressing: true, samples: 1000, activate: 0 }))
+			.toBe("M956 P0 S1000 A0");
+	});
+
+	it("still sends the DriverId when useAccelNumberAddressing is explicitly false", () => {
+		expect(buildAccelCaptureCommand({ device: "121.0", useAccelNumberAddressing: false, samples: 1000, activate: 0 }))
+			.toBe("M956 P121.0 S1000 A0");
+	});
+
+	it("defaults to the DriverId when useAccelNumberAddressing is omitted (pre-rc.1 behaviour unchanged)", () => {
+		expect(buildAccelCaptureCommand({ device: "121.0", samples: 1000, activate: 0 })).toBe("M956 P121.0 S1000 A0");
+	});
 });
 
 describe("accelSampleCount", () => {
