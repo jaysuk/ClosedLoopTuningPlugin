@@ -17,8 +17,21 @@ earlier version, discard it.
 | 3 | Confirm an accepted near-zero I | `888661b` | Depends on §2. |
 | 4 | Explicit capture filenames, batch delete | `7b89f6b` | M569.5 `F"name"` confirmed against RRF source. |
 | 5 | Envelope check proves it reached the speed | `557017a` | `holds: boolean` → `outcome` tri-state. |
+| 6 | Model-fit fallback ramp re-measured the last prior P | (this commit) | Separate bug the tester found at 200 mm/s — see below. |
 
-560 tests pass; `vitest --typecheck`, `DWC_DIR` typecheck, `verify-build`, `check-ui36` all clean.
+562 tests pass; `vitest --typecheck`, `DWC_DIR` typecheck, `verify-build`, `check-ui36` all clean.
+
+### §6 — model-fit fallback re-measured the last reading and false-plateaued
+
+A medianOf=3 run at 200 mm/s: model-fit measured P30 and P50, the next capture failed, it fell back to
+the P stage "reusing its 2 ramp readings". The P stage then measured **P50 again** (not P70) and
+immediately declared "Tracking error plateaued" — the two P50 readings were naturally near-identical.
+The run finished at P50.
+
+`runAxisCycle` set the fallback ramp's `startValue` to `prior[prior.length - 1].value` — the last value
+already measured. `runSignalTerm` now, when primed, runs `strategy.decide(priorAttempts)` first and
+continues from its `set` value (P70), or accepts directly (no capture) if the priors already conclude
+the ramp.
 
 ### Deviations from this plan, made during implementation
 

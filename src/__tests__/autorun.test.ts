@@ -172,6 +172,40 @@ describe("runSignalTerm", () => {
 		expect(result.reason).toBe("Cancelled.");
 	});
 
+	describe("primed with earlier readings (model-fit fallback — docs/PLAN-v2.7-feedback.md §6)", () => {
+		// A well-behaved P ramp: tracking rms genuinely improves with P.
+		const rmsAt = (p: number) => Math.max(0.03, 20 / Math.max(1, p));
+		const readingAt = (p: number) => ({ value: p, signal: sig({ stats: { moveRms: rmsAt(p), restNoise: 0.02 } }) });
+
+		it("continues from the NEXT ramp value instead of re-measuring the last prior (the plateau-at-P50 bug)", async () => {
+			const pid = basePid();
+			const measured: Array<number> = [];
+			const captureSignal = vi.fn(async () => { measured.push(pid.p); return sig({ stats: { moveRms: rmsAt(pid.p), restNoise: 0.02 } }); });
+			const { effects } = fakeEffects({ captureSignal });
+			// model-fit measured P30 and P50, then a capture failed and it fell back here.
+			const prior = [readingAt(30), readingAt(50)];
+			const result = await runSignalTerm(effects, SIGNAL_P_STRATEGY, pid, 1, 2, 50, prior);
+			expect(result.ok).toBe(true);
+			expect(measured[0]).toBe(70); // NOT 50 again — the ramp's next value after 50
+			expect(measured).not.toContain(50); // never re-measures a value it already has
+			expect(pid.p).toBeGreaterThan(50); // the ramp actually progressed
+		});
+
+		it("accepts directly from the reused readings when they already conclude the ramp, spending no capture", async () => {
+			const pid = basePid();
+			const captureSignal = vi.fn(async () => sig({ stats: { moveRms: 0.03, restNoise: 0.02 } }));
+			const { effects } = fakeEffects({ captureSignal });
+			// Two near-identical readings — decide() plateaus immediately.
+			const prior = [
+				{ value: 90, signal: sig({ stats: { moveRms: 0.11, restNoise: 0.02 } }) },
+				{ value: 110, signal: sig({ stats: { moveRms: 0.109, restNoise: 0.02 } }) },
+			];
+			const result = await runSignalTerm(effects, SIGNAL_P_STRATEGY, pid, 1, 2, 110, prior);
+			expect(result.ok).toBe(true);
+			expect(captureSignal).toHaveBeenCalledTimes(1); // just the verification capture, no fresh ramp step
+		});
+	});
+
 	describe("I-stage dither confirmation (docs/PLAN-v2.7-feedback.md §3)", () => {
 		const cleanRest = { restTailValid: true, errorRestRipple: 0.05, errorRestRms: 0.02, errorRestQuantum: 0.05, pTermRestRipple: 5, pTermRestRms: 2, dTermRestRipple: 0, outputRestRipple: 0, restTailSamples: 100 };
 		const ditherRest = { ...cleanRest, errorRestRipple: 0.6 }; // 12 quanta — a real limit cycle

@@ -317,6 +317,26 @@ export async function runSignalTerm(
 	// three times over before this existed).
 	const attempts: Array<SignalAttempt> = [...priorAttempts];
 	const log: Array<AutoRunAttempt> = [];
+	// When primed with earlier readings (model-fit fallback), ask the strategy what it would do NEXT
+	// given them — so the ramp continues from the next value, not by re-measuring the last one. A
+	// re-measurement reads to decide() as a plateau (two near-identical readings of the same value) and
+	// stops the ramp one step in — a real field run finished at P50 this way. docs/PLAN-v2.7-feedback.md §6.
+	if (priorAttempts.length) {
+		const primed = strategy.decide(attempts);
+		if (primed.kind === "set") {
+			value = Math.min(primed.value, ceiling);
+		} else if (primed.kind === "accept") {
+			// The reused readings alone already conclude the ramp — verify and return without spending a
+			// fresh capture (this path exists precisely because captures are failing).
+			const verified = await verifyAccepted(effects, strategy.term, pid, primed.value, medianOf, verifyRetries);
+			if (!verified.ok) { effects.log(verified.reason); return { ok: false, reason: verified.reason, attempts: log }; }
+			pid[strategy.term] = verified.value;
+			await effects.applyPid(pid);
+			effects.log(`${strategy.label}: ✓ ${primed.note} (from the ${priorAttempts.length} reused readings)`);
+			return { ok: true, finalSignal: verified.signal, attempts: log };
+		}
+		// fail / noMove: leave `value` at the caller's startValue and measure it — the priors weren't usable.
+	}
 	for (let k = 0; k <= strategy.maxAttempts; k++) {
 		if (effects.isCancelled()) { return { ok: false, reason: "Cancelled.", attempts: log }; }
 		pid[strategy.term] = value;
@@ -523,7 +543,9 @@ async function runAxisCycle(
 		}
 		const isFeedForward = strategy.term === "a" || strategy.term === "v";
 		const prior = strategy.term === "p" ? pPriorAttempts : [];
-		// With primed readings, continue the ramp from where it stopped instead of restarting at the default.
+		// When `prior` is non-empty, runSignalTerm derives the real start from strategy.decide(prior) —
+		// continuing the ramp from the NEXT value rather than re-measuring the last (see the comment
+		// there). This startValue is only the fallback for when those readings don't conclude cleanly.
 		const startValue = prior.length
 			? prior[prior.length - 1].value
 			: (isFeedForward ? strategy.start : (seeded[strategy.term] ?? strategy.start));
