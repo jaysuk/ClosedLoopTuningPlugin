@@ -377,6 +377,9 @@ export function medianSignal(signals: Array<TuneSignal>): TuneSignal {
 		restEffort: {
 			pTermRestRipple: median(signals.map((s) => s.restEffort.pTermRestRipple)),
 			pTermRestRms: median(signals.map((s) => s.restEffort.pTermRestRms)),
+			errorRestRipple: median(signals.map((s) => s.restEffort.errorRestRipple)),
+			errorRestRms: median(signals.map((s) => s.restEffort.errorRestRms)),
+			errorRestQuantum: median(signals.map((s) => s.restEffort.errorRestQuantum)),
 			dTermRestRipple: median(signals.map((s) => s.restEffort.dTermRestRipple)),
 			outputRestRipple: median(signals.map((s) => s.restEffort.outputRestRipple)),
 			restTailSamples: median(signals.map((s) => s.restEffort.restTailSamples)),

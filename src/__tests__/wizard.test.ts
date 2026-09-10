@@ -74,22 +74,25 @@ describe("I step", () => {
 		expect(I.recommend(metrics({ steadyStateError: 0.02 }), 1000).verdict).toBe("accept");
 	});
 
-	// Real field case (docs/PLAN-standstill-effort.md): a limit cycle centred on zero has ~zero mean
-	// error, so steadyStateError alone can't tell it apart from a genuinely settled driver — the
-	// effort-ripple check is what does. Uses the REAL restEffort measured from the dithering capture
-	// (not a hand-built fake), with steadyStateError forced comfortably below the pre-existing
-	// threshold so this isolates the NEW gate rather than accidentally re-exercising the old one.
-	it("recommends INCREASING I when standstill effort ripple is high, even though steady-state error alone is fine", () => {
-		const dithering = realMetrics("hold-dither-i0.csv");
+	// A limit cycle centred on zero has ~zero mean error, so steadyStateError alone can't tell it apart
+	// from a settled driver — the position-error ripple check does. steadyStateError is forced below the
+	// pre-existing threshold so this isolates the dither gate. hold-limit-cycle-soft.csv: a real ±0.3
+	// step position oscillation. hold-dither-i0.csv: a 2-count quantisation flutter that the 2026-09-10
+	// field feedback established must NOT be treated as a dither (docs/PLAN-v2.7-feedback.md §2).
+	it("recommends INCREASING I on a real sub-rail limit cycle, even though steady-state error alone is fine", () => {
+		const dithering = realMetrics("hold-limit-cycle-soft.csv");
 		expect(dithering.restEffort.restTailValid).toBe(true);
-		expect(dithering.restEffort.pTermRestRipple).toBeGreaterThan(10);
 		const r = I.recommend(metrics({ steadyStateError: 0.02, restEffort: dithering.restEffort }), 0);
 		expect(r.verdict).toBe("increase");
+	});
+	it("ACCEPTS a capture whose standstill motion is only encoder quantisation flutter", () => {
+		const flutter = realMetrics("hold-dither-i0.csv");
+		expect(flutter.restEffort.restTailValid).toBe(true);
+		expect(I.recommend(metrics({ steadyStateError: 0.02, restEffort: flutter.restEffort }), 0).verdict).toBe("accept");
 	});
 	it("ACCEPTS the equivalent real capture once I has actually settled the standstill dither", () => {
 		const settled = realMetrics("hold-settled-i23.csv");
 		expect(settled.restEffort.restTailValid).toBe(true);
-		expect(settled.restEffort.pTermRestRipple).toBeLessThanOrEqual(10);
 		expect(I.recommend(settled, 23.5).verdict).toBe("accept");
 	});
 });

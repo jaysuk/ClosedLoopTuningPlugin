@@ -8,7 +8,7 @@
  * with A and V offered as advanced feed-forward steps (these need steady-speed G1 moves to judge, so
  * they give guidance rather than an auto-recommendation).
  */
-import { REST_EFFORT_RIPPLE_LIMIT, type StepMetrics } from "./analysis";
+import { dithersAtStandstill, type StepMetrics } from "./analysis";
 import { D_MAX } from "./autotune";
 import type { PidValues } from "./m569";
 
@@ -120,11 +120,11 @@ export const WIZARD_STEPS: Array<WizardStep> = [
 			// tail, or the integrator was still converging) means "can't judge effort yet" — steady-
 			// state error alone decides then, same as before this criterion existed.
 			const { restEffort } = m;
-			if (restEffort.restTailValid && restEffort.pTermRestRipple > REST_EFFORT_RIPPLE_LIMIT) {
+			if (dithersAtStandstill(restEffort)) {
 				return {
 					verdict: "increase",
-					message: `Steady-state error is ${m.steadyStateError.toFixed(2)} steps — fine — but the P term is still `
-						+ `swinging ${restEffort.pTermRestRipple.toFixed(1)} at rest, which is audible as buzz or hum. `
+					message: `Steady-state error is ${m.steadyStateError.toFixed(2)} steps — fine — but the position error is `
+						+ `swinging ${restEffort.errorRestRipple.toFixed(3)} step at rest, which is audible as buzz or hum. `
 						+ `Increase I so it holds the static load instead of P.`,
 					suggested: round(current <= 0 ? 1000 : current * 1.5),
 				};

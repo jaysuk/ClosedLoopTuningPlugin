@@ -9,7 +9,7 @@
  * series, `shapeCapturesForDownload` decides which captures keep their full CSV, and `slimModelForReport`
  * embeds only the board/axis/kinematics fields analysis actually uses instead of the whole model.
  */
-import { buildSeries, REST_EFFORT_RIPPLE_LIMIT } from "./analysis";
+import { buildSeries, dithersAtStandstill, type RestEffort } from "./analysis";
 import type { ParsedCapture } from "./csv";
 
 export interface DownsampledSeries {
@@ -75,10 +75,10 @@ export const REPORT_NOTABLE_SAT_DUTY = 0.12;
  * own dependencies stay limited to what report-shaping itself needs.
  */
 export function isNotableCapture(metrics: unknown): boolean {
-	const m = metrics as { pTermSatDuty?: number; restEffort?: { restTailValid: boolean; pTermRestRipple: number } } | null | undefined;
+	const m = metrics as { pTermSatDuty?: number; restEffort?: RestEffort } | null | undefined;
 	if (!m) { return false; }
 	if (typeof m.pTermSatDuty === "number" && m.pTermSatDuty >= REPORT_NOTABLE_SAT_DUTY) { return true; }
-	return !!(m.restEffort?.restTailValid && m.restEffort.pTermRestRipple > REST_EFFORT_RIPPLE_LIMIT);
+	return !!m.restEffort && dithersAtStandstill(m.restEffort);
 }
 
 /**

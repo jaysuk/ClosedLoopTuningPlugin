@@ -9,7 +9,7 @@
  *   bias at rest → I · lag at steady speed → V · spikes in accel/decel → A · overshoot → D · ringing → P↓/D↑
  */
 import {
-	buildSeries, computeRestEffort, REST_EFFORT_RIPPLE_LIMIT, REST_TAIL_FRACTION, REST_TAIL_MIN_SAMPLES, segmentMove,
+	buildSeries, computeRestEffort, dithersAtStandstill, REST_TAIL_FRACTION, REST_TAIL_MIN_SAMPLES, segmentMove,
 } from "./analysis";
 import type { ParsedCapture } from "./csv";
 import type { Vibration } from "./vibration";
@@ -271,12 +271,12 @@ export function evaluateTune(capture: ParsedCapture, sampleRateHz: number, vibra
 			// the capture ended) means "can't judge effort yet" — falls through to "Reaches target",
 			// same as before this check existed, never a false "dithers" finding.
 			const re = computeRestEffort(capture, sampleRateHz);
-			if (re.restTailValid && re.pTermRestRipple > REST_EFFORT_RIPPLE_LIMIT) {
+			if (dithersAtStandstill(re)) {
 				add({
 					severity: "warn",
 					title: "Dithers at standstill",
-					detail: `Position error is only ${b.toFixed(2)} step, but the P term swings ${re.pTermRestRipple.toFixed(1)} `
-						+ `at rest — the motor is working hard to hold position, which is audible as buzz or hum.`,
+					detail: `Position error swings ${re.errorRestRipple.toFixed(3)} step at rest (P term ${re.pTermRestRipple.toFixed(1)}) `
+						+ `while the motor holds position — more than encoder quantisation, and audible as buzz or hum.`,
 					fix: "Raise I (integral) so it holds the static load instead of P",
 					term: "i",
 					direction: "up",

@@ -163,9 +163,14 @@ describe("evaluation in the downloaded report", () => {
 });
 
 describe("isNotableCapture", () => {
-	it("a real dithering capture is notable — kept in full even mid-sequence", () => {
-		const dither = computeTuneSignal(load("hold-dither-i0.csv"), 2000);
+	it("a real sub-rail limit-cycle capture is notable — kept in full even mid-sequence", () => {
+		const dither = computeTuneSignal(load("hold-limit-cycle-soft.csv"), 2000);
 		expect(isNotableCapture(dither)).toBe(true);
+	});
+
+	it("a 2-count quantisation flutter is NOT notable (PLAN-v2.7 §2)", () => {
+		const flutter = computeTuneSignal(load("hold-dither-i0.csv"), 2000);
+		expect(isNotableCapture(flutter)).toBe(false);
 	});
 
 	it("a real settled capture is NOT notable", () => {
@@ -175,7 +180,7 @@ describe("isNotableCapture", () => {
 
 	it("an invalid rest-effort tail never makes a capture notable, however large the raw ripple number", () => {
 		const settled = computeTuneSignal(load("hold-settled-i23.csv"), 2000)!;
-		const invalid = { ...settled, restEffort: { ...settled.restEffort, restTailValid: false, pTermRestRipple: 999 } };
+		const invalid = { ...settled, restEffort: { ...settled.restEffort, restTailValid: false, errorRestRipple: 999 } };
 		expect(isNotableCapture(invalid)).toBe(false);
 	});
 
@@ -190,7 +195,7 @@ describe("isNotableCapture", () => {
 	});
 
 	it("end to end: a notable dithering capture keeps its raw CSV even mid-sequence, via the real composable wiring", () => {
-		const dither = computeTuneSignal(load("hold-dither-i0.csv"), 2000);
+		const dither = computeTuneSignal(load("hold-limit-cycle-soft.csv"), 2000);
 		const captures: Array<ReportCapture> = [
 			{ seq: 0, phase: "i", value: 0, metrics: dither, csv: "raw-csv-data", notable: isNotableCapture(dither) },
 			{ seq: 1, phase: "i", value: 1000, csv: "raw-csv-data", notable: false },

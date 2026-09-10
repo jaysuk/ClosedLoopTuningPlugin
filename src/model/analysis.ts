@@ -338,10 +338,30 @@ export const REST_TAIL_MIN_SAMPLES = 25;
 export const I_SETTLED_TOL_FRACTION = 0.01;
 
 export interface RestEffort {
-	/** Peak-to-peak PID P term over the settled tail of the rest window — the primary dither signal. */
+	/** Peak-to-peak PID P term over the settled tail of the rest window — reported for the log/report so
+	 *  the user sees the effort number they hear as buzz. NOT the dither decision basis: see
+	 *  `errorRestRipple` and docs/PLAN-v2.7-feedback.md §2. */
 	pTermRestRipple: number;
 	/** RMS about the mean over the same window (outlier-resistant companion to p2p). */
 	pTermRestRms: number;
+	/**
+	 * Peak-to-peak POSITION error (steps) over the same settled tail — the dither DECISION basis. The P
+	 * term is `P × error`, so a fixed P-term limit means a different real movement at every P: at P=340
+	 * the old fixed P-term limit of 10 was ~0.6 encoder counts, below one quantisation step, so any
+	 * standstill motion at all tripped "Dithers at standstill". Position error is P-independent. 0 when
+	 * the capture didn't record a "Current Error" column.
+	 */
+	errorRestRipple: number;
+	/** RMS about the mean of the same position-error signal — reported for the log/report. */
+	errorRestRms: number;
+	/**
+	 * The encoder's own quantisation step (steps) recovered from the data: the smallest non-zero gap
+	 * between consecutive rest-tail position-error samples. At standstill the error steps between
+	 * adjacent encoder counts, so this is the encoder resolution without needing it in the object model.
+	 * 0 when the tail never moved (fully settled) or no error column. `dithersAtStandstill` scales its
+	 * threshold by this so a 1-2 count flutter never reads as a limit cycle on any encoder resolution.
+	 */
+	errorRestQuantum: number;
 	/** Peak-to-peak PID D term over the same window. 0 when the capture didn't record it. Reported for
 	 *  the tuning report only — no field data yet to calibrate a D threshold against. */
 	dTermRestRipple: number;
@@ -360,8 +380,8 @@ export interface RestEffort {
 /** The all-zero/"not measured" shape — always `restTailValid: false`, so it can never accidentally
  *  gate a decision. Exported for test fixtures that build a StepMetrics/TuneSignal by hand. */
 export const EMPTY_REST_EFFORT: RestEffort = {
-	pTermRestRipple: 0, pTermRestRms: 0, dTermRestRipple: 0, outputRestRipple: 0,
-	restTailSamples: 0, restTailValid: false,
+	pTermRestRipple: 0, pTermRestRms: 0, errorRestRipple: 0, errorRestRms: 0, errorRestQuantum: 0,
+	dTermRestRipple: 0, outputRestRipple: 0, restTailSamples: 0, restTailValid: false,
 };
 
 function peakToPeak(a: Array<number>): number {
@@ -379,6 +399,16 @@ function rmsAboutMean(a: Array<number>): number {
 	if (a.length === 0) { return 0; }
 	const mean = a.reduce((s, v) => s + v, 0) / a.length;
 	return Math.sqrt(a.reduce((s, v) => s + (v - mean) ** 2, 0) / a.length);
+}
+
+/** Smallest non-zero gap between consecutive samples — the quantisation step of a quantised signal. */
+function smallestStep(a: Array<number>): number {
+	let q = Infinity;
+	for (let i = 1; i < a.length; i++) {
+		const d = Math.abs(a[i] - a[i - 1]);
+		if (d > 1e-9 && d < q) { q = d; }
+	}
+	return Number.isFinite(q) ? q : 0;
 }
 
 /**
@@ -404,8 +434,10 @@ export function computeRestEffort(capture: ParsedCapture, sampleRateHz: number):
 	const tailOf = (a: Array<number>) => a.slice(tailStart, n).filter(Number.isFinite);
 
 	const pTail = tailOf(pterm);
+	const errcol = column(capture, "Current Error");
 	const dcol = column(capture, "PID D Term");
 	const outcol = column(capture, "PID Control Signal");
+	const errTail = errcol ? tailOf(errcol) : [];
 	const dTail = dcol ? tailOf(dcol) : [];
 	const outTail = outcol ? tailOf(outcol) : [];
 
@@ -425,6 +457,9 @@ export function computeRestEffort(capture: ParsedCapture, sampleRateHz: number):
 	return {
 		pTermRestRipple: peakToPeak(pTail),
 		pTermRestRms: rmsAboutMean(pTail),
+		errorRestRipple: peakToPeak(errTail),
+		errorRestRms: rmsAboutMean(errTail),
+		errorRestQuantum: smallestStep(errTail),
 		dTermRestRipple: peakToPeak(dTail),
 		outputRestRipple: peakToPeak(outTail),
 		restTailSamples: pTail.length,
@@ -432,9 +467,28 @@ export function computeRestEffort(capture: ParsedCapture, sampleRateHz: number):
 	};
 }
 
-/** Peak-to-peak P-term at rest above this = control-effort dither, even if position error is tiny.
- *  Judgement call between the measured, real-capture values 3.60 (stable) and 33.60 (dithering) —
- *  ~3x margin either side. P-term units; 4% of the 250 rail (P_TERM_RAIL). See docs/PLAN-standstill-
- *  effort.md §3.3 for the full calibration set this was picked against. Only ever gates a decision
- *  when `restTailValid` is also true — see each consumer (autotune.ts, wizard.ts, evaluate.ts). */
-export const REST_EFFORT_RIPPLE_LIMIT = 10;
+/**
+ * A standstill dither is a real mechanical movement well above the encoder's own quantisation. The
+ * threshold is `max(DITHER_MIN_STEPS, DITHER_MIN_QUANTA × the measured quantum)`:
+ *  - The old fixed P-term limit (10) meant a different real movement at every P — at P=340 it was
+ *    ~0.6 encoder counts, so any standstill motion at all tripped it and a numerically better tune
+ *    could score worse (field data 2026-09-10). Position error is P-independent.
+ *  - 0.2 step sits clearly above a 1-2 count flutter (0.05-0.10 step on a 1000-PPR-quadrature machine)
+ *    and above the original calibration's "stable" case (~0.14 step), and below its "dithering" case
+ *    (~1.34 step) — see docs/PLAN-standstill-effort.md §3.3 and docs/PLAN-v2.7-feedback.md §2.
+ *  - The quanta term keeps it honest on any encoder resolution: 4 counts, whatever a count is here.
+ */
+export const DITHER_MIN_STEPS = 0.2;
+export const DITHER_MIN_QUANTA = 4;
+
+/**
+ * True when the settled rest tail shows a real limit cycle rather than encoder quantisation noise.
+ * Judged on the P-INDEPENDENT position-error ripple. Returns false whenever `restTailValid` is false
+ * (tail too short, or the integrator hadn't converged) — never a false finding, same contract the old
+ * `REST_EFFORT_RIPPLE_LIMIT` checks had.
+ */
+export function dithersAtStandstill(re: RestEffort): boolean {
+	if (!re.restTailValid) { return false; }
+	const quantaFloor = re.errorRestQuantum > 0 ? DITHER_MIN_QUANTA * re.errorRestQuantum : 0;
+	return re.errorRestRipple > Math.max(DITHER_MIN_STEPS, quantaFloor);
+}

@@ -151,13 +151,14 @@ describe("evaluateTune", () => {
 		expect(e.score).toBeLessThanOrEqual(100);
 	});
 
-	// Real field case (docs/PLAN-standstill-effort.md): the panel previously graded this exact capture
-	// "Reaches target — no standing offset", good severity, on the strength of restBias alone — while
-	// the driver was audibly dithering at standstill the whole time. Uses the real user-supplied
-	// captures, not a hand-built fake.
-	describe("standstill effort ripple (real field captures)", () => {
-		it("flags dithering at standstill instead of calling it good, and does NOT also emit 'Reaches target'", () => {
-			const e = evaluateTune(loadCapture("hold-dither-i0.csv"), 2000);
+	// The panel previously graded a dithering capture "Reaches target — no standing offset", good
+	// severity, on restBias alone. The check flags a real position-error limit cycle instead — but NOT
+	// a 1-2 encoder-count quantisation flutter, which at high P swings the P term hard without the axis
+	// meaningfully moving (docs/PLAN-v2.7-feedback.md §2; the 2026-09-10 field feedback where a
+	// numerically better tune scored worse purely because its final capture caught a 2-count flutter).
+	describe("standstill dither (real + realistic field captures)", () => {
+		it("flags a real sub-rail limit cycle instead of calling it good, and does NOT also emit 'Reaches target'", () => {
+			const e = evaluateTune(loadCapture("hold-limit-cycle-soft.csv"), 2000);
 			const dither = e.findings.find((f) => f.title === "Dithers at standstill");
 			expect(dither).toBeTruthy();
 			expect(dither!.severity).toBe("warn");
@@ -165,6 +166,12 @@ describe("evaluateTune", () => {
 			expect(dither!.direction).toBe("up");
 			expect(e.findings.some((f) => f.title === "Reaches target")).toBe(false);
 			expect(e.grade).not.toBe("excellent");
+		});
+
+		it("does NOT flag a 2-count quantisation flutter at high P (the scoring-inversion regression)", () => {
+			const e = evaluateTune(loadCapture("hold-dither-i0.csv"), 2000);
+			expect(e.findings.some((f) => f.title === "Dithers at standstill")).toBe(false);
+			expect(e.findings.some((f) => f.title === "Reaches target")).toBe(true);
 		});
 
 		it("does not flag the equivalent settled capture, and still emits 'Reaches target'", () => {

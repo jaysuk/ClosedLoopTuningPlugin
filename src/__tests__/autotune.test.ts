@@ -247,15 +247,23 @@ describe("SIGNAL_I_STRATEGY", () => {
 		if (d.kind === "accept") expect(d.value).toBe(1000);
 	});
 
-	// Real field case (docs/PLAN-standstill-effort.md): restBias alone accepts BOTH of these captures
-	// (a limit cycle centred on zero has ~zero mean error) — the effort-ripple check is what tells them
-	// apart. computeTuneSignal on the real captures, not a hand-built fake, so this exercises the real
-	// restEffort wiring end to end, not just the strategy's own logic in isolation.
-	it("REJECTS a real capture of the driver audibly dithering at I=0, even though restBias alone would accept it", () => {
-		const dithering = realSignal("hold-dither-i0.csv");
+	// restBias alone accepts BOTH of these captures (a limit cycle centred on zero has ~zero mean error)
+	// — the position-error ripple check is what tells them apart. computeTuneSignal on real/realistic
+	// captures, not hand-built fakes, so this exercises the real restEffort wiring end to end.
+	it("REJECTS a capture with a real sub-rail limit cycle at I=0, even though restBias alone would accept it", () => {
+		const dithering = realSignal("hold-limit-cycle-soft.csv"); // ±0.3 step position oscillation, P term not railed
 		expect(Math.abs(dithering.stats.restBias)).toBeLessThanOrEqual(0.25); // bias alone says "fine"
+		expect(dithering.postMoveOsc).toBe(0); // not a railed hunt — isolates the dither check from signalUnstable
 		const d = SIGNAL_I_STRATEGY.decide([sat(0, dithering)]);
 		expect(d.kind).toBe("set"); // keeps raising I instead of accepting
+	});
+
+	it("ACCEPTS a capture whose standstill motion is only encoder quantisation flutter (PLAN-v2.7 §2)", () => {
+		// hold-dither-i0.csv: P≈340, I=0, position error moves only 2 encoder counts — the 2026-09-10
+		// field feedback established this is quantisation, not a limit cycle, and I=0 is acceptable.
+		const flutter = realSignal("hold-dither-i0.csv");
+		const d = SIGNAL_I_STRATEGY.decide([sat(0, flutter)]);
+		expect(d.kind).toBe("accept");
 	});
 
 	it("ACCEPTS the equivalent real capture once I has actually settled the standstill dither", () => {
