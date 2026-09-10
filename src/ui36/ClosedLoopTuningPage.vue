@@ -472,17 +472,19 @@
 						</v-list>
 					</v-card-text>
 				</v-card>
-				<v-card v-if="tuneSession && tuneSession.envelopeCheck" class="mb-2" :outlined="tuneSession.envelopeCheck.holds" :color="tuneSession.envelopeCheck.holds ? undefined : 'warning'">
+				<v-card v-if="tuneSession && tuneSession.envelopeCheck" class="mb-2" :outlined="tuneSession.envelopeCheck.outcome !== 'saturates'" :color="tuneSession.envelopeCheck.outcome === 'saturates' ? 'warning' : undefined">
 					<v-card-text class="py-3">
 						<div class="d-flex align-center mb-1">
-							<v-icon class="mr-2" :color="tuneSession.envelopeCheck.holds ? 'success' : undefined">{{ tuneSession.envelopeCheck.holds ? "mdi-check-circle" : "mdi-alert" }}</v-icon>
-							<span class="text-subtitle-1">{{ tuneSession.envelopeCheck.holds ? "Holds at the machine's configured max" : "Saturates at the machine's configured max" }}</span>
+							<v-icon class="mr-2" :color="tuneSession.envelopeCheck.outcome === 'holds' ? 'success' : undefined">{{ tuneSession.envelopeCheck.outcome === 'holds' ? "mdi-check-circle" : tuneSession.envelopeCheck.outcome === 'saturates' ? "mdi-alert" : "mdi-help-circle-outline" }}</v-icon>
+							<span class="text-subtitle-1">{{ tuneSession.envelopeCheck.outcome === 'holds' ? "Holds at the machine's configured max" : tuneSession.envelopeCheck.outcome === 'saturates' ? "Saturates at the machine's configured max" : "Envelope check inconclusive" }}</span>
 							<v-spacer />
 							<HelpTip class="ml-1" text="A validation capture at the axis's own configured M203/M201 (its true speed/acceleration ceiling) — separate from the moderate profile identification itself used, which deliberately stays below saturation so the ramp has something to measure. Report-only: never changes the tuned values, only tells you whether they still hold once the machine is driven to what it's actually configured to do. If your slicer's real print speeds are well below the configured M203/M201, this checks a stricter limit than you'll ever actually reach." />
 						</div>
 						<div class="text-body-2 cl-on-grade">
-							Checked at F{{ tuneSession.envelopeCheck.feedMmPerMin.toFixed(0) }} — {{ (tuneSession.envelopeCheck.satDuty * 100).toFixed(1) }}% saturation duty.
-							<template v-if="!tuneSession.envelopeCheck.holds">This tune may need a lower P (or more V/A feed-forward) if the machine is ever driven to its configured M203/M201 limits.</template>
+							<template v-if="tuneSession.envelopeCheck.outcome === 'inconclusive'">The move only reached F{{ tuneSession.envelopeCheck.achievedFeedMmPerMin.toFixed(0) }} of the F{{ tuneSession.envelopeCheck.feedMmPerMin.toFixed(0) }} the axis is configured for — too short to accelerate that far. This tune has not been checked at the machine's real limits.</template>
+							<template v-else>Checked at F{{ tuneSession.envelopeCheck.feedMmPerMin.toFixed(0) }} — {{ (tuneSession.envelopeCheck.satDuty * 100).toFixed(1) }}% saturation duty.
+								<template v-if="tuneSession.envelopeCheck.outcome === 'saturates'">This tune may need a lower P (or more V/A feed-forward) if the machine is ever driven to its configured M203/M201 limits.</template>
+							</template>
 						</div>
 					</v-card-text>
 				</v-card>

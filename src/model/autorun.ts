@@ -942,9 +942,12 @@ export async function runAutoTune(effects: TuneEffects, startPid: PidConfig, opt
 		const check = await effects.checkEnvelope();
 		if (check) {
 			envelopeCheck = check;
-			effects.log(check.holds
-				? `Envelope check: holds at the axis's configured max (F${check.feedMmPerMin.toFixed(0)}, sat ${(check.satDuty * 100).toFixed(1)}%).`
-				: `Envelope check: does NOT hold at the axis's configured max (F${check.feedMmPerMin.toFixed(0)}, sat ${(check.satDuty * 100).toFixed(1)}%) — this tune may saturate if the machine is driven to its configured M203/M201 limits.`);
+			const at = `F${check.feedMmPerMin.toFixed(0)}, sat ${(check.satDuty * 100).toFixed(1)}%`;
+			effects.log(
+				check.outcome === "holds" ? `Envelope check: holds at the axis's configured max (${at}).`
+				: check.outcome === "saturates" ? `Envelope check: does NOT hold at the axis's configured max (${at}) — this tune may saturate if the machine is driven to its configured M203/M201 limits.`
+				: `Envelope check: inconclusive — the move only reached F${check.achievedFeedMmPerMin.toFixed(0)} of the F${check.feedMmPerMin.toFixed(0)} the axis is configured for (too short to accelerate that far). This tune has not been checked at the machine's real limits.`,
+			);
 		}
 	} catch (e) {
 		effects.log(`Envelope check skipped: ${e instanceof Error ? e.message : String(e)}`);

@@ -21,15 +21,22 @@ import type { PidTerm } from "./wizard";
  * actually configured to do. Report-only by design — never feeds back into the tune itself (§6.4).
  */
 export interface EnvelopeCheck {
-	/** Motor-space feed the check capture ran at, mm/min — the speed at which the first coupled axis to
-	 *  reach ITS OWN configured M203 does so (see docs/PLAN-envelope-check.md, "the feed conversion needs
-	 *  every coupled axis, not just the tuned one"). */
+	/** Motor-space feed the check capture was COMMANDED at, mm/min — the speed at which the first coupled
+	 *  axis to reach ITS OWN configured M203 does so (see docs/PLAN-envelope-check.md). */
 	feedMmPerMin: number;
-	/** Saturation duty measured at that feed. */
+	/** The peak motor-space feed the move actually REACHED, mm/min, measured from the capture's own
+	 *  commanded-velocity profile. Well below `feedMmPerMin` means the auto-sized move (capped at
+	 *  AUTO_MOVE_CAP_MM) was too short to accelerate that far — see `outcome: "inconclusive"`. */
+	achievedFeedMmPerMin: number;
+	/** Saturation duty measured at the achieved speed. */
 	satDuty: number;
-	/** True when satDuty stays below MODEL_FIT_SAT_ONSET — the same "saturating" line model-fit's own
-	 *  ramp already uses, reused here rather than inventing a second threshold for the same question. */
-	holds: boolean;
+	/**
+	 * - `"holds"`: reached (near) the configured max and did not saturate.
+	 * - `"saturates"`: reached the configured max and DID saturate — the tune may not be safe at speed.
+	 * - `"inconclusive"`: the move was too short to reach the configured max, so this run did NOT
+	 *   actually test the axis at its limits (docs/PLAN-v2.7-feedback.md §5).
+	 */
+	outcome: "holds" | "saturates" | "inconclusive";
 }
 
 export interface TuneEffects {

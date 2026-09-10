@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { analyzeStep, type CaptureSeries } from "../model/analysis";
 import { parseCapture, type ParsedCapture } from "../model/csv";
-import { analyzeCapture, analyzeMove } from "../model/analysis";
+import { analyzeCapture, analyzeMove, peakCommandedSpeedMmPerMin } from "../model/analysis";
 
 /** Build a synthetic step response: target steps 0→4 at index 20, measured overshoots then settles. */
 function syntheticStep(overshoot: number, ssError: number): CaptureSeries {
@@ -102,5 +102,53 @@ describe("analyzeMove (A/V feed-forward)", () => {
 			truncated: false,
 		};
 		expect(analyzeMove(capture, 1000)!.hasMove).toBe(false);
+	});
+});
+
+describe("peakCommandedSpeedMmPerMin (PLAN-v2.7 §5)", () => {
+	// A trapezoid target profile: `unitsPerMm` units/mm, cruising at `cruiseUnitsPerS` for the middle.
+	function trapezoidCsv(distMm: number, unitsPerMm: number, rate: number, cruiseUnitsPerS: number): string {
+		const dv = cruiseUnitsPerS / rate; // units per sample during cruise
+		const totalUnits = distMm * unitsPerMm;
+		const accelSamples = 40;
+		const rows = ["Sample,Timestamp,Target Motor Steps,PID P Term"];
+		let pos = 0;
+		let s = 0;
+		const push = () => rows.push(`${s},${(s / rate).toFixed(4)},${pos.toFixed(4)},0`);
+		push();
+		for (let i = 0; i < accelSamples; i++) { s++; pos += dv * ((i + 1) / accelSamples); push(); }
+		while (pos < totalUnits - dv * accelSamples) { s++; pos += dv; push(); }
+		for (let i = 0; i < accelSamples; i++) { s++; pos += dv * (1 - (i + 1) / accelSamples); push(); }
+		for (let i = 0; i < 60; i++) { s++; push(); } // rest
+		return rows.join("\n");
+	}
+
+	it("recovers the commanded speed regardless of the capture's step unit (span/distance scaling)", () => {
+		// 200 mm move, 5 units/mm (full-step domain), 1714 Hz, cruising at 1500 units/s = 300 mm/s = F18000.
+		const cap = parseCapture(trapezoidCsv(200, 5, 1714, 1500));
+		const feed = peakCommandedSpeedMmPerMin(cap, 1714, 200);
+		expect(feed).toBeGreaterThan(0.95 * 18000);
+		expect(feed).toBeLessThan(1.15 * 18000); // a little derivative overshoot is fine
+	});
+
+	it("a too-short triangle move peaks well below the commanded feed", () => {
+		// The move only ever reaches ~half its commanded cruise speed before it has to decelerate.
+		const rows = ["Sample,Timestamp,Target Motor Steps,PID P Term"];
+		const rate = 1000;
+		let pos = 0;
+		for (let i = 0; i < 30; i++) { pos += i * 0.5; rows.push(`${i},${i / rate},${pos.toFixed(3)},0`); }
+		for (let i = 30; i < 60; i++) { pos += (60 - i) * 0.5; rows.push(`${i},${i / rate},${pos.toFixed(3)},0`); }
+		for (let i = 60; i < 100; i++) { rows.push(`${i},${i / rate},${pos.toFixed(3)},0`); }
+		const cap = parseCapture(rows.join("\n"));
+		// distance chosen so that a full-speed move would be much faster than this triangle's apex
+		const feed = peakCommandedSpeedMmPerMin(cap, rate, pos / 5); // 5 units/mm
+		expect(feed).toBeGreaterThan(0);
+	});
+
+	it("returns 0 when the target column is missing or the distance is unknown", () => {
+		const noTarget = parseCapture("Sample,Timestamp,PID P Term\n0,0,1\n1,1,1\n2,2,1\n");
+		expect(peakCommandedSpeedMmPerMin(noTarget, 1000, 200)).toBe(0);
+		const cap = parseCapture(trapezoidCsv(200, 5, 1000, 1000));
+		expect(peakCommandedSpeedMmPerMin(cap, 1000, 0)).toBe(0);
 	});
 });

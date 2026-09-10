@@ -58,14 +58,21 @@ export const MODEL_FIT_BACKOFF_DEFAULT = 0.65;
  * (the same P read 256 one day and 180 the next on the same machine), so sat duty backs it up. */
 export const MODEL_FIT_SAT_ONSET = 0.02;
 
+/** Achieved feed must be at least this fraction of the commanded feed for the envelope check to have
+ *  actually tested the axis at its limits — below it the move was too short to accelerate there. */
+export const ENVELOPE_REACH_FRACTION = 0.9;
+
 /**
- * Interpret a validation capture's saturation duty against MODEL_FIT_SAT_ONSET — the same "the loop is
- * saturating" line the ramp above already uses, reused rather than inventing a second threshold for the
- * same underlying question (docs/PLAN-envelope-check.md, decision D). Pure so the judgment call lives in
- * one tested place; the host adapter only needs to measure satDuty, not decide what it means.
+ * Interpret a validation capture. Saturation is judged against MODEL_FIT_SAT_ONSET — the same "the loop
+ * is saturating" line the ramp above uses (docs/PLAN-envelope-check.md, decision D). But first: if the
+ * move never reached (near) the commanded feed, the check tested nothing meaningful and the result is
+ * `"inconclusive"` regardless of sat duty — a comfortable 0% at half the speed must not read as "holds"
+ * (docs/PLAN-v2.7-feedback.md §5). Pure so the judgment call lives in one tested place.
  */
-export function evaluateEnvelope(feedMmPerMin: number, satDuty: number): EnvelopeCheck {
-	return { feedMmPerMin, satDuty, holds: satDuty < MODEL_FIT_SAT_ONSET };
+export function evaluateEnvelope(feedMmPerMin: number, achievedFeedMmPerMin: number, satDuty: number): EnvelopeCheck {
+	const reached = feedMmPerMin > 0 && achievedFeedMmPerMin >= ENVELOPE_REACH_FRACTION * feedMmPerMin;
+	const outcome = !reached ? "inconclusive" : satDuty < MODEL_FIT_SAT_ONSET ? "holds" : "saturates";
+	return { feedMmPerMin, achievedFeedMmPerMin, satDuty, outcome };
 }
 /** Enough geometric-ramp steps to go from SEED_START all the way to P_MAX (30 → … → 600 is 13 steps).
  * The previous budget of 10 expired at P=335.7 — provably one-to-two steps short of a real machine's

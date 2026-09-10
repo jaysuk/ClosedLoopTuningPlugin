@@ -747,29 +747,38 @@ describe("runAutoTune — final verification", () => {
 });
 
 describe("runAutoTune — envelope check (docs/PLAN-envelope-check.md)", () => {
+	const envCheck = (over: Record<string, unknown>) => ({ feedMmPerMin: 36000, achievedFeedMmPerMin: 35000, satDuty: 0.001, outcome: "holds" as const, ...over });
+
 	it("carries a holding result through to AutoRunResult and logs it", async () => {
-		const checkEnvelope = vi.fn(async () => ({ feedMmPerMin: 36000, satDuty: 0.001, holds: true }));
+		const checkEnvelope = vi.fn(async () => envCheck({}));
 		const { effects, log } = fakeEffects({ checkEnvelope });
 		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
 		expect(result.ok).toBe(true);
-		expect(result.envelopeCheck).toEqual({ feedMmPerMin: 36000, satDuty: 0.001, holds: true });
+		expect(result.envelopeCheck?.outcome).toBe("holds");
 		expect(checkEnvelope).toHaveBeenCalledTimes(1);
 		expect(log.some((l) => l.includes("Envelope check: holds"))).toBe(true);
 	});
 
-	it("carries a non-holding result through and logs it as a warning, without touching the tuned pid", async () => {
+	it("carries a saturating result through and logs it as a warning, without touching the tuned pid", async () => {
 		// Same tuning inputs (a converging signal), differing only in what checkEnvelope reports — proves
-		// a failing envelope check (docs/PLAN-rail-detection.md §6.4 / PLAN-envelope-check.md decision: it
-		// is report-only) does not perturb the P the run already converged on, whatever that value is.
+		// a saturating envelope check (report-only) does not perturb the P the run already converged on.
 		const captureSignal = vi.fn(async () => sig({ stats: { moveRms: Math.max(0.05, 20 / Math.max(1, 100)), restNoise: 0.05 } }));
-		const holding = fakeEffects({ captureSignal, checkEnvelope: vi.fn(async () => ({ feedMmPerMin: 36000, satDuty: 0, holds: true })) });
-		const failing = fakeEffects({ captureSignal, checkEnvelope: vi.fn(async () => ({ feedMmPerMin: 36000, satDuty: 0.05, holds: false })) });
+		const holding = fakeEffects({ captureSignal, checkEnvelope: vi.fn(async () => envCheck({ satDuty: 0 })) });
+		const failing = fakeEffects({ captureSignal, checkEnvelope: vi.fn(async () => envCheck({ satDuty: 0.05, outcome: "saturates" })) });
 		const holdingResult = await runAutoTune(holding.effects, basePid(), { cycles: 1, hasAxis: true });
 		const failingResult = await runAutoTune(failing.effects, basePid(), { cycles: 1, hasAxis: true });
 		expect(failingResult.ok).toBe(true);
-		expect(failingResult.envelopeCheck?.holds).toBe(false);
+		expect(failingResult.envelopeCheck?.outcome).toBe("saturates");
 		expect(failing.log.some((l) => l.includes("does NOT hold"))).toBe(true);
 		expect(failingResult.pid).toEqual(holdingResult.pid);
+	});
+
+	it("logs an inconclusive result distinctly (PLAN-v2.7 §5)", async () => {
+		const checkEnvelope = vi.fn(async () => envCheck({ feedMmPerMin: 96000, achievedFeedMmPerMin: 45000, satDuty: 0, outcome: "inconclusive" }));
+		const { effects, log } = fakeEffects({ checkEnvelope });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
+		expect(result.envelopeCheck?.outcome).toBe("inconclusive");
+		expect(log.some((l) => l.includes("Envelope check: inconclusive") && l.includes("F45000"))).toBe(true);
 	});
 
 	it("leaves envelopeCheck undefined and doesn't fail the run when there is nothing to check", async () => {
@@ -797,11 +806,11 @@ describe("runAutoTune — envelope check (docs/PLAN-envelope-check.md)", () => {
 				? evaluation({ grade: "fair", score: 60, findings: [{ severity: "warn", title: "x", detail: "x", term: "d", direction: "up" }] })
 				: evaluation({ grade: "good", score: 85 });
 		});
-		const checkEnvelope = vi.fn(async () => ({ feedMmPerMin: 24000, satDuty: 0, holds: true }));
+		const checkEnvelope = vi.fn(async () => envCheck({ feedMmPerMin: 24000, achievedFeedMmPerMin: 23000, satDuty: 0 }));
 		const { effects } = fakeEffects({ evaluateCapture, checkEnvelope });
 		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
 		expect(result.ok).toBe(true);
-		expect(result.envelopeCheck?.holds).toBe(true);
+		expect(result.envelopeCheck?.outcome).toBe("holds");
 	});
 });
 

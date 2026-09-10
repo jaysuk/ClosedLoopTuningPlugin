@@ -11,6 +11,29 @@ export interface CaptureSeries {
 	target: Array<number>;      // motor steps
 }
 
+/**
+ * Peak commanded speed of a capture's move, in mm/min — from the Target Motor Steps derivative, scaled
+ * by the capture's OWN steps-per-mm (target span ÷ the known commanded distance, so it needs no
+ * object-model stepsPerMm and is immune to full-step vs microstep ambiguity). 0 when it can't be
+ * measured. The envelope check uses this to tell "the axis was actually driven to its configured max"
+ * from "the move was too short to accelerate that far" (docs/PLAN-v2.7-feedback.md §5).
+ */
+export function peakCommandedSpeedMmPerMin(capture: ParsedCapture, sampleRateHz: number, distanceMm: number): number {
+	const target = column(capture, "Target Motor Steps");
+	if (!target || target.length < 3 || !(distanceMm > 0) || !(sampleRateHz > 0)) { return 0; }
+	let lo = Infinity;
+	let hi = -Infinity;
+	for (const v of target) { if (Number.isFinite(v)) { if (v < lo) { lo = v; } if (v > hi) { hi = v; } } }
+	const unitsPerMm = (hi - lo) / distanceMm;
+	if (!(unitsPerMm > 0)) { return 0; }
+	let peak = 0;
+	for (let i = 1; i < target.length; i++) {
+		const dv = Math.abs((target[i] - target[i - 1]) * sampleRateHz);
+		if (Number.isFinite(dv) && dv > peak) { peak = dv; }
+	}
+	return (peak / unitsPerMm) * 60;
+}
+
 /** Build aligned measured/target/time series from a parsed capture. Returns null if columns missing. */
 export function buildSeries(capture: ParsedCapture, sampleRateHz: number): CaptureSeries | null {
 	const measured = column(capture, "Measured Motor Steps");

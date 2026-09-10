@@ -35,7 +35,7 @@ import {
 	parsePidReply, type CalibrationMove, type EncoderType, type LoopMode, type PidConfig,
 } from "../model/m569";
 import { achievedRateHz, parseCapture, type ParsedCapture } from "../model/csv";
-import { analyzeCapture, analyzeMove, buildSeries, segmentMove, type StepMetrics } from "../model/analysis";
+import { analyzeCapture, analyzeMove, buildSeries, peakCommandedSpeedMmPerMin, segmentMove, type StepMetrics } from "../model/analysis";
 import {
 	CENTER_TOLERANCE_MM, CENTERING_FEED_MM_MIN, DEFAULT_MARGIN_MM, envelopeFeedMmPerMin,
 	getAxisLimits, midpoint, planCaptureProfile, planCoupledSymmetricMove, rateCeilingForBoard,
@@ -1268,6 +1268,12 @@ export function useClosedLoopTuning(host: HostAdapter) {
 	interface RawCaptureResult {
 		capture: ParsedCapture;
 		rateHz: number;
+		/** Commanded (motor-space) move distance for this capture, mm — the planned `profile.distance`.
+		 *  `checkEnvelope` uses it with the capture's own target span to work out whether the move actually
+		 *  reached the feed it was commanded at. */
+		moveDistanceMm: number;
+		/** Motor-space feed the move was commanded at, mm/min. */
+		feedMmPerMin: number;
 		/** Present only when vibration recording was on AND the accelerometer capture came back usable. */
 		vibration?: Vibration;
 	}
@@ -1400,7 +1406,7 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		// attempt produced no new data, so the last real reading stays exactly as valid as it was.
 		if (!c) { return null; }
 		const vibration = await collectAccel(pending, c, profile.sampleRateHz);
-		return { capture: c, rateHz: profile.sampleRateHz, vibration };
+		return { capture: c, rateHz: profile.sampleRateHz, moveDistanceMm: profile.distance, feedMmPerMin: feed, vibration };
 	}
 
 	async function captureSignal(): Promise<TuneSignal | null> {
@@ -1454,7 +1460,11 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		if (!result) { return null; }
 		const move = analyzeMove(result.capture, result.rateHz);
 		if (!move) { return null; }
-		return evaluateEnvelope(feedMmPerMin, move.pTermSatDuty);
+		// Whether the axis actually reached the commanded feed — a 200 mm-capped auto-sized move on a
+		// short axis can't accelerate to a high M203, so a comfortable 0% sat duty at half the speed must
+		// not read as "holds" (docs/PLAN-v2.7-feedback.md §5).
+		const achievedFeedMmPerMin = peakCommandedSpeedMmPerMin(result.capture, result.rateHz, result.moveDistanceMm);
+		return evaluateEnvelope(feedMmPerMin, achievedFeedMmPerMin, move.pTermSatDuty);
 	}
 
 	function log(line: string): void {

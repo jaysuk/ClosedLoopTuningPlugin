@@ -78,19 +78,25 @@ describe("restNoiseToPTermFloor", () => {
 	});
 });
 
-describe("evaluateEnvelope (docs/PLAN-envelope-check.md)", () => {
-	it("holds when satDuty stays below MODEL_FIT_SAT_ONSET", () => {
-		const r = evaluateEnvelope(36000, MODEL_FIT_SAT_ONSET / 2);
-		expect(r).toEqual({ feedMmPerMin: 36000, satDuty: MODEL_FIT_SAT_ONSET / 2, holds: true });
+describe("evaluateEnvelope (docs/PLAN-envelope-check.md + PLAN-v2.7 §5)", () => {
+	it("holds when the move reached the feed and satDuty stays below MODEL_FIT_SAT_ONSET", () => {
+		const r = evaluateEnvelope(36000, 35000, MODEL_FIT_SAT_ONSET / 2);
+		expect(r).toEqual({ feedMmPerMin: 36000, achievedFeedMmPerMin: 35000, satDuty: MODEL_FIT_SAT_ONSET / 2, outcome: "holds" });
 	});
 
-	it("does not hold once satDuty reaches the same threshold model-fit's own ramp uses", () => {
-		const r = evaluateEnvelope(36000, MODEL_FIT_SAT_ONSET);
-		expect(r.holds).toBe(false);
+	it("saturates when the move reached the feed and satDuty reaches the threshold", () => {
+		expect(evaluateEnvelope(36000, 36000, MODEL_FIT_SAT_ONSET).outcome).toBe("saturates");
+		expect(evaluateEnvelope(36000, 36000, 0.2).outcome).toBe("saturates");
 	});
 
-	it("does not hold well above the threshold", () => {
-		expect(evaluateEnvelope(36000, 0.2).holds).toBe(false);
+	it("is inconclusive when the move never reached the commanded feed — even at a comfortable 0% sat duty (PLAN-v2.7 §5)", () => {
+		expect(evaluateEnvelope(96000, 45000, 0).outcome).toBe("inconclusive");
+		expect(evaluateEnvelope(96000, 45000, 0.2).outcome).toBe("inconclusive"); // sat duty is moot if the speed wasn't reached
+	});
+
+	it("holds right at the 90% reach boundary", () => {
+		expect(evaluateEnvelope(100000, 90000, 0).outcome).toBe("holds");
+		expect(evaluateEnvelope(100000, 89999, 0).outcome).toBe("inconclusive");
 	});
 });
 
