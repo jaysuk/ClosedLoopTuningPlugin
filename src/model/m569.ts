@@ -166,6 +166,13 @@ export interface CaptureOptions {
 	move?: string;
 	/** Step-change time in ms for a step manoeuvre. */
 	stepTimeMs?: number;
+	/**
+	 * Bare CSV filename for M569.5's `F` parameter — RRF combines it with `0:/sys/closed-loop/` (verified
+	 * in ClosedLoop.cpp; the same directory this plugin reads). Given one, the plugin downloads that path
+	 * directly instead of walking `rr_filelist` for "the newest file", which is where 503s were costing
+	 * whole re-runs of the physical move (docs/PLAN-v2.7-feedback.md §4). Must be a bare name, not a path.
+	 */
+	filename?: string;
 	/** Another complete command to place on the same line, between the M569.5 parameters and `move`.
 	 *  Used to arm an M956 accelerometer capture on the same trigger (docs/PLAN-accelerometer.md §5). */
 	alongside?: string;
@@ -184,6 +191,9 @@ export function buildCaptureCommand(opts: CaptureOptions): string {
 	];
 	if (opts.manoeuvre === 64 && opts.stepTimeMs != null) {
 		parts.push(`T${opts.stepTimeMs}`);
+	}
+	if (opts.filename && opts.filename.trim()) {
+		parts.push(`F"${opts.filename.trim()}"`);
 	}
 	let cmd = parts.join(" ");
 	if (opts.alongside && opts.alongside.trim()) {

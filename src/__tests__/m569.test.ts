@@ -43,6 +43,18 @@ describe("capture command", () => {
 		const withoutAlongside = { driver: "50.0", samples: 2000, activate: 1 as const, rate: 0, variables: [2, 4, 8], manoeuvre: 0, move: "G91 G1 H2 X50 F6000 G90" };
 		expect(buildCaptureCommand(withoutAlongside)).toBe("M569.5 P50.0 S2000 A1 R0 D14 V0 G91 G1 H2 X50 F6000 G90");
 	});
+	it("emits F\"name\" when a filename is given (RRF writes it under 0:/sys/closed-loop/), before the move — docs/PLAN-v2.7 §4", () => {
+		const cmd = buildCaptureCommand({
+			driver: "50.0", samples: 2000, activate: 1, rate: 1000, variables: [2, 4, 8], manoeuvre: 0,
+			filename: "clt-abc-3.csv", move: "G91 G1 H2 Y200 F18000 G90",
+		});
+		expect(cmd).toBe('M569.5 P50.0 S2000 A1 R1000 D14 V0 F"clt-abc-3.csv" G91 G1 H2 Y200 F18000 G90');
+	});
+	it("omits F entirely when no filename is given (unchanged behaviour)", () => {
+		const cmd = buildCaptureCommand({ driver: "50.0", samples: 500, activate: 0, rate: 0, variables: [2], manoeuvre: 0 });
+		expect(cmd).not.toContain('F"');
+		expect(cmd).toBe("M569.5 P50.0 S500 A0 R0 D2 V0");
+	});
 });
 
 describe("calibration command", () => {

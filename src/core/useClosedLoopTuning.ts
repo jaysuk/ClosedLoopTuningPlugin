@@ -93,6 +93,29 @@ export async function maybeDeleteCapture(
 }
 
 /**
+ * Download `path` via `host.download`, retrying ONLY the download (never re-running the physical move or
+ * anything else upstream) up to `retries` times with a short escalating backoff. Returns null only when
+ * every attempt failed. docs/PLAN-v2.7-feedback.md §4 — a completed M569.5 capture (run counter already
+ * incremented) must not be discarded over a transient rr_* file-endpoint 503.
+ */
+export async function downloadCaptureText(
+	host: Pick<HostAdapter, "download">, path: string, retries: number,
+	log: (line: string) => void, sleep: (ms: number) => Promise<void>,
+	warn: (...args: Array<unknown>) => void = console.warn,
+): Promise<string | null> {
+	for (let attempt = 0; attempt <= retries; attempt++) {
+		try { return await host.download(path); }
+		catch (e) {
+			if (attempt < retries) {
+				log(`Capture file not readable yet — retrying the download (${attempt + 1}/${retries})…`);
+				await sleep(400 * (attempt + 1));
+			} else { warn("[ClosedLoopTuning] downloadCaptureText failed", path, e); }
+		}
+	}
+	return null;
+}
+
+/**
  * @param host how to reach this DuetWebControl — `ui37/host.ts` (Pinia) or `ui36/host.ts` (Vuex).
  *             Must be created inside component setup on 3.7, where Pinia requires an active instance.
  */
@@ -576,6 +599,11 @@ export function useClosedLoopTuning(host: HostAdapter) {
 	/** Whether this run has already warned that the firmware's achieved rate diverged from what was
 	 *  requested — once is enough; every capture repeating the same divergence would just be noise. */
 	let warnedAchievedRate = false;
+	/** Every closed-loop CSV this run's `runCapture` calls asked the firmware to write (via M569.5 F),
+	 *  deleted together at the end of the run instead of one delete request per capture — the per-capture
+	 *  deletes were extra SD-card traffic the tester correlated with the rr_* 503s. docs/PLAN-v2.7 §4. */
+	const runCaptureFiles = new Set<string>();
+	let captureFileSeq = 0;
 
 	/**
 	 * Every axis a G1 H2 move on the selected driver actually displaces, with travel limits AND the
@@ -764,7 +792,9 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		recording.value = false;
 	});
 
-	/** Load the newest capture CSV into the chart; returns the parsed capture (no analysis). */
+	/** Load the newest capture CSV into the chart; returns the parsed capture (no analysis). Used by the
+	 *  manual Record button only — the auto-tune path names every capture and downloads it by name (see
+	 *  `loadCaptureByName`), so a transient rr_filelist 503 there can't discard a completed capture. */
 	async function loadLatestCsv(): Promise<ParsedCapture | null> {
 		try {
 			const list = await host.getFileList(CAPTURE_DIR);
@@ -775,15 +805,38 @@ export function useClosedLoopTuning(host: HostAdapter) {
 			const text = await host.download(path);
 			rawText.value = text;
 			capture.value = parseCapture(text);
-			// Every call site reaches loadLatestCsv() strictly because the plugin's own M569.5 command
-			// just ran and the board's closed-loop run counter confirmably incremented (see runCapture's
-			// waitForRuns and record()'s watch on closedLoop.runs) — "the newest file" IS "the file this
-			// capture just wrote", the same identification the rest of this function already relies on
-			// for correctness. So there's nothing to track beyond the name already resolved above; this
-			// can never delete a file the plugin didn't just create.
+			// The manual Record path reaches here strictly after its own M569.5 command ran and the
+			// closed-loop run counter incremented (record()'s watch on closedLoop.runs) — "the newest
+			// file" IS "the file this capture just wrote", so this can't delete a file it didn't create.
 			await maybeDeleteCapture(host, path, deleteCapturesAfterRead.value);
 			return capture.value;
 		} catch (e) { console.warn("[ClosedLoopTuning] loadLatestCsv failed", e); return null; }
+	}
+
+	const CAPTURE_DOWNLOAD_RETRIES = 3;
+
+	/**
+	 * Download and parse a specific closed-loop CSV by its bare name, retrying the DOWNLOAD only (with a
+	 * short backoff) on failure — never re-running the physical move. Reached only after `waitForRuns`
+	 * confirmed the M569.5 capture completed, so a failure here is a file-access problem (the rr_*
+	 * endpoints 503 under load), not a capture problem: docs/PLAN-v2.7-feedback.md §4. Sets the chart
+	 * refs on success; returns null only when every download attempt failed.
+	 */
+	async function loadCaptureByName(name: string): Promise<ParsedCapture | null> {
+		const text = await downloadCaptureText(host, `${CAPTURE_DIR}/${name}`, CAPTURE_DOWNLOAD_RETRIES, log, delay);
+		if (text == null) { return null; }
+		rawText.value = text;
+		capture.value = parseCapture(text);
+		return capture.value;
+	}
+
+	/** Delete every capture file this run created, in one pass at the end of the run — see runCaptureFiles. */
+	async function deleteRunCaptures(): Promise<void> {
+		if (!deleteCapturesAfterRead.value || runCaptureFiles.size === 0) { runCaptureFiles.clear(); return; }
+		for (const name of runCaptureFiles) {
+			await maybeDeleteCapture(host, `${CAPTURE_DIR}/${name}`, true);
+		}
+		runCaptureFiles.clear();
 	}
 
 	/** Manual record path: load newest CSV and analyse it as a step response. */
@@ -912,7 +965,12 @@ export function useClosedLoopTuning(host: HostAdapter) {
 	 */
 	async function runCapture(opts: Parameters<typeof buildCaptureCommand>[0], accel?: PendingAccel | null): Promise<ParsedCapture | null> {
 		const startRuns = selectedBoard.value?.closedLoop?.runs ?? -1;
-		const reply = await host.sendCode(buildCaptureCommand(opts), { log: false });
+		// Name the capture so it can be downloaded directly afterwards instead of walking rr_filelist for
+		// "the newest file" — a transient 503 on that walk was discarding completed captures and re-running
+		// the physical move. docs/PLAN-v2.7-feedback.md §4.
+		const filename = opts.filename ?? `clt-${Date.now().toString(36)}-${captureFileSeq++}.csv`;
+		const namedOpts = { ...opts, filename };
+		const reply = await host.sendCode(buildCaptureCommand(namedOpts), { log: false });
 		if (reply && /error:|warning:/i.test(reply)) {
 			if (opts.alongside && accel && isAccelOnlyError(reply)) {
 				accel.armFailed = true;
@@ -929,7 +987,13 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		const captureMs = opts.rate > 0 ? (opts.samples / opts.rate) * 1000 : 4000;
 		if (!(await waitForRuns(startRuns, captureMs + 8000))) { log("Timed out waiting for the capture to finish — is the driver calibrated and in closed loop?"); return null; }
 		await delay(300); // let the CSV finish writing
-		const c = await loadLatestCsv();
+		// The M569.5 capture completed (run counter incremented). Download that exact file, retrying the
+		// download only — never the move — if the file endpoint is briefly unavailable.
+		const c = await loadCaptureByName(filename);
+		// During an auto-tune run these are deleted together at the end (deleteRunCaptures); a one-off
+		// manual/wizard capture deletes its file straight away, same as before this change.
+		if (autoRunning.value) { runCaptureFiles.add(filename); }
+		else { await maybeDeleteCapture(host, `${CAPTURE_DIR}/${filename}`, deleteCapturesAfterRead.value); }
 		// RRF appends a bare "Data lost" line when its capture buffer overruns — parseCapture already
 		// strips it so the rows that DID arrive are still usable (see csv.ts); this just surfaces that
 		// it happened, once, rather than silently keeping the user in the dark about why their captures
@@ -1296,6 +1360,8 @@ export function useClosedLoopTuning(host: HostAdapter) {
 			// firmware for more samples than the (now lower) rate can actually spread across this window.
 			driver: selectedDriver.value ?? "", samples: profile.samples, activate: 1, rate: profile.sampleRateHz,
 			variables: varIds(ALL_CAPTURE_KEYS), manoeuvre: 0, alongside,
+			// Explicit name so runCapture downloads it directly, not via rr_filelist (docs/PLAN-v2.7 §4).
+			filename: `clt-${Date.now().toString(36)}-${captureFileSeq++}.csv`,
 			move: `G91 G1 H2 ${axis}${signedDist.toFixed(3)} F${feed} G90`,
 		};
 
@@ -1481,6 +1547,8 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		loggedProfileKey = null;
 		loggedCommandKey = null;
 		warnedAchievedRate = false;
+		runCaptureFiles.clear();
+		captureFileSeq = 0;
 		resetStageStates();
 		// Once, here — not on every capture during the run (see the comments on collectAccel and
 		// captureRaw's own `if (!c)` branch). A fresh run's FIRST vibration reading should still replace
@@ -1545,6 +1613,10 @@ export function useClosedLoopTuning(host: HostAdapter) {
 				tuneSession.value.preflightActions = result?.preflightActions;
 				tuneSession.value.restored = result?.restored;
 			}
+			// One pass of deletes for the whole run, not one request per capture (docs/PLAN-v2.7 §4) —
+			// after the session is captured above so a delete failure can't lose the report. Failures are
+			// logged inside maybeDeleteCapture, never thrown.
+			await deleteRunCaptures();
 		}
 	}
 
