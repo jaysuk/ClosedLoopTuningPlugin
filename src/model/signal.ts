@@ -13,7 +13,7 @@
  *
  * Pure and unit-tested against real captures (see src/__tests__/fixtures).
  */
-import { analyzeMove, buildSeries, computeRestEffort, P_TERM_RAIL, segmentMove, type RestEffort } from "./analysis";
+import { analyzeMove, buildSeries, computeRestEffort, dithersAtStandstill, P_TERM_RAIL, segmentMove, type RestEffort } from "./analysis";
 import type { ParsedCapture } from "./csv";
 import { autocorrelationPeriod } from "./dsp";
 import { tuneStats, type TuneStats } from "./evaluate";
@@ -216,14 +216,16 @@ export const COST_WEIGHT_BIAS = 1.0;
 export const COST_WEIGHT_LAG = 0.5;
 export const COST_WEIGHT_RING = 0.25;
 export const COST_RING_FREE = 1; // ring cycles below this are ordinary settling, not penalised
-/** Standstill control-effort dither (restEffort.pTermRestRipple, normalised to the 250 P-term rail so
- *  it's a fraction like the other terms below). Package/refine judges every term through THIS cost
- *  alone — unlike the sequential ramp strategies, it had no P-term/effort data in it at all, so it
- *  could jointly optimise straight past a small encoder-scale limit cycle that never moves restBias
- *  enough to matter and never rails. Sized to break ties and penalise dither, not dominate tracking:
- *  contributes ~0.20 for a real dithering capture, ~0.02 for a real settled one — same order as the
- *  restBias term above (1.0 × ~0.11 on those same two captures). See docs/PLAN-standstill-effort.md. */
-export const COST_WEIGHT_REST_EFFORT = 1.5;
+/** Standstill limit-cycle penalty. Package/refine judges every term through THIS cost alone — unlike
+ *  the sequential ramp strategies — so without it, a small limit cycle that never moves restBias enough
+ *  to matter and never rails could be jointly optimised straight past. Keyed on the P-INDEPENDENT
+ *  position-error ripple (via `dithersAtStandstill`), not `pTermRestRipple/P_TERM_RAIL`: the P term is
+ *  P × error, so the old form penalised a high-P tune for a 1-2 encoder-count flutter that never
+ *  physically moves — the same flaw §2 fixed for the "Dithers at standstill" finding
+ *  (docs/PLAN-v2.7-feedback.md §2). Sized to break ties and register a real dither, not dominate
+ *  tracking: contributes ~0.20 for the `hold-limit-cycle-soft` fixture (0.50 step ripple × 0.4), 0 for
+ *  a quantisation flutter or a settled capture. Same order as the restBias term above. */
+export const COST_WEIGHT_REST_EFFORT = 0.4;
 
 /** Whole-capture cost — lower is better; Infinity for any attempt the stability veto rejects. */
 export function signalCost(s: TuneSignal): number {
@@ -231,7 +233,8 @@ export function signalCost(s: TuneSignal): number {
 	const { stats, restEffort } = s;
 	// restTailValid false (too-short tail, or the integrator was still converging) means the ripple
 	// number isn't trustworthy — contribute nothing rather than penalise an attempt that can't be judged.
-	const effortCost = restEffort.restTailValid ? restEffort.pTermRestRipple / P_TERM_RAIL : 0;
+	// A quantisation flutter is not a dither (dithersAtStandstill) and contributes nothing either.
+	const effortCost = restEffort.restTailValid && dithersAtStandstill(restEffort) ? restEffort.errorRestRipple : 0;
 	return stats.moveRms
 		+ COST_WEIGHT_OVERSHOOT * stats.settleOvershoot
 		+ COST_WEIGHT_BIAS * Math.abs(stats.restBias)

@@ -38,9 +38,13 @@ the ramp.
 - **§2 deleted `REST_EFFORT_RIPPLE_LIMIT` entirely.** The plan said "check every other reference" — there
   were **four** (evaluate, autotune's `SIGNAL_I_STRATEGY`, wizard, report), not one, and the I-ramp's own
   had the identical P-scaling flaw. All four now call `dithersAtStandstill`, so the I ramp, the manual
-  wizard and the final grade can't disagree about what a dither is. `signal.ts` `effortCost`
-  (`pTermRestRipple / P_TERM_RAIL`, a cost term not a finding) is left as-is per the plan — same
-  P-scaling shape, flagged for a later look.
+  wizard and the final grade can't disagree about what a dither is.
+- **`signal.ts` `effortCost` also converted** (follow-up commit, after the tester chose it as a deferred
+  item): `pTermRestRipple / P_TERM_RAIL` → keyed on `dithersAtStandstill` + the P-independent
+  `errorRestRipple`, weight retuned 1.5 → 0.4. Same P-scaling flaw as the finding — package/refine's
+  cost function was penalising a high-P tune for a 1-2 count flutter that never moves. Fixtures for the
+  affected `signal.test.ts` cases switched from `hold-dither-i0.csv` (now a flutter, not a dither) to
+  `hold-limit-cycle-soft.csv` / self-comparison.
 - **§2 threshold is not the noise-relative one the plan sketched.** `errorRestRipple > 6 × restNoiseFull`
   fails for a *sustained* limit cycle — the cycle inflates `restNoiseFull` too, so a real 0.4-step
   oscillation with a 0.14-step RMS never clears `6 × 0.14`. Replaced with

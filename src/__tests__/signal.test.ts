@@ -235,23 +235,29 @@ describe("signalCost", () => {
 		expect(best).toBeLessThan(onset);
 	});
 
-	// Real field case (docs/PLAN-standstill-effort.md): package/refine's ONLY objective is this
-	// function, and until this term existed it had no P-term/effort data in it at all — a small
-	// encoder-scale dither with near-zero restBias and no railing could be jointly optimised straight
-	// past. Uses the real user captures, not hand-built fakes.
-	it("costs a real dithering capture more than the equivalent settled one", () => {
-		const dither = signalOf("hold-dither-i0.csv");
-		const settled = signalOf("hold-settled-i23.csv");
-		expect(dither.restEffort.restTailValid).toBe(true);
-		expect(settled.restEffort.restTailValid).toBe(true);
-		expect(signalCost(dither)).toBeGreaterThan(signalCost(settled));
+	// package/refine's ONLY objective is this function; without an effort term a small sub-rail limit
+	// cycle with near-zero restBias and no railing could be jointly optimised straight past. The penalty
+	// is the P-INDEPENDENT position-error ripple (docs/PLAN-v2.7-feedback.md §2) — comparing a real limit
+	// cycle against the SAME capture with its rest tail flattened isolates the term.
+	it("costs a real sub-rail limit cycle more than the same capture without the dither", () => {
+		const cycle = signalOf("hold-limit-cycle-soft.csv");
+		expect(cycle.restEffort.restTailValid).toBe(true);
+		const flat: TuneSignal = { ...cycle, restEffort: { ...cycle.restEffort, errorRestRipple: 0, errorRestQuantum: 0, pTermRestRipple: 0 } };
+		expect(signalCost(cycle)).toBeGreaterThan(signalCost(flat));
+	});
+
+	it("does NOT cost a 1-2 encoder-count quantisation flutter (the P-scaling regression, §2)", () => {
+		// hold-dither-i0.csv: P≈340, 2-count flutter — huge pTermRestRipple (33.6), tiny real movement.
+		const flutter = signalOf("hold-dither-i0.csv");
+		const flat: TuneSignal = { ...flutter, restEffort: { ...flutter.restEffort, errorRestRipple: 0, errorRestQuantum: 0 } };
+		expect(signalCost(flutter)).toBeCloseTo(signalCost(flat), 10);
 	});
 
 	it("an invalid rest-effort tail contributes nothing to cost — never a penalty for an unmeasurable capture", () => {
-		const base = signalOf("move250-stable-best.csv");
-		const invalid: TuneSignal = { ...base, restEffort: { ...base.restEffort, restTailValid: false, pTermRestRipple: 999 } };
-		const zeroRipple: TuneSignal = { ...base, restEffort: { ...base.restEffort, restTailValid: true, pTermRestRipple: 0 } };
-		expect(signalCost(invalid)).toBeCloseTo(signalCost(zeroRipple), 6);
+		const base = signalOf("hold-limit-cycle-soft.csv");
+		const invalid: TuneSignal = { ...base, restEffort: { ...base.restEffort, restTailValid: false } };
+		const noDither: TuneSignal = { ...base, restEffort: { ...base.restEffort, restTailValid: true, errorRestRipple: 0, errorRestQuantum: 0 } };
+		expect(signalCost(invalid)).toBeCloseTo(signalCost(noDither), 6);
 	});
 });
 
@@ -260,18 +266,16 @@ describe("signalCost", () => {
 // outscores one that was measured and found perfectly settled. comparableCost/signalCostNoEffort fix
 // this by dropping the term from BOTH sides of a comparison whenever either one can't be judged.
 describe("signalCostNoEffort / comparableCost", () => {
-	// Real dithering capture vs. the SAME capture with only its tail marked unjudgeable — nothing
-	// physically different. These are exact measured numbers, not estimates: if either fails, the
-	// implementation drifted, not the fixture.
-	const dither = signalOf("hold-dither-i0.csv");
+	// A real sub-rail limit cycle vs. the SAME capture with only its tail marked unjudgeable — nothing
+	// physically different. If either number drifts, the implementation drifted, not the fixture.
+	const dither = signalOf("hold-limit-cycle-soft.csv");
 	const unjudged: TuneSignal = { ...dither, restEffort: { ...dither.restEffort, restTailValid: false } };
 
 	it("does not let an unmeasurable rest tail outscore the very same capture measured", () => {
 		// The bug, pinned: on the full cost the unjudgeable copy looks better (lower) by the entire
 		// rest-effort term, purely because it can't be judged rather than because anything improved.
-		expect(signalCost(dither)).toBeCloseTo(0.5264, 3);
-		expect(signalCost(unjudged)).toBeCloseTo(0.3248, 3);
 		expect(signalCost(unjudged)).toBeLessThan(signalCost(dither));
+		expect(signalCost(dither) - signalCost(unjudged)).toBeCloseTo(0.4 * dither.restEffort.errorRestRipple, 6);
 		// The fix: compared against each other, both are judged only on terms both actually have — equal.
 		const cost = comparableCost([dither, unjudged]);
 		expect(cost(unjudged)).toBeCloseTo(cost(dither), 10);
@@ -289,7 +293,7 @@ describe("signalCostNoEffort / comparableCost", () => {
 
 	it("signalCostNoEffort matches signalCost when there is no rest-effort contribution to drop", () => {
 		const base = signalOf("move250-stable-best.csv");
-		const zeroRipple: TuneSignal = { ...base, restEffort: { ...base.restEffort, restTailValid: true, pTermRestRipple: 0 } };
+		const zeroRipple: TuneSignal = { ...base, restEffort: { ...base.restEffort, restTailValid: true, errorRestRipple: 0, errorRestQuantum: 0 } };
 		expect(signalCostNoEffort(zeroRipple)).toBeCloseTo(signalCost(zeroRipple), 10);
 	});
 
