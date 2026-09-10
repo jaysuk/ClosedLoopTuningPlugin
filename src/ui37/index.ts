@@ -28,10 +28,6 @@ registerRoute(ClosedLoopTuning, {
 			icon: "mdi-chart-bell-curve-cumulative",
 			caption: "plugins.closedLoopTuning.menuCaption",
 			path: ROUTE_PATH,
-			// The page itself carries the matching `dwc-page-fill` class (md+ only — see the mdAndUp
-			// comment in ClosedLoopTuning.vue); this just tells DWC's own scrollBehavior the page manages
-			// its own scrolling instead of the page-level one, same as InputShaping's own registration.
-			pageFill: true,
 		},
 	},
 });

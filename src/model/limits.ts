@@ -310,8 +310,14 @@ export interface EnvelopeSpeedInput {
 	letter: string;
 	/** mm of this axis's Cartesian travel per 1 mm of the tuned motor's H2 travel (see kinematics.ts). */
 	perUnit: number;
-	/** This axis's own configured max speed, mm/s (RRF M203). */
-	speedMmPerS: number;
+	/**
+	 * This axis's own configured max speed, **mm/min** — the object model's `move.axes[].speed` reports
+	 * M203 already in mm/min (RRF `Move.cpp`: `InverseConvertSpeedToMmPerMin(MaxFeedrate(...))`), the same
+	 * unit a G1 F parameter takes. It is NOT mm/s; treating it as mm/s and converting was a real bug
+	 * (v2.6.3 ran the envelope capture at 60x the intended feed — F5760000 instead of F96000 on a field
+	 * machine with M203 Y48000 and 0.5 CoreXY coupling).
+	 */
+	speedMmPerMin: number;
 }
 
 /**
@@ -327,10 +333,10 @@ export interface EnvelopeSpeedInput {
  */
 export function envelopeFeedMmPerMin(axes: Array<EnvelopeSpeedInput>): number | null {
 	const candidates = axes
-		.filter((a) => Math.abs(a.perUnit) > COUPLING_EPSILON && a.speedMmPerS > 0)
-		.map((a) => a.speedMmPerS / Math.abs(a.perUnit));
+		.filter((a) => Math.abs(a.perUnit) > COUPLING_EPSILON && a.speedMmPerMin > 0)
+		.map((a) => a.speedMmPerMin / Math.abs(a.perUnit));
 	if (!candidates.length) { return null; }
-	return 60 * Math.min(...candidates);
+	return Math.min(...candidates);
 }
 
 export function planCaptureProfile(

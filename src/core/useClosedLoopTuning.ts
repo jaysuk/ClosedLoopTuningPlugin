@@ -1371,8 +1371,10 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		const kinematics = (host.model() as any).move?.kinematics;
 		const coupling = resolveMotionCoupling(kinematics, axes, index);
 		if ("error" in coupling) { log(`Envelope check: ${coupling.error}`); return null; }
+		// `move.axes[].speed` is M203 in mm/min already (RRF Move.cpp: InverseConvertSpeedToMmPerMin) —
+		// the same unit `captureRaw`'s feed override and a G1 F parameter take. No conversion.
 		const speedInputs = coupling.effects.map((e) => ({
-			letter: e.letter, perUnit: e.perUnit, speedMmPerS: Number(axes[e.index]?.speed) || 0,
+			letter: e.letter, perUnit: e.perUnit, speedMmPerMin: Number(axes[e.index]?.speed) || 0,
 		}));
 		const feedMmPerMin = envelopeFeedMmPerMin(speedInputs);
 		if (feedMmPerMin == null) {

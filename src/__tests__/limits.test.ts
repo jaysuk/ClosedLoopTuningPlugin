@@ -417,40 +417,50 @@ describe("coupled kinematics (CoreXY etc.)", () => {
 });
 
 describe("envelopeFeedMmPerMin (docs/PLAN-envelope-check.md)", () => {
+	// Input is mm/min — the object model's move.axes[].speed unit (RRF InverseConvertSpeedToMmPerMin);
+	// output is a G1 F feed in the same unit. No 60x conversion (that was the v2.6.3 bug).
 	it("reduces to a single Cartesian axis's own M203 on an unlinked (perUnit=1) machine", () => {
-		expect(envelopeFeedMmPerMin([{ letter: "Y", perUnit: 1, speedMmPerS: 300 }])).toBe(300 * 60);
+		expect(envelopeFeedMmPerMin([{ letter: "Y", perUnit: 1, speedMmPerMin: 18000 }])).toBe(18000);
 	});
 
 	it("picks the coupled axis that reaches ITS OWN configured max first, not the tuned axis's own perUnit=1 entry", () => {
 		// CoreXY field shape: tuning Y moves X by +0.5 and Y by -0.5 per mm of motor travel. X's own M203
-		// (200 mm/s) is reached at a higher motor feed than Y's (300 mm/s) once each is divided by its
-		// own 0.5 coupling — X is the limiting axis here even though it isn't the nominal tuned one.
+		// (12000 mm/min) is reached at a lower motor feed than Y's (18000) once each is divided by its own
+		// 0.5 coupling — X is the limiting axis here even though it isn't the nominal tuned one.
 		const feed = envelopeFeedMmPerMin([
-			{ letter: "X", perUnit: 0.5, speedMmPerS: 200 },
-			{ letter: "Y", perUnit: -0.5, speedMmPerS: 300 },
+			{ letter: "X", perUnit: 0.5, speedMmPerMin: 12000 },
+			{ letter: "Y", perUnit: -0.5, speedMmPerMin: 18000 },
 		]);
-		// X: 200 / 0.5 = 400 mm/s: Y: 300 / 0.5 = 600 mm/s -> X limits first, at 400 mm/s = 24000 mm/min.
-		expect(feed).toBe(400 * 60);
+		// X: 12000 / 0.5 = 24000; Y: 18000 / 0.5 = 36000 -> X limits first, at F24000.
+		expect(feed).toBe(24000);
+	});
+
+	it("matches the field case: M203 Y48000, 0.5 CoreXY coupling -> F96000 (not the v2.6.3 F5760000)", () => {
+		const feed = envelopeFeedMmPerMin([
+			{ letter: "X", perUnit: 0.5, speedMmPerMin: 48000 },
+			{ letter: "Y", perUnit: -0.5, speedMmPerMin: 48000 },
+		]);
+		expect(feed).toBe(96000);
 	});
 
 	it("ignores an axis with negligible coupling to the tuned motor", () => {
 		const feed = envelopeFeedMmPerMin([
-			{ letter: "Y", perUnit: 1, speedMmPerS: 300 },
-			{ letter: "Z", perUnit: 0, speedMmPerS: 5 }, // not actually coupled — must not drag the feed down to near zero
+			{ letter: "Y", perUnit: 1, speedMmPerMin: 18000 },
+			{ letter: "Z", perUnit: 0, speedMmPerMin: 300 }, // not actually coupled — must not drag the feed down
 		]);
-		expect(feed).toBe(300 * 60);
+		expect(feed).toBe(18000);
 	});
 
 	it("returns null when nothing is meaningfully coupled", () => {
 		expect(envelopeFeedMmPerMin([])).toBeNull();
-		expect(envelopeFeedMmPerMin([{ letter: "Z", perUnit: 0, speedMmPerS: 5 }])).toBeNull();
+		expect(envelopeFeedMmPerMin([{ letter: "Z", perUnit: 0, speedMmPerMin: 300 }])).toBeNull();
 	});
 
 	it("ignores an axis with no configured speed (0) rather than letting it force the feed to zero", () => {
 		const feed = envelopeFeedMmPerMin([
-			{ letter: "Y", perUnit: 1, speedMmPerS: 300 },
-			{ letter: "X", perUnit: 1, speedMmPerS: 0 },
+			{ letter: "Y", perUnit: 1, speedMmPerMin: 18000 },
+			{ letter: "X", perUnit: 1, speedMmPerMin: 0 },
 		]);
-		expect(feed).toBe(300 * 60);
+		expect(feed).toBe(18000);
 	});
 });
