@@ -8,6 +8,42 @@ earlier version, discard it.
 
 ---
 
+## STATUS: all sections implemented 2026-09-10 (commits after v2.6.4)
+
+| § | What | Commit | Notes |
+|---|---|---|---|
+| 1 | "Tuning move too aggressive" panel warning | `433c3f8` | As planned. |
+| 2 | Quantisation-aware dither threshold | `b45f326` | Deviations below. |
+| 3 | Confirm an accepted near-zero I | `888661b` | Depends on §2. |
+| 4 | Explicit capture filenames, batch delete | `7b89f6b` | M569.5 `F"name"` confirmed against RRF source. |
+| 5 | Envelope check proves it reached the speed | `557017a` | `holds: boolean` → `outcome` tri-state. |
+
+560 tests pass; `vitest --typecheck`, `DWC_DIR` typecheck, `verify-build`, `check-ui36` all clean.
+
+### Deviations from this plan, made during implementation
+
+- **§2 deleted `REST_EFFORT_RIPPLE_LIMIT` entirely.** The plan said "check every other reference" — there
+  were **four** (evaluate, autotune's `SIGNAL_I_STRATEGY`, wizard, report), not one, and the I-ramp's own
+  had the identical P-scaling flaw. All four now call `dithersAtStandstill`, so the I ramp, the manual
+  wizard and the final grade can't disagree about what a dither is. `signal.ts` `effortCost`
+  (`pTermRestRipple / P_TERM_RAIL`, a cost term not a finding) is left as-is per the plan — same
+  P-scaling shape, flagged for a later look.
+- **§2 threshold is not the noise-relative one the plan sketched.** `errorRestRipple > 6 × restNoiseFull`
+  fails for a *sustained* limit cycle — the cycle inflates `restNoiseFull` too, so a real 0.4-step
+  oscillation with a 0.14-step RMS never clears `6 × 0.14`. Replaced with
+  `> max(0.2 step, 4 × the encoder quantum recovered from the data)` — P-independent, resolution-tolerant,
+  and it still catches sustained cycles. Calibrated against the five reports: 100-pt run keeps its clean
+  bill, both 85-pt runs (2-count flutter) lose the finding.
+- **§2 reclassified `hold-dither-i0.csv`.** 33.6 P-term ÷ 0.10 step ripple ⇒ P≈340, and the position
+  error only moves 2 encoder counts — the same signature the 2026-09-10 feedback says is quantisation.
+  Its "MUST trip" test is now "must NOT trip". New fixture `hold-limit-cycle-soft.csv` (a real ±0.3 step
+  sub-rail oscillation) is the "IS a dither" case.
+- **§5 changed the `EnvelopeCheck` shape**, not just added a field: `holds: boolean` → `outcome:
+  "holds" | "saturates" | "inconclusive"`, plus `achievedFeedMmPerMin`. Both UI cards and the log line
+  updated.
+
+---
+
 ## START HERE
 
 ### Already done, do not redo
