@@ -389,4 +389,40 @@ describe("runModelFitIdentification (full P → A → V flow)", () => {
 		expect(fit).toBeNull();
 		expect(pRampAttempts).toEqual([]);
 	});
+
+	// docs/PLAN-v2.7-feedback.md §1 — "tuning move too aggressive" warning
+	it("flags identifiedAtSeed when the rail is hit at the very first ramp step (P=SEED_START)", async () => {
+		const pid = basePid();
+		let lastApplied: PidConfig = { ...pid };
+		const applyPid = vi.fn(async (p: PidConfig) => { lastApplied = p; });
+		// Accel P-term is already at the clamp at P=30 with sat duty high — genuine rail at the seed,
+		// confirmed on re-measure (a move too aggressive for P=30 to have headroom).
+		const captureSignal = vi.fn(async () => sig({
+			pTermAccelPeak: 256, pTermSatDuty: 0.1, stats: { restNoise: 0.05 },
+		}));
+		const { effects } = fakeEffects({ applyPid, captureSignal });
+		const { fit } = await runModelFitIdentification(effects, pid, 1, 2, MODEL_FIT_BACKOFF_DEFAULT);
+		expect(fit).not.toBeNull();
+		expect(fit!.identifiedAtSeed).toBe(true);
+		expect(fit!.pBasis).toBe("rail");
+	});
+
+	it("does not flag identifiedAtSeed when the rail is reached later in the ramp", async () => {
+		const pid = basePid();
+		let lastApplied: PidConfig = { ...pid };
+		const applyPid = vi.fn(async (p: PidConfig) => { lastApplied = p; });
+		const captureSignal = vi.fn(async () => {
+			if (lastApplied.a === 0 && lastApplied.v === 0) {
+				return sig({ pTermAccelPeak: Math.min(256, lastApplied.p), stats: { restNoise: 0.05 } });
+			}
+			return sig({
+				pTermAccelPeak: lastApplied.a > 0 ? Math.max(5, 60 - lastApplied.a / 3000) : 60,
+				pTermCruiseMean: -50 + 0.05 * lastApplied.v, stats: { restNoise: 0.05 },
+			});
+		});
+		const { effects } = fakeEffects({ applyPid, captureSignal });
+		const { fit } = await runModelFitIdentification(effects, pid, 1, 2, MODEL_FIT_BACKOFF_DEFAULT);
+		expect(fit).not.toBeNull();
+		expect(fit!.identifiedAtSeed).toBe(false);
+	});
 });

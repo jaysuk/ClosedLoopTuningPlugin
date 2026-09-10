@@ -746,6 +746,31 @@ describe("runAutoTune — envelope check (docs/PLAN-envelope-check.md)", () => {
 	});
 });
 
+describe("runAutoTune — identifiedAtSeed (docs/PLAN-v2.7-feedback.md §1)", () => {
+	it("flags identifiedAtSeed when cycle-1 model-fit rails at the seed P", async () => {
+		// Every capture already at the clamp with high sat duty — a genuine rail at P=SEED_START.
+		const captureSignal = vi.fn(async () => sig({ pTermAccelPeak: 256, pTermSatDuty: 0.1, stats: { restNoise: 0.05 } }));
+		const { effects } = fakeEffects({ captureSignal });
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
+		expect(result.ok).toBe(true);
+		expect(result.identifiedAtSeed).toBe(true);
+	});
+
+	it("leaves identifiedAtSeed falsy on a normal run that never rails at the seed", async () => {
+		const { effects } = fakeEffects(); // GOOD_SIGNAL — flat accel peak, degrades to best-measured
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: true });
+		expect(result.ok).toBe(true);
+		expect(result.identifiedAtSeed).toBeFalsy();
+	});
+
+	it("leaves identifiedAtSeed undefined for an extruder run (model-fit never runs)", async () => {
+		const { effects } = fakeEffects();
+		const result = await runAutoTune(effects, basePid(), { cycles: 1, hasAxis: false });
+		expect(result.ok).toBe(true);
+		expect(result.identifiedAtSeed).toBeUndefined();
+	});
+});
+
 describe("runAutoTune — method dispatch", () => {
 	it("method 'refine' skips seeding/ramp entirely and runs a single joint-optimisation pass from the starting values", async () => {
 		const startPid: PidConfig = { p: 77, i: 200, d: 0.05, v: 10, a: 1000, warn: null, err: null };

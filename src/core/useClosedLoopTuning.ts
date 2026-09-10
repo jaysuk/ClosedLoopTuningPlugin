@@ -345,6 +345,9 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		/** Whether the tune holds (no saturation) at the axis's own configured max — report-only, never
 		 *  fed back into the tune. See docs/PLAN-envelope-check.md. */
 		envelopeCheck?: EnvelopeCheck;
+		/** Cycle-1 model-fit hit its effort rail at the seed P — the tuning move is likely too aggressive
+		 *  for this axis. Shown as a persistent panel warning. See AutoRunResult.identifiedAtSeed. */
+		identifiedAtSeed?: boolean;
 		/** Calibration moves (M569.6 V-ids) actually run during preflight. */
 		preflightActions?: Array<string>;
 		/** True if the run failed/was cancelled and the pre-run PID snapshot was restored. */
@@ -1538,6 +1541,7 @@ export function useClosedLoopTuning(host: HostAdapter) {
 				tuneSession.value.ku = result?.ku;
 				tuneSession.value.tu = result?.tu;
 				tuneSession.value.envelopeCheck = result?.envelopeCheck;
+				tuneSession.value.identifiedAtSeed = result?.identifiedAtSeed;
 				tuneSession.value.preflightActions = result?.preflightActions;
 				tuneSession.value.restored = result?.restored;
 			}

@@ -137,6 +137,10 @@ export interface AutoRunResult {
 	 *  undefined when there was nothing to check (extruder, or an unresolvable coupling) or the check
 	 *  capture itself failed. Report-only: never fed back into `pid`. See docs/PLAN-envelope-check.md. */
 	envelopeCheck?: EnvelopeCheck;
+	/** True when cycle-1 model-fit hit its effort rail at the very first ramp step (P=SEED_START), so P*
+	 *  is seed-derived rather than measured — usually a tuning move too aggressive for P=30 to have any
+	 *  headroom. Surfaced as a persistent panel warning. See ModelFitResult.identifiedAtSeed. */
+	identifiedAtSeed?: boolean;
 	/** Calibration moves actually run during preflight (empty if the driver was already tracking). */
 	preflightActions?: Array<string>;
 	/** Final verification grade (axis drivers only; undefined if verification couldn't run). */
@@ -379,6 +383,8 @@ interface CycleResult {
 	itae?: number;
 	ku?: number;
 	tu?: number;
+	/** Cycle-1 model-fit hit its effort rail at the seed P — see ModelFitResult.identifiedAtSeed. */
+	identifiedAtSeed?: boolean;
 	/** Terms cycle 1's model-fit identification found to have no measurable effect (A/V only) — carried
 	 * forward so a later package/optimise pass can seed them with a smaller step instead of re-discovering
 	 * the same "doesn't matter" conclusion from scratch. Undefined when this cycle didn't run model-fit. */
@@ -425,6 +431,7 @@ async function runAxisCycle(
 
 	const attempts: Array<AutoRunAttempt> = [];
 	let ku: number | undefined, tu: number | undefined;
+	let identifiedAtSeed: boolean | undefined;
 	// Zero every other term and identify P (and, for "model-fit", A/V too) before the per-term stages.
 	const seeded: Partial<Record<PidTerm, number>> = {};
 	const solved = new Set<PidTerm>();
@@ -449,6 +456,7 @@ async function runAxisCycle(
 		if (fit) {
 			solved.add("p"); solved.add("a"); solved.add("v");
 			lastSignal = fit.finalSignal;
+			identifiedAtSeed = fit.identifiedAtSeed;
 			if (!fit.a.measurable) { cycleInsensitiveTerms.push("a"); }
 			if (!fit.v.measurable) { cycleInsensitiveTerms.push("v"); }
 			effects.log(`Model fit: P=${fit.pStar} (${fit.pBasis}), A=${fit.a.applied}${fit.a.measurable ? "" : " (no measurable effect)"}, V=${fit.v.applied}${fit.v.measurable ? "" : " (no measurable effect)"}.`);
@@ -523,7 +531,7 @@ async function runAxisCycle(
 		effects.onStage?.(strategy.term, "done");
 		if (result.finalSignal) { lastSignal = result.finalSignal; }
 	}
-	return { ok: true, attempts, itae: lastSignal?.itae, ku, tu, insensitiveTerms: cycleInsensitiveTerms };
+	return { ok: true, attempts, itae: lastSignal?.itae, ku, tu, identifiedAtSeed, insensitiveTerms: cycleInsensitiveTerms };
 }
 
 // ---- Bidirectional refinement (cycles ≥2): probe each term up, then down, judged on whole-loop cost ----
@@ -821,6 +829,7 @@ export async function runAutoTune(effects: TuneEffects, startPid: PidConfig, opt
 	const pid: PidConfig = { ...startPid };
 	const attempts: Array<AutoRunAttempt> = [];
 	let ku: number | undefined, tu: number | undefined;
+	let identifiedAtSeed: boolean | undefined;
 	let preflightActions: Array<string> = [];
 
 	effects.log(`Auto-tune config: method=${method}, identify=${identifyMethod}, seedRule=${seedRule}, medianOf=${medianOf}, cycles=${totalCycles}${opts.captureBudget != null ? `, captureBudget=${opts.captureBudget}` : ""}.`);
@@ -860,6 +869,7 @@ export async function runAutoTune(effects: TuneEffects, startPid: PidConfig, opt
 				: await runExtruderCycle(effects, pid, cycle);
 			attempts.push(...result.attempts);
 			if (result.ku != null) { ku = result.ku; tu = result.tu; }
+			if (result.identifiedAtSeed != null) { identifiedAtSeed = result.identifiedAtSeed; }
 			if (result.insensitiveTerms) { insensitiveTerms = result.insensitiveTerms; }
 			if (!result.ok) { ok = false; reason = result.reason; break; }
 			if (result.itae != null) {
@@ -925,5 +935,5 @@ export async function runAutoTune(effects: TuneEffects, startPid: PidConfig, opt
 		effects.log(`Envelope check skipped: ${e instanceof Error ? e.message : String(e)}`);
 	}
 
-	return { ok: true, pid, attempts, ku, tu, preflightActions, evaluation, envelopeCheck };
+	return { ok: true, pid, attempts, ku, tu, identifiedAtSeed, preflightActions, evaluation, envelopeCheck };
 }

@@ -486,6 +486,19 @@
 						</div>
 					</v-card-text>
 				</v-card>
+				<v-card v-if="tuneSession && tuneSession.identifiedAtSeed" class="mb-2" color="warning">
+					<v-card-text class="py-3">
+						<div class="d-flex align-center mb-1">
+							<v-icon class="mr-2">mdi-alert</v-icon>
+							<span class="text-subtitle-1">Tuning move too aggressive</span>
+							<v-spacer />
+							<HelpTip class="ml-1" text="Cycle 1's P identification ramps P from a low starting value until the motor's effort hits its limit, then backs off. Here it hit that limit at the very first step, so the final P comes from the starting value rather than a measurement of this axis. The usual cause is a tuning feed too fast for the low starting P to keep up with. Lower the Feed (mm/min) setting above and re-run." />
+						</div>
+						<div class="text-body-2 cl-on-grade">
+							P identification may be unreliable — the P ramp hit its effort limit at the very first step, so the result comes from the starting value rather than a measurement of this axis. Try a lower Feed (mm/min) above and re-run.
+						</div>
+					</v-card-text>
+				</v-card>
 				<v-card class="mb-2">
 					<v-card-title class="py-2 text-subtitle-1 d-flex align-center">
 						Analysis

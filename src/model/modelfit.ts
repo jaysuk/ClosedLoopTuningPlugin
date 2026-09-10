@@ -333,6 +333,13 @@ export interface ModelFitResult {
 	pStar: number;
 	/** How P* was arrived at (rail / extrapolated / best-measured / unstable-backoff). */
 	pBasis: ModelFitPResult["basis"];
+	/**
+	 * True when the P ramp hit its effort rail at the very first step (P=SEED_START) — so P* is
+	 * `backoff × SEED_START`, a number derived from the seed constant with nothing measured about this
+	 * axis in it. The usual cause is a tuning move too aggressive for P=30 to have any headroom (field
+	 * data: two 400 mm/s runs both landed here). Surfaced to the user as a persistent panel warning.
+	 */
+	identifiedAtSeed: boolean;
 	a: FeedForwardSolveResult;
 	v: FeedForwardSolveResult;
 	/** The last capture taken (after A and V are both set) — feeds ITAE tracking / D-I baselining. */
@@ -372,5 +379,7 @@ export async function runModelFitIdentification(
 	const a = await solveFeedForwardTerm(effects, "a", pid, verifiedP.signal, medianOf, verifyRetries, pTermNoiseFloor);
 	const v = await solveFeedForwardTerm(effects, "v", pid, a.signal, medianOf, verifyRetries, pTermNoiseFloor);
 
-	return { fit: { pStar: verifiedP.value, pBasis: pResult.basis, a, v, finalSignal: v.signal }, pRampAttempts };
+	const identifiedAtSeed = pResult.basis === "rail" && pResult.pRailOnset === SEED_START;
+
+	return { fit: { pStar: verifiedP.value, pBasis: pResult.basis, identifiedAtSeed, a, v, finalSignal: v.signal }, pRampAttempts };
 }
