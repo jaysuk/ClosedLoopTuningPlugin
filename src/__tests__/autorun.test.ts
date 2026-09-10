@@ -6,7 +6,7 @@ import {
 	runStepTerm, seedFromUltimate, verifyAccepted, type TuneEffects,
 } from "../model/autorun";
 import {
-	AUTOTUNE_SIGNAL_SEQUENCE, P_MAX, SIGNAL_D_STRATEGY, SIGNAL_P_STRATEGY, P_STRATEGY, D_STRATEGY, I_STRATEGY,
+	AUTOTUNE_SIGNAL_SEQUENCE, P_MAX, SIGNAL_D_STRATEGY, SIGNAL_I_STRATEGY, SIGNAL_P_STRATEGY, P_STRATEGY, D_STRATEGY, I_STRATEGY,
 } from "../model/autotune";
 import type { PidConfig } from "../model/m569";
 import type { TuneSignal } from "../model/signal";
@@ -170,6 +170,65 @@ describe("runSignalTerm", () => {
 		const result = await runSignalTerm(effects, SIGNAL_D_STRATEGY, basePid(), 1, 2, 0);
 		expect(result.ok).toBe(false);
 		expect(result.reason).toBe("Cancelled.");
+	});
+
+	describe("I-stage dither confirmation (docs/PLAN-v2.7-feedback.md §3)", () => {
+		const cleanRest = { restTailValid: true, errorRestRipple: 0.05, errorRestRms: 0.02, errorRestQuantum: 0.05, pTermRestRipple: 5, pTermRestRms: 2, dTermRestRipple: 0, outputRestRipple: 0, restTailSamples: 100 };
+		const ditherRest = { ...cleanRest, errorRestRipple: 0.6 }; // 12 quanta — a real limit cycle
+
+		it("accepts I=0 when every confirmation capture is clean", async () => {
+			const captureSignal = vi.fn(async () => sig({ stats: { restBias: 0.02 }, restEffort: cleanRest }));
+			const { effects, log } = fakeEffects({ captureSignal });
+			const pid = basePid();
+			const result = await runSignalTerm(effects, SIGNAL_I_STRATEGY, pid, 1, 2, 0);
+			expect(result.ok).toBe(true);
+			expect(pid.i).toBe(0);
+			expect(log.some((l) => l.includes("confirmed — I=0 holds"))).toBe(true);
+		});
+
+		it("does NOT accept I=0 when a confirmation capture shows a real dither — raises I and continues", async () => {
+			// n=1 accept-decide capture, n=2 verifyAccepted capture, n>=3 the confirmation captures.
+			let n = 0;
+			const captureSignal = vi.fn(async () => {
+				n++;
+				return sig({ stats: { restBias: 0.02 }, restEffort: n === 3 ? ditherRest : cleanRest });
+			});
+			const { effects, log } = fakeEffects({ captureSignal });
+			const pid = basePid();
+			const result = await runSignalTerm(effects, SIGNAL_I_STRATEGY, pid, 1, 2, 0);
+			expect(result.ok).toBe(true);
+			expect(pid.i).toBeGreaterThan(0);
+			expect(log.some((l) => l.includes("showed standstill dither"))).toBe(true);
+		});
+
+		it("does not crash or silently accept I=0 when the confirmation captures fail outright", async () => {
+			let n = 0;
+			const captureSignal = vi.fn(async () => {
+				n++;
+				if (n <= 2) { return sig({ stats: { restBias: 0.02 }, restEffort: cleanRest }); } // accept + verify
+				if (n <= 5) { return null; } // 1st confirmation captureMedian: 3 nulls exhaust its retries
+				return sig({ stats: { restBias: 0.02 }, restEffort: cleanRest }); // ramp capture at the bumped I
+			});
+			const { effects } = fakeEffects({ captureSignal });
+			const pid = basePid();
+			const result = await runSignalTerm(effects, SIGNAL_I_STRATEGY, pid, 1, 2, 0);
+			expect(result.ok).toBe(true);
+			expect(pid.i).toBeGreaterThan(0); // bumped, not silently accepted at 0
+		});
+
+		it("does not confirm (no extra captures) when the I stage accepts a real, non-zero integrator", async () => {
+			// bias only settles once I is up at 1000 — the strategy raises I to 1000, accepts, and 1000 is
+			// well above I_CONFIRM_MAX so no confirmation captures are spent.
+			const captureSignal = vi.fn(async () => sig({ stats: { restBias: pidI() >= 1000 ? 0.02 : 0.5 }, restEffort: cleanRest }));
+			let pidRef: PidConfig;
+			function pidI() { return pidRef?.i ?? 0; }
+			const { effects, log } = fakeEffects({ captureSignal });
+			pidRef = basePid();
+			const result = await runSignalTerm(effects, SIGNAL_I_STRATEGY, pidRef, 1, 2, 0);
+			expect(result.ok).toBe(true);
+			expect(pidRef.i).toBeGreaterThanOrEqual(1000);
+			expect(log.some((l) => l.includes("confirming I="))).toBe(false);
+		});
 	});
 
 	it("fails cleanly when the capture returns null", async () => {

@@ -5,7 +5,7 @@
  * still gets the primitives (TuneEffects, captureMedian, term clamps) it needs, without the two files
  * importing each other.
  */
-import type { StepMetrics } from "./analysis";
+import { dithersAtStandstill, type StepMetrics } from "./analysis";
 import { A_MAX, D_MAX, I_MAX, P_MAX, V_MAX } from "./autotune";
 import type { TuneEvaluation } from "./evaluate";
 import type { PidConfig } from "./m569";
@@ -169,4 +169,29 @@ export async function verifyAccepted(
 		value = nextBackoff(acceptedValue, retry, term);
 	}
 	return { ok: false, reason: `${term.toUpperCase()}: stayed unstable after ${verifyRetries} verification backoffs — stopping the run.` };
+}
+
+/** Accepted I at or below this triggers dither confirmation — an I=0/near-0 "accept" is the degenerate
+ *  case the field report showed slipping through. A real integrator (the ramp's first non-zero I is
+ *  1000) never needs it. */
+export const I_CONFIRM_MAX = 100;
+/** Extra rest captures taken to confirm a low-I accept. */
+export const I_CONFIRM_TRIES = 3;
+
+/**
+ * Confirm a just-accepted low I really holds, by taking a few more rest captures. The CoreXY standstill
+ * limit cycle in the 2026-09-10 field report is INTERMITTENT — one I=0 capture can look settled while a
+ * later one shows the dither, so `medianOf` alone (a median of N) doesn't catch a behaviour that only
+ * appears on a minority of captures (docs/PLAN-v2.7-feedback.md §3). Returns false if ANY of `tries`
+ * captures shows a dither (position-error limit cycle, `dithersAtStandstill`) or fails outright — the
+ * caller then bumps I rather than accepting, and never silently accepts an unconfirmed low I.
+ */
+export async function confirmNoDither(effects: TuneEffects, medianOf: number, tries: number): Promise<boolean> {
+	for (let i = 0; i < tries; i++) {
+		if (effects.isCancelled()) { return true; } // a cancel is the caller's to handle, not ours to fail
+		const s = await captureMedian(effects, medianOf);
+		if (!s) { return false; }
+		if (dithersAtStandstill(s.restEffort)) { return false; }
+	}
+	return true;
 }

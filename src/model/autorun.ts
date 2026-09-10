@@ -49,7 +49,8 @@ import {
 	describeSignal, RUNAWAY_STEPS, significantlyBetterForTerm, signalUnstable, type TuneSignal,
 } from "./signal";
 import {
-	captureMedian, clampTerm, nextBackoff, ROUND_DP, SEED_START, SETTLE_DELAY_MS, verifyAccepted, ZERO_START,
+	captureMedian, clampTerm, confirmNoDither, I_CONFIRM_MAX, I_CONFIRM_TRIES, nextBackoff, ROUND_DP,
+	SEED_START, SETTLE_DELAY_MS, verifyAccepted, ZERO_START,
 	type AutoRunAttempt, type EnvelopeCheck, type TuneEffects,
 } from "./tuneShared";
 import type { PidTerm } from "./wizard";
@@ -335,6 +336,20 @@ export async function runSignalTerm(
 			if (!verified.ok) { effects.log(verified.reason); return { ok: false, reason: verified.reason, attempts: log }; }
 			pid[strategy.term] = verified.value;
 			await effects.applyPid(pid);
+			// I only: an accepted near-zero I is confirmed with extra rest captures. The standstill limit
+			// cycle this guards against is intermittent (docs/PLAN-v2.7-feedback.md §3) — one accepting
+			// capture, or a median of N, can miss a behaviour that only shows on a minority of captures.
+			if (strategy.term === "i" && verified.value <= I_CONFIRM_MAX && k < strategy.maxAttempts) {
+				effects.log(`I (integral): confirming I=${verified.value} with ${I_CONFIRM_TRIES} more rest captures — the standstill dither is intermittent.`);
+				const clean = await confirmNoDither(effects, medianOf, I_CONFIRM_TRIES);
+				if (!clean) {
+					const bumped = clampTerm("i", verified.value <= 0 ? 1000 : verified.value * 1.5);
+					effects.log(`I (integral): a confirmation capture showed standstill dither — I=${verified.value} isn't reliably settled. Raising I to ${bumped}.`);
+					value = Math.min(bumped, ceiling);
+					continue;
+				}
+				effects.log(`I (integral): confirmed — I=${verified.value} holds with no dither.`);
+			}
 			const note = verified.value !== d.value ? `${d.note} (backed off further to ${verified.value} on verification)` : d.note;
 			effects.log(`${strategy.label}: ✓ ${note}`);
 			return { ok: true, finalSignal: verified.signal, attempts: log };
