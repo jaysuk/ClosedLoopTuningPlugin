@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
-	buildCalibrationCommand, buildCaptureCommand, buildModeCommand, buildPidCommand,
+	buildCalibrationCommand, buildCaptureCommand, buildModeCommand, buildPidCommand, findsBlockingProblem,
 	CAPTURE_VARIABLES, captureBitmask, DEFAULT_MODE_D, parseCalibrationReply, parsePidReply,
 } from "../model/m569";
 
@@ -112,5 +112,28 @@ describe("CAPTURE_VARIABLES — derived entries (docs/PLAN-v2.4-feedback.md item
 		const real = CAPTURE_VARIABLES.filter((v) => v.key !== "motorCurrentCombined");
 		expect(real.every((v) => !v.derived)).toBe(true);
 		expect(real.every((v) => v.id > 0)).toBe(true);
+	});
+});
+
+describe("findsBlockingProblem — dwc-gcode-core safety net before sending", () => {
+	it("lets every real builder's own output through clean", () => {
+		expect(findsBlockingProblem(buildModeCommand("50.0", "closed"), "3.7.0-rc.1")).toBeNull();
+		expect(findsBlockingProblem(buildPidCommand("50.0", { p: 150, i: 5000, d: 0.2, v: 400, a: 200000 }), "3.7.0-rc.1")).toBeNull();
+		expect(findsBlockingProblem(buildPidCommand("50.0", { p: 150, i: 5000, d: 0.2, v: 400, a: 200000, warn: 1, err: 2 }), "3.7.0-rc.1")).toBeNull();
+		expect(findsBlockingProblem(buildCalibrationCommand("50.0", 1), "3.7.0-rc.1")).toBeNull();
+		expect(findsBlockingProblem(buildCaptureCommand({ driver: "50.0", samples: 1000, activate: 0, rate: 1000, variables: [1, 2] }), "3.7.0-rc.1")).toBeNull();
+	});
+
+	it("catches a command missing its required P (driver) parameter", () => {
+		// M569.1's P is required (dictionary/missing-required, the one dictionary rule this function
+		// actually treats as blocking - everything else dwc-gcode-core's own dictionary rules flag is
+		// "warning" severity, deliberately not refused here).
+		const problem = findsBlockingProblem("M569.1 T3 R150 I5000 D0.2 V400 A200000", "3.7.0-rc.1");
+		expect(problem).not.toBeNull();
+		expect(problem).toContain("P");
+	});
+
+	it("skips the check entirely when the firmware version isn't known yet, rather than guessing", () => {
+		expect(findsBlockingProblem("M569.1 T3 R150 I5000 D0.2 V400 A200000", null)).toBeNull();
 	});
 });

@@ -31,7 +31,7 @@ import { ACCEL_CAPTURE_DIR, CAPTURE_DIR, CONFIG_FILE, DOCS, LS_STATE, PLUGIN_ID 
 import { upsertTuneBlock } from "../model/config";
 import { stepJumpDistanceMm, stepJumpFeedMmPerMin } from "../model/scale";
 import {
-	buildCalibrationCommand, buildCaptureCommand, buildModeCommand, buildPidCommand,
+	buildCalibrationCommand, buildCaptureCommand, buildModeCommand, buildPidCommand, findsBlockingProblem,
 	CALIBRATION_MOVES, CAPTURE_VARIABLES, DEFAULT_MODE_D, ENCODER_TYPES, MODE_LABELS,
 	parsePidReply, type CalibrationMove, type EncoderType, type LoopMode, type PidConfig,
 } from "../model/m569";
@@ -1733,6 +1733,17 @@ export function useClosedLoopTuning(host: HostAdapter) {
 		if (resolve) { resolve(false); }
 	}
 	async function send(code: string): Promise<void> {
+		// findsBlockingProblem (model/m569.ts) is the generic dwc-gcode-core safety net over every
+		// M569-family command sent through here - firmware version comes from `boards[0]` (the
+		// DWC-connected board) purely as a baseline for the dictionary's own version-gating rules;
+		// none of M569/M569.1/M569.5/M569.6's parameters are dated, so this never actually changes
+		// which findings fire, but the option is required and a real value costs nothing to provide.
+		const fw = (host.model() as any).boards?.[0]?.firmwareVersion;
+		const problem = findsBlockingProblem(code, typeof fw === "string" && fw !== "" ? fw : null);
+		if (problem) {
+			host.notify("error", "Closed Loop Tuning", `Refusing to send "${code}" - ${problem}`);
+			return;
+		}
 		try {
 			const reply = await host.sendCode(code);
 			if (reply && reply.startsWith("Error:")) {

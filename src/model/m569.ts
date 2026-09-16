@@ -6,6 +6,9 @@
  *   M569.5 ...   — performance data capture (optionally during an appended move)
  *   M569.6 V<n>  — calibration / tuning manoeuvres
  *
+ * Also `findsBlockingProblem` — a dwc-gcode-core-backed safety net over an already-built command
+ * before it's sent, independent of any one builder's own domain checks.
+ *
  * M569 D-values (confirmed from the RRF M569 dictionary): D0=constant off time, D1=random off time,
  * D2=spreadCycle, D3=stealthChop, D4=Closed Loop, D5=Assisted open loop (D4/D5 only on closed-loop-
  * capable drivers, e.g. Duet3D's 1HCL / Motor23CL). There is no dedicated "open loop" mode for a
@@ -13,6 +16,7 @@
  * whose RRF 3.4+ default is spreadCycle (D2). The UI still shows the literal command before sending and lets the D-values be
  * overridden, so a per-machine config quirk never sends a wrong mode blind.
  */
+import { diagnoseDocument, parseDocument } from "dwc-gcode-core";
 
 export type LoopMode = "open" | "assisted" | "closed";
 
@@ -250,4 +254,25 @@ export function parsePidReply(reply: string): ParsedPid {
 		warn: thresh ? Number(thresh[1]) : null,
 		err: thresh ? Number(thresh[2]) : null,
 	};
+}
+
+/**
+ * A generic safety net over an already-built M569-family command, independent of any one builder's
+ * own domain checks: a malformed or out-of-range parameter (dictionary/unknown-parameter, /wrong-kind,
+ * /value-out-of-range) is worth refusing before it reaches a real, physically-moving closed-loop
+ * driver. Commands built entirely from this module's own typed builders above are not expected to
+ * trip this in practice; it exists for the case they do - the same reasoning duet-calibration-wizard's
+ * own diagnoseDocument gate uses before writing config.g.
+ *
+ * `firmwareVersion` is only required because `diagnoseDocument`'s own options type requires it (used
+ * for the dictionary's version-gating rules) - null skips the check entirely rather than guessing a
+ * version, matching this plugin's own "never send blind" convention elsewhere.
+ *
+ * @returns the first error-severity finding's message, or null if the command looks fine (or the
+ * firmware version isn't known yet, in which case this can't say anything useful either way).
+ */
+export function findsBlockingProblem(code: string, firmwareVersion: string | null): string | null {
+	if (!firmwareVersion) { return null; }
+	const diags = diagnoseDocument(parseDocument(`${code}\n`), "generated", { firmwareVersion });
+	return diags.find((d) => d.severity === "error")?.message ?? null;
 }
