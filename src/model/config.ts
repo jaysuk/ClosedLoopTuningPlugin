@@ -4,7 +4,18 @@
  * its own markers, so re-running it (or running it for a different driver) can't clobber the rest of
  * the user's config.g. The Vue layer is responsible for downloading/backing up/uploading the file —
  * this module only computes the new text.
+ *
+ * Line splitting goes through `dwc-gcode-core/edit`'s `parseLines`/`detectEol` rather than a bare
+ * `.split(/\r?\n/)`: the marker-block shape this module edits (find/replace a whole run of lines
+ * between two comment markers) isn't something that package has a primitive for — its own directive
+ * functions (`setParam`, `findDirectives`, `planDirectiveEdit`) are all single-G-code-line operations
+ * — so the marker-matching and re-joining logic here stays hand-rolled. But the OLD unconditional
+ * `.join("\n")` silently rewrote a CRLF file to LF-only line endings on every write, which
+ * `detectEol` exists specifically to avoid - found while looking at this module for a shared-package
+ * migration, not previously covered by any test here.
  */
+import { detectEol, parseLines } from "dwc-gcode-core/edit";
+
 import { buildCalibrationCommand, buildModeCommand, buildPidCommand, type LoopMode, type ModeCommandConfig, type PidConfig } from "./m569";
 
 export interface TuneConfigBlock {
@@ -49,11 +60,12 @@ export interface UpsertResult {
  * lines between this driver's markers, byte-for-byte preserving everything else in the file.
  */
 export function upsertTuneBlock(configText: string, block: TuneConfigBlock): UpsertResult {
+	const eol = detectEol(configText);
 	const begin = beginMarker(block.driver);
 	const end = endMarker(block.driver);
 	const newBlockLines = [begin, ...renderTuneBlockBody(block), end];
 
-	const lines = configText.split(/\r?\n/);
+	const lines = parseLines(configText).map((l) => l.raw);
 	const beginIdx = lines.findIndex((l) => l.trim() === begin);
 	const endIdx = beginIdx >= 0 ? lines.findIndex((l, i) => i > beginIdx && l.trim() === end) : -1;
 
@@ -65,12 +77,14 @@ export function upsertTuneBlock(configText: string, block: TuneConfigBlock): Ups
 		if (unchanged) {
 			return { text: configText, changed: false, replaced: false };
 		}
-		const text = [...before, ...newBlockLines, ...after].join("\n");
+		const text = [...before, ...newBlockLines, ...after].join(eol);
 		return { text, changed: true, replaced: true };
 	}
 
 	// No existing block for this driver — append, keeping a blank-line separator if the file is non-empty.
 	const trimmedEnd = configText.replace(/\s+$/, "");
-	const text = trimmedEnd ? `${trimmedEnd}\n\n${newBlockLines.join("\n")}\n` : `${newBlockLines.join("\n")}\n`;
+	const text = trimmedEnd
+		? `${trimmedEnd}${eol}${eol}${newBlockLines.join(eol)}${eol}`
+		: `${newBlockLines.join(eol)}${eol}`;
 	return { text, changed: true, replaced: false };
 }

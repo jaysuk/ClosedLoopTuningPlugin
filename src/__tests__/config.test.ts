@@ -69,6 +69,33 @@ describe("upsertTuneBlock", () => {
 		expect(result.text).toContain("M569.1 P51.0");
 	});
 
+	it("preserves CRLF line endings when appending a fresh block (previously silently rewritten to LF)", () => {
+		const original = "; user config\r\nM584 X0 Y1\r\nM906 X800\r\n";
+		const result = upsertTuneBlock(original, block());
+		expect(result.text).toContain("\r\n");
+		expect(result.text).not.toMatch(/[^\r]\n/); // every \n is preceded by \r - no bare LF anywhere
+	});
+
+	it("preserves CRLF line endings when replacing an existing block", () => {
+		const original = [
+			"; before", "M584 X0 Y1",
+			"; --- ClosedLoopTuning driver 51.0 begin ---",
+			"M569 P51.0 D9      ; stale mode",
+			"M569.1 P51.0 R10 I0 D0 V0 A0",
+			"; --- ClosedLoopTuning driver 51.0 end ---",
+			"; after", "M906 X800",
+		].join("\r\n") + "\r\n";
+		const result = upsertTuneBlock(original, block());
+		expect(result.replaced).toBe(true);
+		expect(result.text).not.toMatch(/[^\r]\n/);
+	});
+
+	it("preserves LF line endings on an LF file (the common case stays exactly as before)", () => {
+		const original = "; user config\nM584 X0 Y1\n";
+		const result = upsertTuneBlock(original, block());
+		expect(result.text).not.toContain("\r\n");
+	});
+
 	it("includes calibration moves as a reference comment, not a re-run command", () => {
 		const lines = renderTuneBlockBody(block({ calibrationMoveIds: [1, 2] }));
 		const calLines = lines.filter((l) => l.includes("M569.6"));
