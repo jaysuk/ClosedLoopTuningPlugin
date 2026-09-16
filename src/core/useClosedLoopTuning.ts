@@ -23,6 +23,7 @@ import { computed, reactive, ref, watch } from "vue";
 
 // Subpath, not the barrel — see the note above.
 import { buildReport, downloadReport } from "dwc-plugin-runtime/diagnostics";
+import { firmwareAtLeast } from "dwc-gcode-core";
 
 import { isMachineUnsafeForTuning, type HostAdapter } from "./host";
 import { evaluateTune, gradeColor, severityColor, severityIcon, type Term, type TuneEvaluation } from "../model/evaluate";
@@ -49,7 +50,6 @@ import {
 	ACCEL_ASSUMED_RATE_HZ, accelSampleCount, buildAccelCaptureCommand, findAccelerometers, isAccelOnlyError,
 	type AccelerometerInfo,
 } from "../model/accelerometer";
-import { firmwareAtLeast } from "../model/firmwareVersion";
 import { parseAccelCapture, type AccelCapture } from "../model/accelCsv";
 import { computeVibration, VIBRATION_MIN_COVERAGE, type Vibration } from "../model/vibration";
 import { computeTuneSignal, type TuneSignal } from "../model/signal";
