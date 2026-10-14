@@ -38,7 +38,9 @@ const INCLUDE = ["model", "core", "i18n", "ui36", "updateCheck.ts"];
  * is found before the checkout's own. Same trick for dwc-plugin-runtime, which 3.6 has never heard
  * of — which keeps this build reproducible on any 3.6 checkout with no manual preparation.
  */
-const VENDOR = ["chart.js", "dwc-plugin-runtime"];
+// Every runtime `dependencies` entry of package.json, not a hand-kept list: a hand-kept one went stale
+// when dwc-gcode-core was added, and the 3.6 build then failed on the unresolved import.
+const VENDOR = Object.keys(JSON.parse(readFileSync(join(repo, "package.json"), "utf8")).dependencies ?? {});
 
 rmSync(outDir, { recursive: true, force: true });
 mkdirSync(join(outDir, "src"), { recursive: true });
